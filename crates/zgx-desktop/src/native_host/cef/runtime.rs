@@ -204,7 +204,8 @@ fn initialize_inner() -> Result<Runtime, String> {
     let handler = PumpHandler::new(schedule);
     let mock_keychain = std::env::var_os("ZGX_CEF_EVAL_RESULT").is_some()
         || std::env::var_os("ZGX_CEF_EVENT_RESULT").is_some()
-        || std::env::var_os("ZGX_CEF_DOWNLOAD_RESULT").is_some();
+        || std::env::var_os("ZGX_CEF_DOWNLOAD_RESULT").is_some()
+        || std::env::var_os("ZGX_CEF_PROFILE_FIXTURE").is_some();
     let mut app = CEFApplication::new(handler, mock_keychain);
     #[cfg(target_os = "windows")]
     let sandbox_info = WINDOWS_SANDBOX_INFO.with(std::cell::Cell::get);
