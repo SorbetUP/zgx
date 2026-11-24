@@ -279,13 +279,47 @@ wrap_load_handler! {
     }
 }
 
+wrap_display_handler! {
+    pub(super) struct CEFDisplayHandler { web: zgx::web_view::WeakWebView }
+    impl DisplayHandler {
+        fn on_address_change(
+            &self,
+            _browser: Option<&mut Browser>,
+            frame: Option<&mut Frame>,
+            url: Option<&CefString>,
+        ) {
+            let Some(frame) = frame.filter(|frame| frame.is_main() != 0) else { return };
+            let url = url.map(ToString::to_string).unwrap_or_else(|| CefString::from(&frame.url()).to_string());
+            let web = self.web.clone();
+            zgx::native_view::post(move || {
+                if let Some(web) = web.upgrade() {
+                    web.update_state(|state| state.url = url.clone());
+                    web.emit(zgx::web_view::WebViewEvent::UrlChanged { url });
+                }
+            });
+        }
+
+        fn on_title_change(&self, _browser: Option<&mut Browser>, title: Option<&CefString>) {
+            let title = title.map(ToString::to_string).unwrap_or_default();
+            let web = self.web.clone();
+            zgx::native_view::post(move || {
+                if let Some(web) = web.upgrade() {
+                    web.update_state(|state| state.title = title.clone());
+                    web.emit(zgx::web_view::WebViewEvent::TitleChanged { title });
+                }
+            });
+        }
+    }
+}
+
 wrap_client! {
-pub(super) struct CEFClient { render: RenderHandler, life: LifeSpanHandler, load: LoadHandler, download: DownloadHandler }
+pub(super) struct CEFClient { render: RenderHandler, life: LifeSpanHandler, load: LoadHandler, download: DownloadHandler, display: DisplayHandler }
     impl Client {
         fn render_handler(&self) -> Option<RenderHandler> { Some(self.render.clone()) }
         fn life_span_handler(&self) -> Option<LifeSpanHandler> { Some(self.life.clone()) }
         fn load_handler(&self) -> Option<LoadHandler> { Some(self.load.clone()) }
         fn download_handler(&self) -> Option<DownloadHandler> { Some(self.download.clone()) }
+        fn display_handler(&self) -> Option<DisplayHandler> { Some(self.display.clone()) }
     }
 }
 
@@ -306,8 +340,9 @@ pub(super) fn client(
     let render = CEFRenderHandler::new(state);
     let life = CEFLifeSpanHandler::new(callbacks);
     let load = CEFLoadHandler::new(web.clone());
+    let display = CEFDisplayHandler::new(web.clone());
     let download = CEFDownloadHandler::new(web, Rc::new(RefCell::new(HashMap::new())));
-    CEFClient::new(render, life, load, download)
+    CEFClient::new(render, life, load, download, display)
 }
 
 #[cfg(test)]
@@ -322,7 +357,10 @@ mod tests {
         let seen = Rc::new(RefCell::new(Vec::new()));
         let recorded = seen.clone();
         let mut statuses: HashMap<u32, zgx::web_view::DownloadStatusFn> = HashMap::new();
-        statuses.insert(7, Box::new(move |status| recorded.borrow_mut().push(status)));
+        statuses.insert(
+            7,
+            Box::new(move |status| recorded.borrow_mut().push(status)),
+        );
 
         update_download_status(
             &mut statuses,
@@ -353,7 +391,10 @@ mod tests {
         let seen = Rc::new(RefCell::new(Vec::new()));
         let recorded = seen.clone();
         let mut statuses: HashMap<u32, zgx::web_view::DownloadStatusFn> = HashMap::new();
-        statuses.insert(1, Box::new(move |status| recorded.borrow_mut().push(status)));
+        statuses.insert(
+            1,
+            Box::new(move |status| recorded.borrow_mut().push(status)),
+        );
         update_download_status(
             &mut statuses,
             1,
@@ -365,7 +406,10 @@ mod tests {
         );
 
         let recorded = seen.clone();
-        statuses.insert(2, Box::new(move |status| recorded.borrow_mut().push(status)));
+        statuses.insert(
+            2,
+            Box::new(move |status| recorded.borrow_mut().push(status)),
+        );
         update_download_status(
             &mut statuses,
             2,
