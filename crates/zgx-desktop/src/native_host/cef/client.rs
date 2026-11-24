@@ -2,13 +2,32 @@ use std::sync::{Arc, Mutex};
 
 use cef::{self, *};
 
-use super::rendering::{Frame, SharedFrame};
+use super::rendering::SharedFrame;
 
 #[derive(Clone)]
 pub(super) struct RenderState {
     pub frame: SharedFrame,
     pub size: Arc<Mutex<(i32, i32)>>,
+    pub scale: Arc<Mutex<f32>>,
     pub invalidate: Arc<dyn Fn()>,
+}
+
+#[derive(Clone)]
+pub(super) struct BrowserCallbacks {
+    pub created: Arc<dyn Fn(Browser)>,
+    pub before_close: Arc<dyn Fn()>,
+}
+
+wrap_life_span_handler! {
+    pub(super) struct CEFLifeSpanHandler { callbacks: BrowserCallbacks }
+    impl LifeSpanHandler {
+        fn on_after_created(&self, browser: Option<&mut Browser>) {
+            if let Some(browser) = browser {
+                (self.callbacks.created)(browser.clone());
+            }
+        }
+        fn on_before_close(&self, _browser: Option<&mut Browser>) { (self.callbacks.before_close)(); }
+    }
 }
 
 wrap_render_handler! {
@@ -26,7 +45,13 @@ wrap_render_handler! {
 
         fn screen_info(&self, _browser: Option<&mut Browser>, info: Option<&mut ScreenInfo>) -> i32 {
             if let Some(info) = info {
-                info.device_scale_factor = 1.0;
+                let (width, height) = *self.state.size.lock().unwrap_or_else(|poison| poison.into_inner());
+                info.device_scale_factor = *self.state.scale.lock().unwrap_or_else(|poison| poison.into_inner());
+                info.depth = 32;
+                info.depth_per_component = 8;
+                info.is_monochrome = 0;
+                info.rect = Rect { x: 0, y: 0, width: width.max(1), height: height.max(1) };
+                info.available_rect = info.rect.clone();
                 return 1;
             }
             0
@@ -45,7 +70,7 @@ wrap_render_handler! {
             width: i32,
             height: i32,
         ) {
-            if kind != PaintElementType::View || buffer.is_null() || width <= 0 || height <= 0 {
+            if kind != PaintElementType::VIEW || buffer.is_null() || width <= 0 || height <= 0 {
                 return;
             }
             let (width, height) = (width as u32, height as u32);
@@ -66,17 +91,42 @@ wrap_render_handler! {
     }
 }
 
-wrap_client! {
-    pub(super) struct CEFClient { render: RenderHandler }
-    impl Client {
-        fn render_handler(&self) -> Option<RenderHandler> { Some(self.render.clone()) }
+wrap_load_handler! {
+    pub(super) struct CEFLoadHandler;
+    impl LoadHandler {
+        fn on_load_start(&self, _browser: Option<&mut Browser>, frame: Option<&mut cef::Frame>, _transition: TransitionType) {
+        }
+        fn on_load_end(&self, _browser: Option<&mut Browser>, frame: Option<&mut cef::Frame>, status: i32) {
+        }
+        fn on_load_error(&self, _browser: Option<&mut Browser>, _frame: Option<&mut cef::Frame>, code: Errorcode, text: Option<&CefString>, url: Option<&CefString>) {
+        }
     }
 }
 
-pub(super) fn client(frame: SharedFrame, size: Arc<Mutex<(i32, i32)>>, invalidate: Arc<dyn Fn()>) -> Client {
-    let state = RenderState { frame, size, invalidate };
-    let render = CEFRenderHandler::new(state);
-    CEFClient::new(render)
+wrap_client! {
+pub(super) struct CEFClient { render: RenderHandler, life: LifeSpanHandler, load: LoadHandler }
+    impl Client {
+        fn render_handler(&self) -> Option<RenderHandler> { Some(self.render.clone()) }
+        fn life_span_handler(&self) -> Option<LifeSpanHandler> { Some(self.life.clone()) }
+        fn load_handler(&self) -> Option<LoadHandler> { Some(self.load.clone()) }
+    }
 }
 
-pub(super) fn empty_frame() -> Frame { Frame::default() }
+pub(super) fn client(
+    frame: SharedFrame,
+    size: Arc<Mutex<(i32, i32)>>,
+    scale: Arc<Mutex<f32>>,
+    invalidate: Arc<dyn Fn()>,
+    callbacks: BrowserCallbacks,
+) -> Client {
+    let state = RenderState {
+        frame,
+        size,
+        scale,
+        invalidate,
+    };
+    let render = CEFRenderHandler::new(state);
+    let life = CEFLifeSpanHandler::new(callbacks);
+    let load = CEFLoadHandler::new();
+    CEFClient::new(render, life, load)
+}

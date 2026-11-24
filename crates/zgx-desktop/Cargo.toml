@@ -52,7 +52,8 @@ webview2 = ["dep:webview2-com", "zgx-gpu/composition", "windows/Win32_Graphics_D
 # and where it is missing pages are placeholders.
 webkitgtk = []
 # CEF OSR pages composited into the ZGX renderer.
-cef = ["dep:cef"]
+cef = ["dep:cef", "dep:wgpu"]
+cef-package = ["cef", "cef/build-util", "dep:semver"]
 # mimalloc as the program's allocator, in place of the system's: 1-10%
 # fewer cycles in zgx's headless scenes (text 7%, layout 6%, animation
 # 9%), for up to 3 MB more resident memory. A program has one allocator:
@@ -88,6 +89,8 @@ accesskit_winit = "0.33.2"
 rfd = "=0.17.2"
 open = "=5.4.4"
 cef = { version = "=156.7.0", default-features = false, features = ["sandbox", "resources"], optional = true }
+wgpu = { version = "29.0.4", default-features = false, optional = true }
+semver = { version = "1.0", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Clipboard images on Wayland, as PNG (clipboard.rs); arboard's version,
@@ -157,6 +160,24 @@ required-features = ["ghostty"]
 name = "web_view_probe"
 required-features = ["webkitgtk"]
 
+[[bin]]
+name = "cef_web_view"
+path = "src/bin/cef_web_view.rs"
+required-features = ["cef"]
+
+[[bin]]
+name = "cef_web_view_helper"
+path = "src/bin/cef_web_view_helper.rs"
+required-features = ["cef"]
+
+[package.metadata.cef.bundle]
+helper_name = "cef_web_view_helper"
+
+[[bin]]
+name = "bundle_cef_fixture"
+path = "src/bin/bundle_cef_fixture.rs"
+required-features = ["cef-package"]
+
 [[example]]
 name = "terminal_pane"
 required-features = ["terminal"]
@@ -181,6 +202,7 @@ name = "titlebar_resize"
 harness = false
 
 [dev-dependencies]
+pollster = "0.4"
 # The perf gate's output check, called by the gate benches each frame.
 zgx-fingerprint = { path = "../../scripts/perf/fingerprint" }
 # The components the Linux probe's example shows (`components_probe`).

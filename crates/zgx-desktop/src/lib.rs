@@ -172,6 +172,24 @@ pub use window_info::{
 #[cfg(feature = "audio")]
 pub use zgx_audio;
 mod native_host;
+/// Handle a CEF helper-process launch before initializing application state.
+///
+/// Call this at the start of `main`, before creating the ZGX application,
+/// opening databases, or initializing scripting. `Some(code)` means this
+/// process is a Chromium subprocess and should exit with that status.
+#[cfg(feature = "cef")]
+pub fn execute_cef_process() -> Result<Option<i32>, String> {
+    native_host::cef::execute_process()
+}
+/// Handle a CEF Windows bootstrap launch, preserving its mandatory sandbox
+/// context for both subprocess dispatch and CEF initialization.
+#[cfg(all(feature = "cef", target_os = "windows"))]
+pub fn execute_cef_process_with_windows_context(
+    instance: cef::sys::HINSTANCE,
+    sandbox_info: *mut u8,
+) -> Result<Option<i32>, String> {
+    native_host::cef::execute_process_with_windows_context(instance, sandbox_info)
+}
 #[cfg(any(windows, test))]
 mod windows_caption;
 #[cfg(target_os = "macos")]

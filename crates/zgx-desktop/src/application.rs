@@ -182,6 +182,8 @@ impl Default for WindowOptions {
 #[derive(Debug)]
 enum Event {
     Quit,
+    #[cfg(feature = "cef")]
+    CefMessagePump(std::time::Instant),
     /// An event, with the token of the launch that sent it (Linux).
     Application(crate::ApplicationEvent, Option<String>),
     MenuAction(u64, crate::MenuAction),
@@ -908,7 +910,9 @@ impl WindowContext {
             windows: Some(self.windows.clone()),
         }));
         // Pages as images of WebKitGTK's (`web_view` asks it first).
-        #[cfg(all(target_os = "linux", feature = "webkitgtk"))]
+        #[cfg(feature = "cef")]
+        let view = zgx::compose::provide(crate::native_host::cef::page_views(), view);
+        #[cfg(all(target_os = "linux", feature = "webkitgtk", not(feature = "cef")))]
         let view = zgx::compose::provide(
             crate::native_host::webkitgtk::page_views(self.windows.clipboard.clone(), {
                 let dialogs = self.dialogs.clone();
@@ -1105,6 +1109,10 @@ impl Application {
     /// Run the event loop: open the first window, `build` its content, and
     /// return once the application quits.
     pub fn run(self, build: impl FnOnce(&mut WindowContext)) -> Result<(), Box<dyn Error>> {
+        #[cfg(feature = "cef")]
+        if let Some(code) = crate::native_host::cef::execute_process()? {
+            std::process::exit(code);
+        }
         zgx::profile::mark("run");
         // Who the app is to the system's notifications and badge.
         crate::notify::set_identity(crate::notify::Identity {
@@ -1155,6 +1163,19 @@ impl Application {
         zgx::profile::mark("event loop");
         zgx::memory::set_hosted();
         let proxy = event_loop.create_proxy();
+        #[cfg(feature = "cef")]
+        let cef_deadline = Rc::new(Cell::new(None));
+        #[cfg(feature = "cef")]
+        {
+            let pump_proxy = proxy.clone();
+            crate::native_host::cef::set_scheduler(Arc::new(move |delay_ms| {
+                let delay = std::time::Duration::from_millis(delay_ms.max(0) as u64);
+                let deadline = std::time::Instant::now() + delay;
+                // CEF may call this from any thread. Only send an event here;
+                // its deadline is merged on ZGX's UI thread below.
+                let _ = pump_proxy.send_event(Event::CefMessagePump(deadline));
+            }));
+        }
         let native_events = if let Some(id) = &self.application_id {
             let wake = proxy.clone();
             let events = crate::native_events::NativeApplicationEvents::new(
@@ -1256,8 +1277,12 @@ impl Application {
             device_events: false,
             error: None,
             timers,
+            #[cfg(feature = "cef")]
+            cef_deadline,
         };
         event_loop.run_app(&mut host)?;
+        #[cfg(feature = "cef")]
+        crate::native_host::cef::shutdown();
         if let Some(e) = host.error.take() {
             return Err(e.into());
         }
@@ -7500,6 +7525,8 @@ struct WindowManager {
     device_events: bool,
     error: Option<String>,
     timers: zgx::timer::Hosted,
+    #[cfg(feature = "cef")]
+    cef_deadline: Rc<Cell<Option<std::time::Instant>>>,
 }
 impl WindowManager {
     /// A window event, handled now.
@@ -8316,6 +8343,26 @@ impl WindowManager {
     fn user_event_turn(&mut self, event_loop: &ActiveEventLoop, event: Event) {
         match event {
             Event::Quit => event_loop.exit(),
+            #[cfg(feature = "cef")]
+            Event::CefMessagePump(deadline) => {
+                let now = std::time::Instant::now();
+                if deadline <= now {
+                    if self
+                        .cef_deadline
+                        .get()
+                        .is_some_and(|pending| pending <= now)
+                    {
+                        self.cef_deadline.set(None);
+                    }
+                    crate::native_host::cef::pump();
+                } else if self
+                    .cef_deadline
+                    .get()
+                    .is_none_or(|pending| deadline < pending)
+                {
+                    self.cef_deadline.set(Some(deadline));
+                }
+            }
             #[cfg(feature = "audio")]
             Event::AudioVoicesEnded => crate::audio::voices_ended(),
             #[cfg(target_os = "macos")]
@@ -8733,6 +8780,15 @@ impl WindowManager {
         }
     }
     fn about_to_wait_turn(&mut self, event_loop: &ActiveEventLoop) {
+        #[cfg(feature = "cef")]
+        if self
+            .cef_deadline
+            .get()
+            .is_some_and(|deadline| deadline <= std::time::Instant::now())
+        {
+            self.cef_deadline.set(None);
+            crate::native_host::cef::pump();
+        }
         self.app_active();
         #[cfg(target_os = "macos")]
         self.apply_full_screen();
@@ -8748,6 +8804,16 @@ impl WindowManager {
         if self.quit_on_last_window_close
             && self.hosts.is_empty()
             && self.factory.pending.borrow().is_empty()
+            && {
+                #[cfg(feature = "cef")]
+                {
+                    !crate::native_host::cef::has_browsers()
+                }
+                #[cfg(not(feature = "cef"))]
+                {
+                    true
+                }
+            }
         {
             event_loop.exit();
             return;
@@ -8765,7 +8831,14 @@ impl WindowManager {
         if !self.active {
             event_loop.set_control_flow(match self.timers.deadline() {
                 Some(deadline) => ControlFlow::WaitUntil(deadline),
-                None => ControlFlow::Wait,
+                None => {
+                    #[cfg(feature = "cef")]
+                    if let Some(deadline) = self.cef_deadline.get() {
+                        event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+                        return;
+                    }
+                    ControlFlow::Wait
+                }
             });
             return;
         }
@@ -8799,6 +8872,16 @@ impl WindowManager {
         if self.quit_on_last_window_close
             && self.hosts.is_empty()
             && self.factory.pending.borrow().is_empty()
+            && {
+                #[cfg(feature = "cef")]
+                {
+                    !crate::native_host::cef::has_browsers()
+                }
+                #[cfg(not(feature = "cef"))]
+                {
+                    true
+                }
+            }
         {
             event_loop.exit();
             return;
@@ -8905,6 +8988,16 @@ impl WindowManager {
             })
             .flatten()
             .chain(self.timers.deadline())
+            .chain({
+                #[cfg(feature = "cef")]
+                {
+                    self.cef_deadline.get()
+                }
+                #[cfg(not(feature = "cef"))]
+                {
+                    None
+                }
+            })
             .chain({
                 #[cfg(target_os = "macos")]
                 let menu_bar = self.menu_bar_due;

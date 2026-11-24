@@ -10,6 +10,8 @@
 //! they never drift a frame apart. A window without native views does none
 //! of it. On Linux (the `webkitgtk` feature) pages are images in the
 //! window's own paint instead (`webkitgtk.rs`), and none of this applies.
+#[cfg(feature = "cef")]
+pub(crate) mod cef;
 #[cfg(all(windows, feature = "webview2"))]
 mod dcomp;
 #[cfg(all(target_os = "macos", feature = "ghostty"))]
@@ -20,8 +22,6 @@ mod ghostty_colors;
 mod gtk;
 #[cfg(all(target_os = "linux", feature = "webkitgtk"))]
 pub(crate) mod webkitgtk;
-#[cfg(feature = "cef")]
-pub(crate) mod cef;
 #[cfg(all(target_os = "macos", feature = "ghostty"))]
 pub(crate) use ghostty::processes_changed;
 #[cfg(target_os = "macos")]
