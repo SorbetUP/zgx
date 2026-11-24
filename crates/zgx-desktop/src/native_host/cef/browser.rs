@@ -14,7 +14,7 @@ use zgx::{
 
 use super::{
     client::{self, BrowserCallbacks},
-    rendering::{Painter, SharedFrame},
+    rendering::{Painter, SharedFrame, SharedPopup},
     runtime,
 };
 
@@ -28,6 +28,7 @@ pub(super) struct Page {
     visible: Cell<u32>,
     gpu: zgx::gpu_view::GpuView,
     frame: SharedFrame,
+    popup: SharedPopup,
     size: Arc<Mutex<(i32, i32)>>,
     scale: Arc<Mutex<f32>>,
 }
@@ -149,11 +150,13 @@ pub(super) fn backend(web: &WebView) -> Result<Rc<Page>, String> {
     };
     let context = runtime::request_context(&profile)?;
     let frame = Arc::new(Mutex::default());
+    let popup = Arc::new(Mutex::default());
     let size = Arc::new(Mutex::new((1024, 768)));
     let scale = Arc::new(Mutex::new(1.));
     let browser = Rc::new(RefCell::new(None));
     let gpu = zgx_gpu::viewport::view(Painter::new(
         frame.clone(),
+        popup.clone(),
         size.clone(),
         scale.clone(),
         browser.clone(),
@@ -166,6 +169,7 @@ pub(super) fn backend(web: &WebView) -> Result<Rc<Page>, String> {
         visible: Cell::new(0),
         gpu,
         frame,
+        popup,
         size,
         scale,
     });
@@ -199,6 +203,7 @@ pub(super) fn backend(web: &WebView) -> Result<Rc<Page>, String> {
     let invalidator = page.gpu.clone();
     let client = client::client(
         page.frame.clone(),
+        page.popup.clone(),
         page.size.clone(),
         page.scale.clone(),
         Arc::new(move || invalidator.invalidate()),

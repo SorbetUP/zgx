@@ -7,11 +7,12 @@ use std::{
 
 use cef::{self, *};
 
-use super::rendering::SharedFrame;
+use super::rendering::{SharedFrame, SharedPopup};
 
 #[derive(Clone)]
 pub(super) struct RenderState {
     pub frame: SharedFrame,
+    pub popup: SharedPopup,
     pub size: Arc<Mutex<(i32, i32)>>,
     pub scale: Arc<Mutex<f32>>,
     pub invalidate: Arc<dyn Fn()>,
@@ -185,9 +186,25 @@ wrap_render_handler! {
             0
         }
 
-        fn on_popup_show(&self, _browser: Option<&mut Browser>, _show: i32) {}
+        fn on_popup_show(&self, _browser: Option<&mut Browser>, show: i32) {
+            let mut popup = self.state.popup.lock().unwrap_or_else(|poison| poison.into_inner());
+            popup.visible = show != 0;
+            if !popup.visible {
+                popup.frame.width = 0;
+                popup.frame.height = 0;
+                popup.frame.pixels.clear();
+            }
+            drop(popup);
+            (self.state.invalidate)();
+        }
 
-        fn on_popup_size(&self, _browser: Option<&mut Browser>, _rect: Option<&Rect>) {}
+        fn on_popup_size(&self, _browser: Option<&mut Browser>, rect: Option<&Rect>) {
+            let Some(rect) = rect else { return };
+            let mut popup = self.state.popup.lock().unwrap_or_else(|poison| poison.into_inner());
+            popup.rect = (rect.x, rect.y, rect.width.max(0), rect.height.max(0));
+            drop(popup);
+            (self.state.invalidate)();
+        }
 
         fn on_paint(
             &self,
@@ -198,7 +215,7 @@ wrap_render_handler! {
             width: i32,
             height: i32,
         ) {
-            if kind != PaintElementType::VIEW || buffer.is_null() || width <= 0 || height <= 0 {
+            if buffer.is_null() || width <= 0 || height <= 0 {
                 return;
             }
             let (width, height) = (width as u32, height as u32);
@@ -207,6 +224,20 @@ wrap_render_handler! {
             };
             // CEF owns `buffer`; copy it before returning from this callback.
             let pixels = unsafe { std::slice::from_raw_parts(buffer, length) };
+            if kind == PaintElementType::POPUP {
+                let mut popup = self.state.popup.lock().unwrap_or_else(|poison| poison.into_inner());
+                popup.frame.width = width;
+                popup.frame.height = height;
+                popup.frame.pixels.clear();
+                popup.frame.pixels.extend_from_slice(pixels);
+                popup.frame.revision = popup.frame.revision.wrapping_add(1);
+                drop(popup);
+                (self.state.invalidate)();
+                return;
+            }
+            if kind != PaintElementType::VIEW {
+                return;
+            }
             let mut frame = self.state.frame.lock().unwrap_or_else(|poison| poison.into_inner());
             frame.width = width;
             frame.height = height;
@@ -325,6 +356,7 @@ pub(super) struct CEFClient { render: RenderHandler, life: LifeSpanHandler, load
 
 pub(super) fn client(
     frame: SharedFrame,
+    popup: SharedPopup,
     size: Arc<Mutex<(i32, i32)>>,
     scale: Arc<Mutex<f32>>,
     invalidate: Arc<dyn Fn()>,
@@ -333,6 +365,7 @@ pub(super) fn client(
 ) -> Client {
     let state = RenderState {
         frame,
+        popup,
         size,
         scale,
         invalidate,

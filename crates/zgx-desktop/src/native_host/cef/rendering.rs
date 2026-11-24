@@ -17,10 +17,21 @@ pub(super) struct Frame {
 
 pub(super) type SharedFrame = Arc<Mutex<Frame>>;
 
+#[derive(Default)]
+pub(super) struct PopupFrame {
+    pub frame: Frame,
+    pub rect: (i32, i32, i32, i32),
+    pub visible: bool,
+}
+
+pub(super) type SharedPopup = Arc<Mutex<PopupFrame>>;
+
 pub(super) struct Painter {
     pub frame: SharedFrame,
+    pub popup: SharedPopup,
     size: (u32, u32),
     gpu: Option<Blit>,
+    popup_gpu: Option<Blit>,
     page_size: Arc<Mutex<(i32, i32)>>,
     scale: Arc<Mutex<f32>>,
     browser: Rc<RefCell<Option<Browser>>>,
@@ -29,14 +40,17 @@ pub(super) struct Painter {
 impl Painter {
     pub(super) fn new(
         frame: SharedFrame,
+        popup: SharedPopup,
         page_size: Arc<Mutex<(i32, i32)>>,
         scale: Arc<Mutex<f32>>,
         browser: Rc<RefCell<Option<Browser>>>,
     ) -> Self {
         Self {
             frame,
+            popup,
             size: (1024, 768),
             gpu: None,
+            popup_gpu: None,
             page_size,
             scale,
             browser,
@@ -87,6 +101,10 @@ impl Viewport for Painter {
         let blit = match &mut self.gpu {
             Some(blit) if blit.format == frame.format => blit,
             _ => self.gpu.insert(Blit::new(frame.device, frame.format)),
+        };
+        let popup_blit = match &mut self.popup_gpu {
+            Some(blit) if blit.format == frame.format => blit,
+            _ => self.popup_gpu.insert(Blit::new(frame.device, frame.format)),
         };
         let mut shared = self
             .frame
@@ -155,6 +173,78 @@ impl Viewport for Painter {
             shared.consumed = shared.revision;
         }
         drop(shared);
+        let mut popup = self
+            .popup
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let popup_visible = popup.visible
+            && popup.rect.2 > 0
+            && popup.rect.3 > 0
+            && popup.frame.width > 0
+            && popup.frame.height > 0;
+        let popup_size = (popup.frame.width, popup.frame.height);
+        if popup_visible && popup.frame.revision != popup.frame.consumed {
+            let fresh = popup_blit
+                .texture
+                .as_ref()
+                .is_none_or(|(_, _, at)| *at != popup_size);
+            if fresh {
+                let texture = frame.device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("CEF popup BGRA"),
+                    size: wgpu::Extent3d {
+                        width: popup_size.0,
+                        height: popup_size.1,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Bgra8Unorm,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                    view_formats: &[],
+                });
+                let view = texture.create_view(&Default::default());
+                let bind = frame.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("CEF popup BGRA"),
+                    layout: &popup_blit.layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(&view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::Sampler(&popup_blit.sampler),
+                        },
+                    ],
+                });
+                popup_blit.texture = Some((texture, bind, popup_size));
+            }
+            if let Some((texture, _, _)) = &popup_blit.texture {
+                frame.queue.write_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    &popup.frame.pixels,
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(popup_size.0 * 4),
+                        rows_per_image: Some(popup_size.1),
+                    },
+                    wgpu::Extent3d {
+                        width: popup_size.0,
+                        height: popup_size.1,
+                        depth_or_array_layers: 1,
+                    },
+                );
+            }
+            popup.frame.consumed = popup.frame.revision;
+        }
+        let popup_rect = popup.rect;
+        drop(popup);
         let mut pass = frame
             .encoder
             .begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -175,10 +265,28 @@ impl Viewport for Painter {
             pass.set_bind_group(0, bind, &[]);
             pass.draw(0..3, 0..1);
         }
+        if popup_visible && let Some((_, bind, _)) = &popup_blit.texture {
+            let scale = scale.max(0.01);
+            let x = (popup_rect.0 as f32 * scale).max(0.0);
+            let y = (popup_rect.1 as f32 * scale).max(0.0);
+            let width = (popup_rect.2 as f32 * scale).max(1.0);
+            let height = (popup_rect.3 as f32 * scale).max(1.0);
+            pass.set_viewport(x, y, width, height, 0.0, 1.0);
+            pass.set_scissor_rect(
+                x.floor() as u32,
+                y.floor() as u32,
+                width.ceil() as u32,
+                height.ceil() as u32,
+            );
+            pass.set_pipeline(&popup_blit.pipeline);
+            pass.set_bind_group(0, bind, &[]);
+            pass.draw(0..3, 0..1);
+        }
     }
 
     fn device_changed(&mut self) {
         self.gpu = None;
+        self.popup_gpu = None;
     }
 }
 
@@ -236,7 +344,11 @@ impl Blit {
                 module: &shader,
                 entry_point: Some("fragment"),
                 compilation_options: Default::default(),
-                targets: &[Some(format.into())],
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
             }),
             primitive: Default::default(),
             depth_stencil: None,
@@ -291,8 +403,20 @@ mod tests {
             revision: 1,
             consumed: 0,
         }));
+        let popup = Arc::new(Mutex::new(PopupFrame {
+            frame: Frame {
+                width: 1,
+                height: 1,
+                pixels: vec![0, 0, 255, 255],
+                revision: 1,
+                consumed: 0,
+            },
+            rect: (1, 0, 1, 1),
+            visible: true,
+        }));
         let mut painter = Painter::new(
             source,
+            popup,
             Arc::new(Mutex::new((2, 2))),
             Arc::new(Mutex::new(1.)),
             Rc::new(RefCell::new(None)),
@@ -371,7 +495,11 @@ mod tests {
             &mapped[260..264],
         ];
         assert_eq!(pixels[0], [255, 0, 0, 255], "top-left CEF pixel");
-        assert_eq!(pixels[1], [0, 255, 0, 255], "top-right CEF pixel");
+        assert_eq!(
+            pixels[1],
+            [255, 0, 0, 255],
+            "popup overlays top-right pixel"
+        );
         assert_eq!(pixels[2], [0, 0, 255, 255], "bottom-left CEF pixel");
         assert_eq!(pixels[3], [255, 255, 255, 255], "bottom-right CEF pixel");
     }
