@@ -20,6 +20,8 @@ mod ghostty_colors;
 mod gtk;
 #[cfg(all(target_os = "linux", feature = "webkitgtk"))]
 pub(crate) mod webkitgtk;
+#[cfg(feature = "cef")]
+pub(crate) mod cef;
 #[cfg(all(target_os = "macos", feature = "ghostty"))]
 pub(crate) use ghostty::processes_changed;
 #[cfg(target_os = "macos")]

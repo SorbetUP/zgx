@@ -51,6 +51,8 @@ webview2 = ["dep:webview2-com", "zgx-gpu/composition", "windows/Win32_Graphics_D
 # (libwebkit2gtk-4.1-0) is opened at run time: building needs none of it,
 # and where it is missing pages are placeholders.
 webkitgtk = []
+# CEF OSR pages composited into the ZGX renderer.
+cef = ["dep:cef"]
 # mimalloc as the program's allocator, in place of the system's: 1-10%
 # fewer cycles in zgx's headless scenes (text 7%, layout 6%, animation
 # 9%), for up to 3 MB more resident memory. A program has one allocator:
@@ -85,6 +87,7 @@ rustc-hash = "2.1"
 accesskit_winit = "0.33.2"
 rfd = "=0.17.2"
 open = "=5.4.4"
+cef = { version = "=156.7.0", default-features = false, features = ["sandbox", "resources"], optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Clipboard images on Wayland, as PNG (clipboard.rs); arboard's version,
