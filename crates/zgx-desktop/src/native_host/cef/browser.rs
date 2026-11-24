@@ -1,5 +1,6 @@
 use std::{
     cell::{Cell, RefCell},
+    collections::HashMap,
     rc::Rc,
     sync::{Arc, Mutex},
 };
@@ -20,11 +21,22 @@ use super::{
 
 pub(super) struct CefWebView(Rc<Page>);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BrowserLifecycle {
+    Creating,
+    Ready,
+    Closing,
+    Closed,
+}
+
 pub(super) struct Page {
     web: zgx::web_view::WeakWebView,
     browser: Rc<RefCell<Option<Browser>>>,
     pending: RefCell<Vec<WebViewCommand>>,
-    closing: Cell<bool>,
+    evaluations: Rc<RefCell<HashMap<i32, EvaluationReply>>>,
+    next_evaluation: Cell<i32>,
+    devtools_registration: RefCell<Option<Registration>>,
+    lifecycle: Cell<BrowserLifecycle>,
     visible: Cell<u32>,
     gpu: zgx::gpu_view::GpuView,
     frame: SharedFrame,
@@ -33,13 +45,80 @@ pub(super) struct Page {
     scale: Arc<Mutex<f32>>,
 }
 
+type EvaluationReply = Box<dyn FnOnce(Result<String, String>)>;
+
+wrap_dev_tools_message_observer! {
+    struct CEFScriptObserver {
+        evaluations: Rc<RefCell<HashMap<i32, EvaluationReply>>>,
+    }
+
+    impl DevToolsMessageObserver {
+        fn on_dev_tools_method_result(
+            &self,
+            _browser: Option<&mut Browser>,
+            message_id: i32,
+            success: i32,
+            result: Option<&[u8]>,
+        ) {
+            let Some(reply) = self.evaluations.borrow_mut().remove(&message_id) else {
+                return;
+            };
+            reply(parse_evaluation_result(success, result));
+        }
+    }
+}
+
+fn parse_evaluation_result(success: i32, result: Option<&[u8]>) -> Result<String, String> {
+    if success == 0 {
+        return Err(result
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+            .unwrap_or("Chromium rejected the JavaScript evaluation")
+            .to_owned());
+    }
+    let bytes = result.ok_or_else(|| "Chromium returned an empty JavaScript result".to_owned())?;
+    let response: serde_json::Value = serde_json::from_slice(bytes)
+        .map_err(|error| format!("Chromium returned invalid evaluation JSON: {error}"))?;
+    let payload = response.get("result").unwrap_or(&response);
+    if let Some(exception) = payload.get("exceptionDetails") {
+        let message = exception
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| {
+                exception
+                    .get("exception")
+                    .and_then(|value| value.get("description"))
+                    .and_then(serde_json::Value::as_str)
+            })
+            .unwrap_or("JavaScript evaluation threw an exception");
+        return Err(message.to_owned());
+    }
+    let value = payload.get("result").unwrap_or(payload);
+    if value.get("type").and_then(serde_json::Value::as_str) == Some("undefined") {
+        return Ok("null".to_owned());
+    }
+    let value = value
+        .get("value")
+        .ok_or_else(|| "JavaScript result was not serializable by value".to_owned())?;
+    serde_json::to_string(value)
+        .map_err(|error| format!("cannot encode JavaScript result: {error}"))
+}
+
 impl WebViewBackend for CefWebView {
     fn run(&self, command: WebViewCommand) {
-        if self.0.closing.get() {
+        if matches!(
+            self.0.lifecycle.get(),
+            BrowserLifecycle::Closing | BrowserLifecycle::Closed
+        ) {
+            if let WebViewCommand::Evaluate {
+                reply: Some(reply), ..
+            } = command
+            {
+                reply(Err("CEF browser is closing".into()));
+            }
             return;
         }
         if let Some(browser) = self.0.browser.borrow().as_ref() {
-            apply(browser, command);
+            apply(&self.0, browser, command);
         } else {
             self.0.pending.borrow_mut().push(command);
         }
@@ -52,7 +131,11 @@ impl WebViewBackend for CefWebView {
 
 impl Drop for CefWebView {
     fn drop(&mut self) {
-        self.0.closing.set(true);
+        self.0.lifecycle.set(BrowserLifecycle::Closing);
+        fail_pending(
+            &self.0,
+            "CEF browser controller was dropped during creation",
+        );
         if let Some(browser) = self.0.browser.borrow().as_ref()
             && let Some(host) = browser.host()
         {
@@ -61,7 +144,22 @@ impl Drop for CefWebView {
     }
 }
 
-fn apply(browser: &Browser, command: WebViewCommand) {
+fn fail_pending(page: &Page, reason: &str) {
+    for command in std::mem::take(&mut *page.pending.borrow_mut()) {
+        if let WebViewCommand::Evaluate {
+            reply: Some(reply), ..
+        } = command
+        {
+            reply(Err(reason.to_owned()));
+        }
+    }
+    let pending = std::mem::take(&mut *page.evaluations.borrow_mut());
+    for (_, reply) in pending {
+        reply(Err(reason.to_owned()));
+    }
+}
+
+fn apply(page: &Page, browser: &Browser, command: WebViewCommand) {
     match command {
         WebViewCommand::LoadUrl(url) => {
             let frame = browser.main_frame();
@@ -104,11 +202,43 @@ fn apply(browser: &Browser, command: WebViewCommand) {
                 }
             }
         }
-        WebViewCommand::Evaluate { reply, .. } => {
+        WebViewCommand::Evaluate { script, reply } => {
             if let Some(reply) = reply {
-                reply(Err(
-                    "CEF JavaScript result callbacks are not wired yet".into()
-                ));
+                if page.devtools_registration.borrow().is_none() {
+                    reply(Err("CEF evaluation observer is unavailable".into()));
+                    return;
+                }
+                let Some(host) = browser.host() else {
+                    reply(Err("CEF browser host is unavailable".into()));
+                    return;
+                };
+                let mut id = page.next_evaluation.get().wrapping_add(1).max(1);
+                while page.evaluations.borrow().contains_key(&id) {
+                    id = id.wrapping_add(1).max(1);
+                }
+                page.next_evaluation.set(id);
+                let Some(mut params) = dictionary_value_create() else {
+                    reply(Err("CEF could not allocate evaluation parameters".into()));
+                    return;
+                };
+                let expression: CefString = script.as_str().into();
+                let expression_key: CefString = "expression".into();
+                let by_value_key: CefString = "returnByValue".into();
+                let await_key: CefString = "awaitPromise".into();
+                let _ = params.set_string(Some(&expression_key), Some(&expression));
+                let _ = params.set_bool(Some(&by_value_key), 1);
+                let _ = params.set_bool(Some(&await_key), 1);
+                page.evaluations.borrow_mut().insert(id, reply);
+                let method: CefString = "Runtime.evaluate".into();
+                if host.execute_dev_tools_method(id, Some(&method), Some(&mut params)) == 0 {
+                    if let Some(reply) = page.evaluations.borrow_mut().remove(&id) {
+                        reply(Err("CEF rejected Runtime.evaluate".into()));
+                    }
+                }
+            } else if let Some(frame) = browser.main_frame() {
+                let script: CefString = script.as_str().into();
+                let source: CefString = "polyscale://evaluate".into();
+                frame.execute_java_script(Some(&script), Some(&source), 1);
             }
         }
         WebViewCommand::Focus(focus) => {
@@ -143,12 +273,13 @@ pub(super) fn backend(web: &WebView) -> Result<Rc<Page>, String> {
         return Ok(page.0.clone());
     }
     runtime::initialize()?;
-    let profile = match &web.options().profile {
-        WebProfile::Default => "default".to_owned(),
-        WebProfile::Ephemeral => format!("ephemeral-{}", web.id()),
-        WebProfile::Named(id) => id.clone(),
+    runtime::ensure_accepting_browsers()?;
+    let (profile, persistent) = match &web.options().profile {
+        WebProfile::Default => ("default".to_owned(), true),
+        WebProfile::Ephemeral => (format!("ephemeral:{}", web.id()), false),
+        WebProfile::Named(id) => (format!("named:{id}"), true),
     };
-    let context = runtime::request_context(&profile)?;
+    let context = runtime::request_context(&profile, persistent)?;
     let frame = Arc::new(Mutex::default());
     let popup = Arc::new(Mutex::default());
     let size = Arc::new(Mutex::new((1024, 768)));
@@ -165,7 +296,10 @@ pub(super) fn backend(web: &WebView) -> Result<Rc<Page>, String> {
         web: web.downgrade(),
         browser: browser.clone(),
         pending: RefCell::new(Vec::new()),
-        closing: Cell::new(false),
+        evaluations: Rc::new(RefCell::new(HashMap::new())),
+        next_evaluation: Cell::new(0),
+        devtools_registration: RefCell::new(None),
+        lifecycle: Cell::new(BrowserLifecycle::Creating),
         visible: Cell::new(0),
         gpu,
         frame,
@@ -178,24 +312,47 @@ pub(super) fn backend(web: &WebView) -> Result<Rc<Page>, String> {
     let closed_weak = weak;
     let callbacks = BrowserCallbacks {
         created: Arc::new(move |browser| {
+            runtime::browser_created(browser.identifier());
+            if runtime::register_browser(&browser).is_err() {
+                if let Some(host) = browser.host() {
+                    host.close_browser(1);
+                }
+                return;
+            }
             let Some(page) = created_weak.upgrade() else {
+                if let Some(host) = browser.host() {
+                    host.close_browser(1);
+                }
                 return;
             };
             *page.browser.borrow_mut() = Some(browser.clone());
+            if page.lifecycle.get() != BrowserLifecycle::Creating {
+                page.lifecycle.set(BrowserLifecycle::Closing);
+                if let Some(host) = browser.host() {
+                    host.close_browser(1);
+                }
+                return;
+            }
+            page.lifecycle.set(BrowserLifecycle::Ready);
             if let Some(host) = browser.host() {
+                let mut observer = CEFScriptObserver::new(page.evaluations.clone());
+                page.devtools_registration
+                    .replace(host.add_dev_tools_message_observer(Some(&mut observer)));
                 host.was_hidden((page.visible.get() == 0) as i32);
                 host.invalidate(PaintElementType::VIEW);
             }
             let pending = std::mem::take(&mut *page.pending.borrow_mut());
             for command in pending {
-                apply(&browser, command);
+                apply(&page, &browser, command);
             }
             runtime::schedule_work(0);
             let _ = page.web.upgrade();
         }),
-        before_close: Arc::new(move || {
-            runtime::browser_closed();
+        before_close: Arc::new(move |identifier| {
+            runtime::browser_closed(identifier);
             if let Some(page) = closed_weak.upgrade() {
+                page.lifecycle.set(BrowserLifecycle::Closed);
+                fail_pending(&page, "CEF browser closed before the operation completed");
                 page.browser.borrow_mut().take();
             }
         }),
@@ -222,6 +379,7 @@ pub(super) fn backend(web: &WebView) -> Result<Rc<Page>, String> {
     };
     let url: CefString = "about:blank".into();
     let mut context = context;
+    runtime::browser_creation_started();
     let accepted = browser_host_create_browser(
         Some(&info),
         Some(&mut client.clone()),
@@ -231,9 +389,9 @@ pub(super) fn backend(web: &WebView) -> Result<Rc<Page>, String> {
         Some(&mut context),
     );
     if accepted == 0 {
+        runtime::browser_creation_failed();
         return Err("CEF rejected asynchronous windowless browser creation".into());
     }
-    runtime::browser_opened();
     runtime::schedule_work(0);
     web.attach(Rc::new(CefWebView(page.clone())));
     Ok(page)
@@ -458,6 +616,44 @@ fn percent_encode(value: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod evaluation_tests {
+    use super::parse_evaluation_result;
+
+    #[test]
+    fn devtools_values_are_returned_as_json() {
+        for (payload, expected) in [
+            (r#"{"result":{"result":{"type":"number","value":3}}}"#, "3"),
+            (r#"{"result":{"type":"number","value":3}}"#, "3"),
+            (
+                r#"{"result":{"result":{"type":"string","value":"hello"}}}"#,
+                r#""hello""#,
+            ),
+            (
+                r#"{"result":{"result":{"type":"object","value":{"name":"polyscale","value":42}}}}"#,
+                r#"{"name":"polyscale","value":42}"#,
+            ),
+            (r#"{"result":{"result":{"type":"undefined"}}}"#, "null"),
+        ] {
+            assert_eq!(
+                parse_evaluation_result(1, Some(payload.as_bytes()))
+                    .unwrap_or_else(|error| panic!("{payload}: {error}")),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn devtools_javascript_exceptions_are_errors() {
+        let response = r#"{"result":{"exceptionDetails":{"text":"Uncaught Error: fixture"}}}"#;
+        assert!(
+            parse_evaluation_result(1, Some(response.as_bytes()))
+                .unwrap_err()
+                .contains("fixture")
+        );
+    }
 }
 
 #[cfg(test)]

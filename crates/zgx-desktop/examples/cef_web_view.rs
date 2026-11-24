@@ -5,6 +5,7 @@ use std::{
     fs,
     io::{Read, Write},
     net::TcpListener,
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     sync::{Arc, Mutex},
     thread,
 };
@@ -41,6 +42,63 @@ const EVENT_CHANGED_FIXTURE: &str = r#"<!doctype html>
 <meta charset="utf-8"><title>CEF event changed</title>
 <p>cef-event-url-changed</p>
 "#;
+
+fn run_evaluation_test(
+    web: WebView,
+    result_path: std::path::PathBuf,
+    window: zgx_desktop::WindowHandle,
+    done: Arc<AtomicBool>,
+) {
+    let remaining = Arc::new(AtomicUsize::new(8));
+    let all_ok = Arc::new(AtomicBool::new(true));
+    let cases = [
+        ("1 + 2", Ok("3")),
+        ("document.title", Ok("\"CEF event changed\"")),
+        ("'result'", Ok("\"result\"")),
+        (
+            "({name:'polyscale',value:42})",
+            Ok("{\"name\":\"polyscale\",\"value\":42}"),
+        ),
+        ("[1,2,3]", Ok("[1,2,3]")),
+        ("undefined", Ok("null")),
+        ("null", Ok("null")),
+        ("throw new Error('fixture')", Err("fixture")),
+    ];
+    for (script, expected) in cases {
+        let remaining = remaining.clone();
+        let all_ok = all_ok.clone();
+        let result_path = result_path.clone();
+        let log_path = result_path.with_extension("log");
+        let window = window.clone();
+        let done = done.clone();
+        web.evaluate_js(script, move |result| {
+            if let Ok(mut log) = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(log_path)
+            {
+                let _ = writeln!(log, "{script}: {result:?} expected={expected:?}");
+            }
+            let matches = match (result, expected) {
+                (Ok(actual), Ok(expected)) => actual == expected,
+                (Err(actual), Err(expected)) => actual.contains(expected),
+                _ => false,
+            };
+            if !matches {
+                all_ok.store(false, Ordering::Release);
+            }
+            if remaining.fetch_sub(1, Ordering::AcqRel) == 1 && !done.swap(true, Ordering::AcqRel) {
+                let result = if all_ok.load(Ordering::Acquire) {
+                    "PASS"
+                } else {
+                    "FAIL"
+                };
+                let _ = fs::write(result_path, result);
+                window.close();
+            }
+        });
+    }
+}
 
 fn start_fixture_server(download_test: bool) -> Result<String, Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
@@ -92,11 +150,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let download_test = std::env::var_os("ZGX_CEF_DOWNLOAD_RESULT").is_some();
     let event_result_path = std::env::var_os("ZGX_CEF_EVENT_RESULT").map(std::path::PathBuf::from);
     let event_test = event_result_path.is_some();
-    let automated = download_test || event_test;
+    let eval_result_path = std::env::var_os("ZGX_CEF_EVAL_RESULT").map(std::path::PathBuf::from);
+    let eval_test = eval_result_path.is_some();
+    let automated = download_test || event_test || eval_test;
     if let Some(result_path) = std::env::var_os("ZGX_CEF_DOWNLOAD_RESULT") {
         fs::write(result_path, format!("START:auto={automated}\n"))?;
     }
     if let Some(result_path) = event_result_path.as_ref() {
+        fs::write(result_path, "START\n")?;
+    }
+    if let Some(result_path) = eval_result_path.as_ref() {
         fs::write(result_path, "START\n")?;
     }
     let origin = start_fixture_server(download_test)?;
@@ -197,12 +260,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 })
             });
+            let eval_done = Arc::new(AtomicBool::new(false));
             if event_test {
                 web.load_html(EVENT_FIXTURE, None);
                 let web = web.clone();
                 cx.tasks.spawn(async move {
                     zgx::timer::sleep(std::time::Duration::from_millis(300)).await;
                     web.load_html(EVENT_CHANGED_FIXTURE, None);
+                });
+            } else if eval_test {
+                web.load_html(EVENT_CHANGED_FIXTURE, None);
+                let eval_web = web.clone();
+                let eval_path = eval_result_path.clone().expect("eval test has result path");
+                let window = cx.window.clone();
+                let eval_done = eval_done.clone();
+                cx.tasks.spawn(async move {
+                    zgx::timer::sleep(std::time::Duration::from_millis(800)).await;
+                    run_evaluation_test(
+                        eval_web,
+                        eval_path.clone(),
+                        window.clone(),
+                        eval_done.clone(),
+                    );
+                    zgx::timer::sleep(std::time::Duration::from_secs(15)).await;
+                    if !eval_done.swap(true, Ordering::AcqRel) {
+                        let _ = fs::write(eval_path, "TIMEOUT");
+                        window.close();
+                    }
                 });
             } else if download_test {
                 web.load_url(origin);
@@ -240,8 +324,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .w_full()
                     .h_full(),
                 );
-            let app = if let Some(subscription) = event_subscription {
-                app.on_mount(move |handle| handle.retain(subscription))
+            let app = if event_subscription.is_some() {
+                app.on_mount(move |handle| {
+                    if let Some(subscription) = event_subscription {
+                        handle.retain(subscription);
+                    }
+                })
             } else {
                 app
             };

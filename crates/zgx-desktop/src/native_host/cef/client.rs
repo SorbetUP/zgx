@@ -21,7 +21,7 @@ pub(super) struct RenderState {
 #[derive(Clone)]
 pub(super) struct BrowserCallbacks {
     pub created: Arc<dyn Fn(Browser)>,
-    pub before_close: Arc<dyn Fn()>,
+    pub before_close: Arc<dyn Fn(i32)>,
 }
 
 wrap_download_handler! {
@@ -155,7 +155,11 @@ wrap_life_span_handler! {
                 (self.callbacks.created)(browser.clone());
             }
         }
-        fn on_before_close(&self, _browser: Option<&mut Browser>) { (self.callbacks.before_close)(); }
+        fn on_before_close(&self, browser: Option<&mut Browser>) {
+            if let Some(browser) = browser {
+                (self.callbacks.before_close)(browser.identifier());
+            }
+        }
     }
 }
 

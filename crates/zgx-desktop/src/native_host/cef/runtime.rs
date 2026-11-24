@@ -1,9 +1,20 @@
 use std::{cell::RefCell, collections::HashMap, path::PathBuf, sync::Arc};
 
 use cef::{self, args::Args, *};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::collections::HashSet;
+use std::sync::{Mutex, OnceLock};
 
-static BROWSERS: AtomicUsize = AtomicUsize::new(0);
+#[derive(Default)]
+struct BrowserTracker {
+    pending_creations: usize,
+    open_ids: HashSet<i32>,
+}
+
+static BROWSERS: OnceLock<Mutex<BrowserTracker>> = OnceLock::new();
+
+fn browsers() -> &'static Mutex<BrowserTracker> {
+    BROWSERS.get_or_init(|| Mutex::new(BrowserTracker::default()))
+}
 
 thread_local! {
     static RUNTIME: RefCell<Option<Runtime>> = const { RefCell::new(None) };
@@ -19,6 +30,8 @@ thread_local! {
 
 struct Runtime {
     contexts: HashMap<String, RequestContext>,
+    browsers: HashMap<i32, Browser>,
+    shutting_down: bool,
 }
 
 wrap_browser_process_handler! {
@@ -29,8 +42,26 @@ wrap_browser_process_handler! {
 }
 
 wrap_app! {
-    struct CEFApplication { handler: BrowserProcessHandler }
-    impl App { fn browser_process_handler(&self) -> Option<BrowserProcessHandler> { Some(self.handler.clone()) } }
+    struct CEFApplication { handler: BrowserProcessHandler, mock_keychain: bool }
+    impl App {
+        fn browser_process_handler(&self) -> Option<BrowserProcessHandler> { Some(self.handler.clone()) }
+        fn on_before_command_line_processing(
+            &self,
+            process_type: Option<&CefString>,
+            command_line: Option<&mut CommandLine>,
+        ) {
+            #[cfg(target_os = "macos")]
+            if self.mock_keychain
+                && process_type.is_none_or(|process_type| process_type.to_string().is_empty())
+                && let Some(command_line) = command_line
+            {
+                let switch: CefString = "use-mock-keychain".into();
+                command_line.append_switch(Some(&switch));
+            }
+            #[cfg(not(target_os = "macos"))]
+            let _ = (process_type, command_line);
+        }
+    }
 }
 
 pub(super) fn set_scheduler(schedule: Arc<dyn Fn(i64)>) {
@@ -171,7 +202,10 @@ fn initialize_inner() -> Result<Runtime, String> {
         .with(|slot| slot.borrow().clone())
         .ok_or("CEF message pump was not connected to the ZGX event loop")?;
     let handler = PumpHandler::new(schedule);
-    let mut app = CEFApplication::new(handler);
+    let mock_keychain = std::env::var_os("ZGX_CEF_EVAL_RESULT").is_some()
+        || std::env::var_os("ZGX_CEF_EVENT_RESULT").is_some()
+        || std::env::var_os("ZGX_CEF_DOWNLOAD_RESULT").is_some();
+    let mut app = CEFApplication::new(handler, mock_keychain);
     #[cfg(target_os = "windows")]
     let sandbox_info = WINDOWS_SANDBOX_INFO.with(std::cell::Cell::get);
     #[cfg(not(target_os = "windows"))]
@@ -187,6 +221,8 @@ fn initialize_inner() -> Result<Runtime, String> {
     }
     Ok(Runtime {
         contexts: HashMap::new(),
+        browsers: HashMap::new(),
+        shutting_down: false,
     })
 }
 
@@ -203,7 +239,7 @@ pub(super) fn initialize() -> Result<(), String> {
     })
 }
 
-pub(super) fn request_context(profile: &str) -> Result<RequestContext, String> {
+pub(super) fn request_context(profile: &str, persistent: bool) -> Result<RequestContext, String> {
     initialize()?;
     RUNTIME.with(|runtime| {
         let mut runtime = runtime.borrow_mut();
@@ -211,14 +247,16 @@ pub(super) fn request_context(profile: &str) -> Result<RequestContext, String> {
         if let Some(context) = runtime.contexts.get(profile) {
             return Ok(context.clone());
         }
-        let root = data_root()?;
-        std::fs::create_dir_all(&root)
-            .map_err(|error| format!("cannot create CEF profile store: {error}"))?;
-        let cache_path = root.join(profile_component(profile)?);
-        std::fs::create_dir_all(&cache_path)
-            .map_err(|error| format!("cannot create CEF profile store: {error}"))?;
         let mut settings = RequestContextSettings::default();
-        settings.cache_path = cache_path.to_string_lossy().as_ref().into();
+        if persistent {
+            let root = data_root()?;
+            std::fs::create_dir_all(&root)
+                .map_err(|error| format!("cannot create CEF profile store: {error}"))?;
+            let cache_path = root.join(profile_component(profile)?);
+            std::fs::create_dir_all(&cache_path)
+                .map_err(|error| format!("cannot create CEF profile store: {error}"))?;
+            settings.cache_path = cache_path.to_string_lossy().as_ref().into();
+        }
         let context =
             cef::request_context_create_context(Some(&settings), None).ok_or_else(|| {
                 format!("CEF could not create request context for profile `{profile}`")
@@ -270,26 +308,121 @@ pub(super) fn pump() {
     });
 }
 
-pub(super) fn browser_opened() {
-    BROWSERS.fetch_add(1, Ordering::AcqRel);
-}
-pub(super) fn browser_closed() {
-    let _ = BROWSERS.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-        Some(n.saturating_sub(1))
-    });
-}
-pub(super) fn has_browsers() -> bool {
-    BROWSERS.load(Ordering::Acquire) != 0
+pub(super) fn browser_creation_started() {
+    browsers()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .pending_creations += 1;
 }
 
-pub(super) fn shutdown() {
+pub(super) fn browser_creation_failed() {
+    let mut tracker = browsers()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    tracker.pending_creations = tracker
+        .pending_creations
+        .checked_sub(1)
+        .expect("CEF creation failure without a pending browser creation");
+}
+
+pub(super) fn browser_created(identifier: i32) {
+    let mut tracker = browsers()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    tracker.pending_creations = tracker
+        .pending_creations
+        .checked_sub(1)
+        .expect("CEF created a browser without a pending creation");
+    assert!(
+        tracker.open_ids.insert(identifier),
+        "CEF reused a browser ID while the previous browser was still open"
+    );
+}
+
+pub(super) fn register_browser(browser: &Browser) -> Result<(), String> {
+    let identifier = browser.identifier();
+    let mut failure = None;
+    RUNTIME.with(|runtime| {
+        let mut runtime = runtime.borrow_mut();
+        let Some(runtime) = runtime.as_mut() else {
+            failure = Some("CEF browser arrived after runtime shutdown".to_owned());
+            return;
+        };
+        if runtime.shutting_down {
+            failure = Some("CEF is shutting down".to_owned());
+            return;
+        }
+        runtime.browsers.insert(identifier, browser.clone());
+    });
+    failure.map_or(Ok(()), Err)
+}
+
+pub(super) fn is_shutting_down() -> bool {
+    RUNTIME.with(|runtime| {
+        runtime
+            .borrow()
+            .as_ref()
+            .is_none_or(|runtime| runtime.shutting_down)
+    })
+}
+
+pub(super) fn begin_shutdown() {
+    let open = RUNTIME.with(|runtime| {
+        let mut runtime = runtime.borrow_mut();
+        let Some(runtime) = runtime.as_mut() else {
+            return Vec::new();
+        };
+        runtime.shutting_down = true;
+        runtime.browsers.values().cloned().collect::<Vec<_>>()
+    });
+    for browser in open {
+        if let Some(host) = browser.host() {
+            host.close_browser(1);
+        }
+    }
+}
+
+pub(super) fn browser_closed(identifier: i32) {
+    let removed = browsers()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .open_ids
+        .remove(&identifier);
+    assert!(
+        removed,
+        "CEF closed an unknown or already-closed browser ID"
+    );
+    RUNTIME.with(|runtime| {
+        if let Some(runtime) = runtime.borrow_mut().as_mut() {
+            runtime.browsers.remove(&identifier);
+        }
+    });
+    schedule_work(0);
+}
+
+pub(super) fn has_browsers() -> bool {
+    let tracker = browsers()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    tracker.pending_creations > 0 || !tracker.open_ids.is_empty()
+}
+
+pub(super) fn ensure_accepting_browsers() -> Result<(), String> {
+    if is_shutting_down() {
+        Err("CEF is shutting down and cannot create another browser".into())
+    } else {
+        Ok(())
+    }
+}
+
+pub(super) fn shutdown() -> Result<(), String> {
+    if has_browsers() {
+        return Err("CEF shutdown requested while browser creation or closure is pending".into());
+    }
     RUNTIME.with(|runtime| {
         if runtime.borrow_mut().take().is_some() {
-            debug_assert!(
-                !has_browsers(),
-                "CEF shutdown requested before browser callbacks closed"
-            );
             cef::shutdown();
         }
     });
+    Ok(())
 }

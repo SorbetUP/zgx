@@ -25,9 +25,9 @@
 //! layer-backed views' layers upright), so a layer's space is top-down when
 //! an odd number of it and its superlayers are flipped. Cuts recheck it
 //! every frame (AppKit may settle it after a view first shows).
-use super::{Shape, shapes};
 #[cfg(all(feature = "macos-webkit", not(feature = "cef")))]
 use super::webkit;
+use super::{Shape, shapes};
 use objc2::{
     ClassType, DefinedClass, MainThreadMarker, MainThreadOnly, Message, define_class, msg_send,
     rc::Retained,

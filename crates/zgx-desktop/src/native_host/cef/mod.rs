@@ -12,8 +12,11 @@ pub(crate) fn page_views() -> PageViews {
 pub(crate) fn pump() {
     runtime::pump();
 }
-pub(crate) fn shutdown() {
-    runtime::shutdown();
+pub(crate) fn shutdown() -> Result<(), String> {
+    runtime::shutdown()
+}
+pub(crate) fn begin_shutdown() {
+    runtime::begin_shutdown();
 }
 pub(crate) fn execute_process() -> Result<Option<i32>, String> {
     runtime::execute_process()

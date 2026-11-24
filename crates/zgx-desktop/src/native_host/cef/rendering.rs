@@ -287,6 +287,20 @@ impl Viewport for Painter {
     fn device_changed(&mut self) {
         self.gpu = None;
         self.popup_gpu = None;
+        {
+            let mut frame = self
+                .frame
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            frame.consumed = frame.revision.wrapping_sub(1);
+        }
+        {
+            let mut popup = self
+                .popup
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            popup.frame.consumed = popup.frame.revision.wrapping_sub(1);
+        }
     }
 }
 
@@ -401,7 +415,7 @@ mod tests {
                 0, 0, 255, 255, 0, 255, 0, 255, 255, 0, 0, 255, 255, 255, 255, 255,
             ],
             revision: 1,
-            consumed: 0,
+            consumed: 1,
         }));
         let popup = Arc::new(Mutex::new(PopupFrame {
             frame: Frame {
@@ -409,7 +423,7 @@ mod tests {
                 height: 1,
                 pixels: vec![0, 0, 255, 255],
                 revision: 1,
-                consumed: 0,
+                consumed: 1,
             },
             rect: (1, 0, 1, 1),
             visible: true,
@@ -421,6 +435,9 @@ mod tests {
             Arc::new(Mutex::new(1.)),
             Rc::new(RefCell::new(None)),
         );
+        // Simulate device loss after the current page and popup frames were
+        // already consumed. They must be re-uploaded without a new CEF paint.
+        painter.device_changed();
         let target = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("CEF painter readback target"),
             size: wgpu::Extent3d {

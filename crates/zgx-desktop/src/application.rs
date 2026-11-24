@@ -1166,6 +1166,8 @@ impl Application {
         #[cfg(feature = "cef")]
         let cef_deadline = Rc::new(Cell::new(None));
         #[cfg(feature = "cef")]
+        let cef_quit_requested = Rc::new(Cell::new(false));
+        #[cfg(feature = "cef")]
         {
             let pump_proxy = proxy.clone();
             crate::native_host::cef::set_scheduler(Arc::new(move |delay_ms| {
@@ -1279,10 +1281,15 @@ impl Application {
             timers,
             #[cfg(feature = "cef")]
             cef_deadline,
+            #[cfg(feature = "cef")]
+            cef_quit_requested,
         };
-        event_loop.run_app(&mut host)?;
+        let run_result = event_loop.run_app(&mut host);
         #[cfg(feature = "cef")]
-        crate::native_host::cef::shutdown();
+        if let Err(error) = crate::native_host::cef::shutdown() {
+            return Err(format!("CEF did not shut down cleanly: {error}").into());
+        }
+        run_result?;
         if let Some(e) = host.error.take() {
             return Err(e.into());
         }
@@ -7527,6 +7534,8 @@ struct WindowManager {
     timers: zgx::timer::Hosted,
     #[cfg(feature = "cef")]
     cef_deadline: Rc<Cell<Option<std::time::Instant>>>,
+    #[cfg(feature = "cef")]
+    cef_quit_requested: Rc<Cell<bool>>,
 }
 impl WindowManager {
     /// A window event, handled now.
@@ -8146,6 +8155,15 @@ impl WindowManager {
         if self.error.is_none() {
             self.error = Some(error.to_string());
         }
+        #[cfg(feature = "cef")]
+        {
+            if !self.cef_quit_requested.replace(true) {
+                crate::native_host::cef::begin_shutdown();
+            }
+            if crate::native_host::cef::has_browsers() {
+                return;
+            }
+        }
         event_loop.exit();
     }
     fn create_pending(&mut self, event_loop: &ActiveEventLoop) -> Result<(), Box<dyn Error>> {
@@ -8342,7 +8360,19 @@ impl WindowManager {
     }
     fn user_event_turn(&mut self, event_loop: &ActiveEventLoop, event: Event) {
         match event {
-            Event::Quit => event_loop.exit(),
+            Event::Quit => {
+                #[cfg(feature = "cef")]
+                {
+                    if !self.cef_quit_requested.replace(true) {
+                        crate::native_host::cef::begin_shutdown();
+                    }
+                    if !crate::native_host::cef::has_browsers() {
+                        event_loop.exit();
+                    }
+                }
+                #[cfg(not(feature = "cef"))]
+                event_loop.exit();
+            }
             #[cfg(feature = "cef")]
             Event::CefMessagePump(deadline) => {
                 let now = std::time::Instant::now();
@@ -8789,6 +8819,11 @@ impl WindowManager {
             self.cef_deadline.set(None);
             crate::native_host::cef::pump();
         }
+        #[cfg(feature = "cef")]
+        if self.cef_quit_requested.get() && !crate::native_host::cef::has_browsers() {
+            event_loop.exit();
+            return;
+        }
         self.app_active();
         #[cfg(target_os = "macos")]
         self.apply_full_screen();
@@ -8804,17 +8839,15 @@ impl WindowManager {
         if self.quit_on_last_window_close
             && self.hosts.is_empty()
             && self.factory.pending.borrow().is_empty()
-            && {
-                #[cfg(feature = "cef")]
-                {
-                    !crate::native_host::cef::has_browsers()
-                }
-                #[cfg(not(feature = "cef"))]
-                {
-                    true
-                }
-            }
         {
+            #[cfg(feature = "cef")]
+            if !self.cef_quit_requested.replace(true) {
+                crate::native_host::cef::begin_shutdown();
+            }
+            #[cfg(feature = "cef")]
+            if crate::native_host::cef::has_browsers() {
+                return;
+            }
             event_loop.exit();
             return;
         }
