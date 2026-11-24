@@ -426,3 +426,37 @@ pub(super) fn shutdown() -> Result<(), String> {
     });
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        browser_closed, browser_created, browser_creation_failed, browser_creation_started,
+        has_browsers,
+    };
+
+    #[test]
+    fn tracks_pending_creations_and_actual_browser_ids() {
+        assert!(!has_browsers());
+        browser_creation_started();
+        assert!(
+            has_browsers(),
+            "an accepted creation must keep shutdown alive"
+        );
+
+        browser_created(9_314_159);
+        assert!(has_browsers(), "the actual CEF ID must stay tracked");
+        assert!(
+            super::shutdown().is_err(),
+            "shutdown must wait for on_before_close"
+        );
+        browser_closed(9_314_159);
+        assert!(!has_browsers(), "only on_before_close releases the browser");
+
+        browser_creation_started();
+        browser_creation_failed();
+        assert!(
+            !has_browsers(),
+            "rejected creation must release its pending slot"
+        );
+    }
+}
