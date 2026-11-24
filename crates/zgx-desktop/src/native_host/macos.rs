@@ -25,7 +25,9 @@
 //! layer-backed views' layers upright), so a layer's space is top-down when
 //! an odd number of it and its superlayers are flipped. Cuts recheck it
 //! every frame (AppKit may settle it after a view first shows).
-use super::{Shape, shapes, webkit};
+use super::{Shape, shapes};
+#[cfg(all(feature = "macos-webkit", not(feature = "cef")))]
+use super::webkit;
 use objc2::{
     ClassType, DefinedClass, MainThreadMarker, MainThreadOnly, Message, define_class, msg_send,
     rc::Retained,
@@ -1150,6 +1152,7 @@ impl Surfaces {
                 match content {
                     // A closed page shows nothing (and gets no new page).
                     NativeContent::Web(web) if web.is_closed() => (None, Some(web.clone())),
+                    #[cfg(all(feature = "macos-webkit", not(feature = "cef")))]
                     NativeContent::Web(web) => {
                         let backend = webkit::backend(web, self.mtm);
                         let page =
@@ -1162,6 +1165,8 @@ impl Surfaces {
                                 });
                         (page, Some(web.clone()))
                     }
+                    #[cfg(any(feature = "cef", not(feature = "macos-webkit")))]
+                    NativeContent::Web(web) => (None, Some(web.clone())),
                     NativeContent::Terminal(terminal) => {
                         term = Some(terminal.clone());
                         (Self::terminal_view(terminal, zoom, self.mtm), None)
@@ -1361,6 +1366,7 @@ impl Surfaces {
         }
         // WebKit fills tiles a size change exposes a frame later: under them,
         // the page's own background rather than the window's.
+        #[cfg(all(feature = "macos-webkit", not(feature = "cef")))]
         if let Some(web) = &clip.web
             && let Some(backend) = web.backend()
             && let Some(page) = backend.as_any().downcast_ref::<webkit::MacWebView>()
@@ -1916,7 +1922,8 @@ fn glass_view(
             let _ = mtm;
             // SAFETY: `new` on an NSView subclass, on the main thread (`mtm`).
             let view: Retained<NSView> = unsafe { msg_send![class, new] };
-            objc2_app_kit::NSAccessibility::setAccessibilityElement(&*view, false);
+            // SAFETY: `NSView` implements the `setAccessibilityElement:` selector.
+            let _: () = unsafe { msg_send![&*view, setAccessibilityElement: false] };
             pane.set_view(Rc::new((
                 view.clone(),
                 std::cell::Cell::new(None::<GlassStyle>),

@@ -28,7 +28,7 @@ pub(crate) use ghostty::processes_changed;
 mod macos;
 #[cfg(target_os = "macos")]
 pub(crate) use macos::modifiers_watched;
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "macos-webkit", not(feature = "cef")))]
 mod webkit;
 #[cfg(all(windows, feature = "webview2"))]
 mod webview2;

@@ -12,7 +12,7 @@ categories = ["gui"]
 
 [features]
 # Image formats (see zgx-gpu): all by default.
-default = ["svg", "png", "jpeg", "gif", "private-api", "cjk-thai-words"]
+default = ["svg", "png", "jpeg", "gif", "private-api", "cjk-thai-words", "macos-webkit"]
 # Words in Chinese, Japanese and Thai by dictionary (zgx's `cjk-thai-words`).
 cjk-thai-words = ["zgx/cjk-thai-words"]
 # Words break at their hyphenation points where text asks (zgx-gpu's
@@ -53,6 +53,8 @@ webview2 = ["dep:webview2-com", "zgx-gpu/composition", "windows/Win32_Graphics_D
 webkitgtk = []
 # CEF OSR pages composited into the ZGX renderer.
 cef = ["dep:cef", "dep:wgpu"]
+# macOS system WebKit pages (disabled when the CEF backend is selected).
+macos-webkit = ["dep:objc2-web-kit"]
 cef-package = ["cef", "cef/build-util", "dep:semver"]
 # mimalloc as the program's allocator, in place of the system's: 1-10%
 # fewer cycles in zgx's headless scenes (text 7%, layout 6%, animation
@@ -136,7 +138,7 @@ objc2-user-notifications = { version = "=0.3.2", default-features = false, featu
 zgx-ghostty-sys = { path = "../zgx-ghostty-sys", version = "0.1.10", optional = true }
 libc = { version = "0.2", optional = true }
 # Native views over zgx (src/native_host): web pages, clipping masks, backdrops.
-objc2-web-kit = { version = "=0.3.2", default-features = false, features = ["std", "block2", "objc2-app-kit", "objc2-core-foundation", "WKWebView", "WKWebViewConfiguration", "WKBackForwardList", "WKBackForwardListItem", "WKNavigationDelegate", "WKNavigation", "WKNavigationAction", "WKNavigationResponse", "WKWebsiteDataStore", "WKWebsiteDataRecord", "WKUserContentController", "WKUserScript", "WKScriptMessageHandler", "WKScriptMessage", "WKUIDelegate", "WKWindowFeatures", "WKFrameInfo", "WKSecurityOrigin", "WKPreferences", "WKURLSchemeHandler", "WKURLSchemeTask", "WKOpenPanelParameters", "WKFindConfiguration", "WKFindResult", "WKDownload", "WKDownloadDelegate"] }
+objc2-web-kit = { version = "=0.3.2", default-features = false, features = ["std", "block2", "objc2-app-kit", "objc2-core-foundation", "WKWebView", "WKWebViewConfiguration", "WKBackForwardList", "WKBackForwardListItem", "WKNavigationDelegate", "WKNavigation", "WKNavigationAction", "WKNavigationResponse", "WKWebsiteDataStore", "WKWebsiteDataRecord", "WKUserContentController", "WKUserScript", "WKScriptMessageHandler", "WKScriptMessage", "WKUIDelegate", "WKWindowFeatures", "WKFrameInfo", "WKSecurityOrigin", "WKPreferences", "WKURLSchemeHandler", "WKURLSchemeTask", "WKOpenPanelParameters", "WKFindConfiguration", "WKFindResult", "WKDownload", "WKDownloadDelegate"], optional = true }
 # Answers custom-scheme requests on the main queue, from whatever thread served them.
 dispatch2 = "0.3"
 block2 = "0.6"
