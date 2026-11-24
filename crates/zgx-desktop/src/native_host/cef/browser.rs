@@ -7,7 +7,7 @@ use std::{
 use cef::*;
 use zgx::{
     compose::{View, component, div, gpu_view, text},
-    input::{InputEvent, PointerButton},
+    input::{InputEvent, Key, Modifiers, PointerButton},
     style::Styled,
     web_view::{WebProfile, WebView, WebViewBackend, WebViewCommand},
 };
@@ -364,8 +364,76 @@ fn input(page: &Page, event: &InputEvent) {
                 host.send_key_event(Some(&event));
             }
         }
+        InputEvent::KeyDown { key, modifiers, .. } => {
+            if let Some(code) = cef_key_code(&key) {
+                host.send_key_event(Some(&KeyEvent {
+                    type_: KeyEventType::RAWKEYDOWN,
+                    modifiers: cef_modifiers(modifiers),
+                    windows_key_code: code,
+                    ..Default::default()
+                }));
+            }
+        }
+        InputEvent::KeyUp { key, modifiers } => {
+            if let Some(code) = cef_key_code(&key) {
+                host.send_key_event(Some(&KeyEvent {
+                    type_: KeyEventType::KEYUP,
+                    modifiers: cef_modifiers(modifiers),
+                    windows_key_code: code,
+                    ..Default::default()
+                }));
+            }
+        }
         _ => {}
     }
+}
+
+fn cef_key_code(key: &Key) -> Option<i32> {
+    Some(match key {
+        Key::Tab => 0x09,
+        Key::Enter => 0x0d,
+        Key::Space => 0x20,
+        Key::Escape => 0x1b,
+        Key::Backspace => 0x08,
+        Key::Delete => 0x2e,
+        Key::ArrowLeft => 0x25,
+        Key::ArrowUp => 0x26,
+        Key::ArrowRight => 0x27,
+        Key::ArrowDown => 0x28,
+        Key::Home => 0x24,
+        Key::End => 0x23,
+        Key::PageUp => 0x21,
+        Key::PageDown => 0x22,
+        Key::Insert => 0x2d,
+        Key::ContextMenu => 0x5d,
+        Key::Function(n @ 1..=24) => 0x70 + i32::from(*n) - 1,
+        Key::Function(_) => return None,
+        Key::Character(value) => {
+            let mut chars = value.chars();
+            let ch = chars.next()?;
+            if !ch.is_ascii() || chars.next().is_some() {
+                return None;
+            }
+            i32::from(ch.to_ascii_uppercase() as u8)
+        }
+    })
+}
+
+fn cef_modifiers(modifiers: Modifiers) -> u32 {
+    let mut flags = 0;
+    if modifiers.shift {
+        flags |= cef::sys::cef_event_flags_t::EVENTFLAG_SHIFT_DOWN.0;
+    }
+    if modifiers.control {
+        flags |= cef::sys::cef_event_flags_t::EVENTFLAG_CONTROL_DOWN.0;
+    }
+    if modifiers.alt {
+        flags |= cef::sys::cef_event_flags_t::EVENTFLAG_ALT_DOWN.0;
+    }
+    if modifiers.meta {
+        flags |= cef::sys::cef_event_flags_t::EVENTFLAG_COMMAND_DOWN.0;
+    }
+    flags
 }
 
 fn escape_attr(value: &str) -> String {
@@ -384,4 +452,31 @@ fn percent_encode(value: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{cef_key_code, cef_modifiers};
+    use zgx::input::{Key, Modifiers};
+
+    #[test]
+    fn browser_keys_map_to_chromium_virtual_keys() {
+        assert_eq!(cef_key_code(&Key::Character("c".into())), Some(0x43));
+        assert_eq!(cef_key_code(&Key::Character("A".into())), Some(0x41));
+        assert_eq!(cef_key_code(&Key::ArrowLeft), Some(0x25));
+        assert_eq!(cef_key_code(&Key::Enter), Some(0x0d));
+        assert_eq!(cef_key_code(&Key::Function(12)), Some(0x7b));
+        assert_eq!(cef_key_code(&Key::Function(25)), None);
+    }
+
+    #[test]
+    fn browser_modifiers_keep_platform_shortcut_keys() {
+        let flags = cef_modifiers(Modifiers {
+            shift: true,
+            control: true,
+            alt: true,
+            meta: true,
+        });
+        assert_eq!(flags, 2 | 4 | 8 | 128);
+    }
 }
