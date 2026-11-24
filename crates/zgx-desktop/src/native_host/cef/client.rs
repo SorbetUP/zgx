@@ -29,6 +29,15 @@ wrap_download_handler! {
         statuses: Rc<RefCell<HashMap<u32, zgx::web_view::DownloadStatusFn>>>,
     }
     impl DownloadHandler {
+        fn can_download(
+            &self,
+            _browser: Option<&mut Browser>,
+            _url: Option<&CefString>,
+            _request_method: Option<&CefString>,
+        ) -> i32 {
+            1
+        }
+
         fn on_before_download(
             &self,
             _browser: Option<&mut Browser>,
@@ -211,13 +220,61 @@ wrap_render_handler! {
 }
 
 wrap_load_handler! {
-    pub(super) struct CEFLoadHandler;
+    pub(super) struct CEFLoadHandler { web: zgx::web_view::WeakWebView }
     impl LoadHandler {
         fn on_load_start(&self, _browser: Option<&mut Browser>, frame: Option<&mut cef::Frame>, _transition: TransitionType) {
+            let Some(frame) = frame.filter(|frame| frame.is_main() != 0) else { return };
+            let url = CefString::from(&frame.url()).to_string();
+            let web = self.web.clone();
+            zgx::native_view::post(move || {
+                if let Some(web) = web.upgrade() {
+                    web.update_state(|state| {
+                        state.url = url.clone();
+                        state.loading = true;
+                        state.progress = 0.05;
+                        state.error = None;
+                    });
+                    web.emit(zgx::web_view::WebViewEvent::NavigationStarted { url: url.clone() });
+                    web.emit(zgx::web_view::WebViewEvent::NavigationCommitted { url });
+                }
+            });
         }
-        fn on_load_end(&self, _browser: Option<&mut Browser>, frame: Option<&mut cef::Frame>, status: i32) {
+        fn on_load_end(&self, browser: Option<&mut Browser>, frame: Option<&mut cef::Frame>, _status: i32) {
+            let Some(frame) = frame.filter(|frame| frame.is_main() != 0) else { return };
+            let url = CefString::from(&frame.url()).to_string();
+            let (can_go_back, can_go_forward) = browser
+                .map(|browser| (browser.can_go_back() != 0, browser.can_go_forward() != 0))
+                .unwrap_or_default();
+            let web = self.web.clone();
+            zgx::native_view::post(move || {
+                if let Some(web) = web.upgrade() {
+                    web.update_state(|state| {
+                        state.url = url.clone();
+                        state.loading = false;
+                        state.progress = 1.0;
+                        state.can_go_back = can_go_back;
+                        state.can_go_forward = can_go_forward;
+                        state.error = None;
+                    });
+                    web.emit(zgx::web_view::WebViewEvent::NavigationFinished { url });
+                }
+            });
         }
-        fn on_load_error(&self, _browser: Option<&mut Browser>, _frame: Option<&mut cef::Frame>, code: Errorcode, text: Option<&CefString>, url: Option<&CefString>) {
+        fn on_load_error(&self, _browser: Option<&mut Browser>, frame: Option<&mut cef::Frame>, code: Errorcode, text: Option<&CefString>, url: Option<&CefString>) {
+            let Some(frame) = frame.filter(|frame| frame.is_main() != 0) else { return };
+            let url = url.map(ToString::to_string).unwrap_or_else(|| CefString::from(&frame.url()).to_string());
+            let error = format!("{code:?}: {}", text.map(ToString::to_string).unwrap_or_default());
+            let web = self.web.clone();
+            zgx::native_view::post(move || {
+                if let Some(web) = web.upgrade() {
+                    web.update_state(|state| {
+                        state.url = url.clone();
+                        state.loading = false;
+                        state.error = Some(error.clone());
+                    });
+                    web.emit(zgx::web_view::WebViewEvent::NavigationFailed { url, error });
+                }
+            });
         }
     }
 }
@@ -248,7 +305,7 @@ pub(super) fn client(
     };
     let render = CEFRenderHandler::new(state);
     let life = CEFLifeSpanHandler::new(callbacks);
-    let load = CEFLoadHandler::new();
+    let load = CEFLoadHandler::new(web.clone());
     let download = CEFDownloadHandler::new(web, Rc::new(RefCell::new(HashMap::new())));
     CEFClient::new(render, life, load, download)
 }

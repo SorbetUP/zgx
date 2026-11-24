@@ -6,7 +6,14 @@ use zgx::{
     web_view::{WebView, WebViewOptions},
 };
 use zgx_desktop::{Application, WindowOptions};
-use std::fs;
+use std::{
+    fs,
+    io::{Read, Write},
+    net::TcpListener,
+    thread,
+};
+
+const DOWNLOAD_PAYLOAD: &[u8] = b"cef-download-payload";
 
 const FIXTURE: &str = r#"<!doctype html>
 <meta charset="utf-8"><title>CEF OSR fixture</title>
@@ -21,15 +28,58 @@ const FIXTURE: &str = r#"<!doctype html>
 <main><div id="red">RED PIXEL</div><div id="green">GREEN PIXEL</div>
 <div id="blue"><input id="typing" aria-label="typing fixture" placeholder="click and type"></div>
 <div id="gold"><button onclick="location.hash='navigated'">Navigate</button>
-<a id="download" download="cef-fixture.txt" href="data:text/plain,cef-download-payload">Download fixture</a></div></main>
+<a id="download" href="/download">Download fixture</a></div></main>
 "#;
 
+fn start_fixture_server(automated: bool) -> Result<String, Box<dyn std::error::Error>> {
+    let listener = TcpListener::bind(("127.0.0.1", 0))?;
+    let address = listener.local_addr()?;
+    let origin = format!("http://{address}");
+    let result_path = std::env::var_os("ZGX_CEF_DOWNLOAD_RESULT").map(std::path::PathBuf::from);
+    thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let mut request = [0; 2048];
+            let count = stream.read(&mut request).unwrap_or(0);
+            let request = String::from_utf8_lossy(&request[..count]);
+            let path = request.split_whitespace().nth(1).unwrap_or("/");
+            if let Some(result_path) = result_path.as_ref() {
+                if let Ok(mut result) = fs::OpenOptions::new().create(true).append(true).open(result_path) {
+                    let _ = writeln!(result, "HTTP:{path} auto={automated}");
+                }
+            }
+            let (status, content_type, headers, body) = if path == "/download" || automated {
+                (
+                    "200 OK",
+                    "text/plain",
+                    "Content-Disposition: attachment; filename=\"cef-fixture.txt\"\r\n",
+                    DOWNLOAD_PAYLOAD,
+                )
+            } else {
+                ("200 OK", "text/html; charset=utf-8", "", FIXTURE.as_bytes())
+            };
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.write_all(body);
+        }
+    });
+    Ok(origin)
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let automated = std::env::var_os("ZGX_CEF_DOWNLOAD_RESULT").is_some();
+    if let Some(result_path) = std::env::var_os("ZGX_CEF_DOWNLOAD_RESULT") {
+        fs::write(result_path, format!("START:auto={automated}\n"))?;
+    }
+    let origin = start_fixture_server(automated)?;
     Application::new()
         .window(WindowOptions {
             title: "CEF OSR fixture".into(),
             width: 900.,
             height: 650.,
+            visible: !automated,
             ..Default::default()
         })
         .run(|cx| {
@@ -38,17 +88,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .join(format!("zgx-cef-download-{}.txt", std::process::id()));
             let _ = fs::remove_file(&download_path);
             let completed_path = download_path.clone();
+            let window = cx.window.clone();
+            let result_path = std::env::var_os("ZGX_CEF_DOWNLOAD_RESULT").map(std::path::PathBuf::from);
             web.set_download_handler(move |request, responder| {
                 println!("CEF_DOWNLOAD_REQUEST {} {}", request.name, request.mime);
                 let completed_path = completed_path.clone();
+                let result_path = result_path.clone();
+                let window = window.clone();
+                if let Some(result_path) = result_path.as_ref() {
+                    let _ = fs::write(result_path, format!("REQUEST:{}:{}", request.name, request.mime));
+                }
                 responder.save_to(download_path.clone(), move |status| match status {
                     zgx::web_view::DownloadStatus::Progress { received, total } => {
                         println!("CEF_DOWNLOAD_PROGRESS {received} {total:?}");
                     }
                     zgx::web_view::DownloadStatus::Finished => {
                         let matches = fs::read(&completed_path)
-                            .is_ok_and(|bytes| bytes == b"cef-download-payload");
+                            .is_ok_and(|bytes| bytes == DOWNLOAD_PAYLOAD);
                         println!("CEF_DOWNLOAD_{}", if matches { "PASS" } else { "FAIL" });
+                        if let Some(result_path) = result_path.as_ref() {
+                            let _ = fs::write(result_path, if matches { "PASS" } else { "FAIL" });
+                            window.close();
+                        }
                         let _ = fs::remove_file(&completed_path);
                     }
                     zgx::web_view::DownloadStatus::Failed(reason) => {
@@ -57,7 +118,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     _ => eprintln!("CEF_DOWNLOAD_UNKNOWN_STATUS"),
                 });
             });
-            web.load_html(FIXTURE, Some("https://fixture.invalid/"));
+            let fixture = if automated {
+                None
+            } else {
+                Some(FIXTURE.to_owned())
+            };
+            if let Some(fixture) = fixture {
+                web.load_html(&fixture, Some(&origin));
+            } else {
+                web.load_url(origin);
+            }
             let page = web.clone();
             let visible = cx.ui.signal(true);
             let show = visible.clone();
