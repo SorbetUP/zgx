@@ -203,6 +203,7 @@ pub(super) fn backend(web: &WebView) -> Result<Rc<Page>, String> {
         page.scale.clone(),
         Arc::new(move || invalidator.invalidate()),
         callbacks,
+        web.downgrade(),
     );
     let info = WindowInfo {
         windowless_rendering_enabled: 1,

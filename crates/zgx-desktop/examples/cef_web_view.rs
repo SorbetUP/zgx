@@ -6,6 +6,7 @@ use zgx::{
     web_view::{WebView, WebViewOptions},
 };
 use zgx_desktop::{Application, WindowOptions};
+use std::fs;
 
 const FIXTURE: &str = r#"<!doctype html>
 <meta charset="utf-8"><title>CEF OSR fixture</title>
@@ -19,7 +20,8 @@ const FIXTURE: &str = r#"<!doctype html>
 </style>
 <main><div id="red">RED PIXEL</div><div id="green">GREEN PIXEL</div>
 <div id="blue"><input id="typing" aria-label="typing fixture" placeholder="click and type"></div>
-<div id="gold"><button onclick="location.hash='navigated'">Navigate</button></div></main>
+<div id="gold"><button onclick="location.hash='navigated'">Navigate</button>
+<a id="download" download="cef-fixture.txt" href="data:text/plain,cef-download-payload">Download fixture</a></div></main>
 "#;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -32,6 +34,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .run(|cx| {
             let web = WebView::new(&cx.ui.runtime, WebViewOptions::default());
+            let download_path = std::env::temp_dir()
+                .join(format!("zgx-cef-download-{}.txt", std::process::id()));
+            let _ = fs::remove_file(&download_path);
+            let completed_path = download_path.clone();
+            web.set_download_handler(move |request, responder| {
+                println!("CEF_DOWNLOAD_REQUEST {} {}", request.name, request.mime);
+                let completed_path = completed_path.clone();
+                responder.save_to(download_path.clone(), move |status| match status {
+                    zgx::web_view::DownloadStatus::Progress { received, total } => {
+                        println!("CEF_DOWNLOAD_PROGRESS {received} {total:?}");
+                    }
+                    zgx::web_view::DownloadStatus::Finished => {
+                        let matches = fs::read(&completed_path)
+                            .is_ok_and(|bytes| bytes == b"cef-download-payload");
+                        println!("CEF_DOWNLOAD_{}", if matches { "PASS" } else { "FAIL" });
+                        let _ = fs::remove_file(&completed_path);
+                    }
+                    zgx::web_view::DownloadStatus::Failed(reason) => {
+                        eprintln!("CEF_DOWNLOAD_FAILED {reason}");
+                    }
+                    _ => eprintln!("CEF_DOWNLOAD_UNKNOWN_STATUS"),
+                });
+            });
             web.load_html(FIXTURE, Some("https://fixture.invalid/"));
             let page = web.clone();
             let visible = cx.ui.signal(true);

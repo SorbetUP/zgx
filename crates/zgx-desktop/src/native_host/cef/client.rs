@@ -1,4 +1,9 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    cell::RefCell,
+    collections::HashMap,
+    rc::Rc,
+    sync::{Arc, Mutex},
+};
 
 use cef::{self, *};
 
@@ -16,6 +21,120 @@ pub(super) struct RenderState {
 pub(super) struct BrowserCallbacks {
     pub created: Arc<dyn Fn(Browser)>,
     pub before_close: Arc<dyn Fn()>,
+}
+
+wrap_download_handler! {
+    pub(super) struct CEFDownloadHandler {
+        web: zgx::web_view::WeakWebView,
+        statuses: Rc<RefCell<HashMap<u32, zgx::web_view::DownloadStatusFn>>>,
+    }
+    impl DownloadHandler {
+        fn on_before_download(
+            &self,
+            _browser: Option<&mut Browser>,
+            item: Option<&mut DownloadItem>,
+            suggested_name: Option<&CefString>,
+            callback: Option<&mut BeforeDownloadCallback>,
+        ) -> i32 {
+            let (Some(item), Some(callback)) = (item, callback) else {
+                return 0;
+            };
+            let id = item.id();
+            let url = CefString::from(&item.url()).to_string();
+            let mime = CefString::from(&item.mime_type()).to_string();
+            let name = suggested_name
+                .map(ToString::to_string)
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| CefString::from(&item.suggested_file_name()).to_string());
+            let Some(web) = self.web.upgrade() else {
+                callback.cont(None, 0);
+                return 1;
+            };
+
+            let callback = callback.clone();
+            let statuses = self.statuses.clone();
+            web.download(
+                zgx::web_view::DownloadRequest::new(url, name, mime),
+                zgx::web_view::DownloadResponder::new(move |selection| match selection {
+                    Some((path, status)) => {
+                        statuses.borrow_mut().insert(id, status);
+                        let path = path.to_string_lossy().into_owned();
+                        let path: CefString = path.as_str().into();
+                        callback.cont(Some(&path), 0);
+                    }
+                    None => callback.cont(None, 0),
+                }),
+            );
+            1
+        }
+
+        fn on_download_updated(
+            &self,
+            _browser: Option<&mut Browser>,
+            item: Option<&mut DownloadItem>,
+            _callback: Option<&mut DownloadItemCallback>,
+        ) {
+            let Some(item) = item else { return };
+            let id = item.id();
+            if item.is_complete() != 0 {
+                update_download_status(&mut self.statuses.borrow_mut(), id, DownloadUpdate::Finished);
+            } else if item.is_canceled() != 0 {
+                update_download_status(
+                    &mut self.statuses.borrow_mut(),
+                    id,
+                    DownloadUpdate::Failed("Download cancelled".into()),
+                );
+            } else if item.is_interrupted() != 0 {
+                let reason = format!("{:?}", item.interrupt_reason());
+                update_download_status(
+                    &mut self.statuses.borrow_mut(),
+                    id,
+                    DownloadUpdate::Failed(reason),
+                );
+            } else {
+                let total = item.total_bytes();
+                update_download_status(
+                    &mut self.statuses.borrow_mut(),
+                    id,
+                    DownloadUpdate::Progress {
+                        received: item.received_bytes().max(0) as u64,
+                        total: (total >= 0).then_some(total as u64),
+                    },
+                );
+            }
+        }
+    }
+}
+
+enum DownloadUpdate {
+    Progress { received: u64, total: Option<u64> },
+    Finished,
+    Failed(String),
+}
+
+fn update_download_status(
+    statuses: &mut HashMap<u32, zgx::web_view::DownloadStatusFn>,
+    id: u32,
+    update: DownloadUpdate,
+) {
+    use zgx::web_view::DownloadStatus;
+    match update {
+        DownloadUpdate::Progress { received, total } => {
+            if let Some(status) = statuses.get_mut(&id) {
+                status(DownloadStatus::Progress { received, total });
+            }
+        }
+        DownloadUpdate::Finished => {
+            if let Some(mut status) = statuses.remove(&id) {
+                status(DownloadStatus::Finished);
+            }
+        }
+        DownloadUpdate::Failed(reason) => {
+            if let Some(mut status) = statuses.remove(&id) {
+                status(DownloadStatus::Failed(reason));
+            }
+        }
+    }
 }
 
 wrap_life_span_handler! {
@@ -104,11 +223,12 @@ wrap_load_handler! {
 }
 
 wrap_client! {
-pub(super) struct CEFClient { render: RenderHandler, life: LifeSpanHandler, load: LoadHandler }
+pub(super) struct CEFClient { render: RenderHandler, life: LifeSpanHandler, load: LoadHandler, download: DownloadHandler }
     impl Client {
         fn render_handler(&self) -> Option<RenderHandler> { Some(self.render.clone()) }
         fn life_span_handler(&self) -> Option<LifeSpanHandler> { Some(self.life.clone()) }
         fn load_handler(&self) -> Option<LoadHandler> { Some(self.load.clone()) }
+        fn download_handler(&self) -> Option<DownloadHandler> { Some(self.download.clone()) }
     }
 }
 
@@ -118,6 +238,7 @@ pub(super) fn client(
     scale: Arc<Mutex<f32>>,
     invalidate: Arc<dyn Fn()>,
     callbacks: BrowserCallbacks,
+    web: zgx::web_view::WeakWebView,
 ) -> Client {
     let state = RenderState {
         frame,
@@ -128,5 +249,78 @@ pub(super) fn client(
     let render = CEFRenderHandler::new(state);
     let life = CEFLifeSpanHandler::new(callbacks);
     let load = CEFLoadHandler::new();
-    CEFClient::new(render, life, load)
+    let download = CEFDownloadHandler::new(web, Rc::new(RefCell::new(HashMap::new())));
+    CEFClient::new(render, life, load, download)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{cell::RefCell, collections::HashMap, rc::Rc};
+
+    use super::{DownloadUpdate, update_download_status};
+    use zgx::web_view::DownloadStatus;
+
+    #[test]
+    fn download_progress_and_completion_reach_the_registered_handler_once() {
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let recorded = seen.clone();
+        let mut statuses: HashMap<u32, zgx::web_view::DownloadStatusFn> = HashMap::new();
+        statuses.insert(7, Box::new(move |status| recorded.borrow_mut().push(status)));
+
+        update_download_status(
+            &mut statuses,
+            7,
+            DownloadUpdate::Progress {
+                received: 4,
+                total: Some(9),
+            },
+        );
+        update_download_status(&mut statuses, 7, DownloadUpdate::Finished);
+        update_download_status(&mut statuses, 7, DownloadUpdate::Finished);
+
+        assert!(statuses.is_empty());
+        assert_eq!(
+            *seen.borrow(),
+            [
+                DownloadStatus::Progress {
+                    received: 4,
+                    total: Some(9),
+                },
+                DownloadStatus::Finished,
+            ]
+        );
+    }
+
+    #[test]
+    fn cancelled_and_interrupted_downloads_finish_with_an_error() {
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let recorded = seen.clone();
+        let mut statuses: HashMap<u32, zgx::web_view::DownloadStatusFn> = HashMap::new();
+        statuses.insert(1, Box::new(move |status| recorded.borrow_mut().push(status)));
+        update_download_status(
+            &mut statuses,
+            1,
+            DownloadUpdate::Failed("Download cancelled".into()),
+        );
+        assert_eq!(
+            seen.borrow().as_slice(),
+            [DownloadStatus::Failed("Download cancelled".into())]
+        );
+
+        let recorded = seen.clone();
+        statuses.insert(2, Box::new(move |status| recorded.borrow_mut().push(status)));
+        update_download_status(
+            &mut statuses,
+            2,
+            DownloadUpdate::Failed("NetworkFailed".into()),
+        );
+        assert_eq!(
+            seen.borrow().as_slice(),
+            [
+                DownloadStatus::Failed("Download cancelled".into()),
+                DownloadStatus::Failed("NetworkFailed".into()),
+            ]
+        );
+        assert!(statuses.is_empty());
+    }
 }
