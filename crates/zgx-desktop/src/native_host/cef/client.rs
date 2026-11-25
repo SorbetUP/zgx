@@ -39,6 +39,7 @@ wrap_download_handler! {
     pub(super) struct CEFDownloadHandler {
         web: zgx::web_view::WeakWebView,
         statuses: Rc<RefCell<HashMap<u32, zgx::web_view::DownloadStatusFn>>>,
+        cancel_paths: Rc<RefCell<HashMap<u32, std::path::PathBuf>>>,
     }
     impl DownloadHandler {
         fn can_download(
@@ -68,12 +69,17 @@ wrap_download_handler! {
                 .filter(|name| !name.is_empty())
                 .unwrap_or_else(|| CefString::from(&item.suggested_file_name()).to_string());
             let Some(web) = self.web.upgrade() else {
-                callback.cont(None, 0);
+                // CEF 156's BeforeDownloadCallback has no cancel method and an
+                // empty path means its default temp directory. Give the
+                // download a private, disposable path and cancel it from the
+                // first DownloadItemCallback, the supported cancellation API.
+                continue_to_cancelled_path(id, &callback, &self.cancel_paths);
                 return 1;
             };
 
             let callback = callback.clone();
             let statuses = self.statuses.clone();
+            let cancel_paths = self.cancel_paths.clone();
             web.download(
                 zgx::web_view::DownloadRequest::new(url, name, mime),
                 zgx::web_view::DownloadResponder::new(move |selection| match selection {
@@ -83,7 +89,11 @@ wrap_download_handler! {
                         let path: CefString = path.as_str().into();
                         callback.cont(Some(&path), 0);
                     }
-                    None => callback.cont(None, 0),
+                    // BeforeDownloadCallback::Continue cannot cancel in CEF
+                    // 156. Do not pass an empty path (which silently writes
+                    // to the temp directory); use a private target and cancel
+                    // via DownloadItemCallback as soon as CEF exposes it.
+                    None => continue_to_cancelled_path(id, &callback, &cancel_paths),
                 }),
             );
             1
@@ -93,10 +103,20 @@ wrap_download_handler! {
             &self,
             _browser: Option<&mut Browser>,
             item: Option<&mut DownloadItem>,
-            _callback: Option<&mut DownloadItemCallback>,
+            callback: Option<&mut DownloadItemCallback>,
         ) {
             let Some(item) = item else { return };
             let id = item.id();
+            if let Some(path) = self.cancel_paths.borrow().get(&id).cloned() {
+                if let Some(callback) = callback {
+                    callback.cancel();
+                }
+                if item.is_canceled() != 0 || item.is_interrupted() != 0 || item.is_complete() != 0 {
+                    self.cancel_paths.borrow_mut().remove(&id);
+                    remove_cancelled_download_files(&path);
+                }
+                return;
+            }
             if item.is_complete() != 0 {
                 update_download_status(&mut self.statuses.borrow_mut(), id, DownloadUpdate::Finished);
             } else if item.is_canceled() != 0 {
@@ -125,6 +145,38 @@ wrap_download_handler! {
             }
         }
     }
+}
+
+impl Drop for CEFDownloadHandler {
+    fn drop(&mut self) {
+        for path in self.cancel_paths.borrow().values() {
+            remove_cancelled_download_files(path);
+        }
+    }
+}
+
+fn continue_to_cancelled_path(
+    id: u32,
+    callback: &BeforeDownloadCallback,
+    cancel_paths: &Rc<RefCell<HashMap<u32, std::path::PathBuf>>>,
+) {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    let path = std::env::temp_dir().join(format!(
+        "polyscale-cancelled-{}-{id}-{nonce}.part",
+        std::process::id()
+    ));
+    cancel_paths.borrow_mut().insert(id, path.clone());
+    let path_string: CefString = path.to_string_lossy().as_ref().into();
+    callback.cont(Some(&path_string), 0);
+}
+
+fn remove_cancelled_download_files(path: &std::path::Path) {
+    let _ = std::fs::remove_file(path);
+    let mut partial = path.as_os_str().to_os_string();
+    partial.push(".crdownload");
+    let _ = std::fs::remove_file(std::path::PathBuf::from(partial));
 }
 
 wrap_audio_handler! {
@@ -840,7 +892,11 @@ pub(super) fn client(
     );
     let load = CEFLoadHandler::new(web.clone(), navigation_started);
     let display = CEFDisplayHandler::new(web.clone());
-    let download = CEFDownloadHandler::new(web.clone(), Rc::new(RefCell::new(HashMap::new())));
+    let download = CEFDownloadHandler::new(
+        web.clone(),
+        Rc::new(RefCell::new(HashMap::new())),
+        Rc::new(RefCell::new(HashMap::new())),
+    );
     let audio = CEFAudioHandler::new(web.clone());
     let find = CEFFindHandler::new(find_replies);
     let permission = CEFPermissionHandler::new(profile, store, dialogs, tasks);
@@ -982,6 +1038,29 @@ mod tests {
             ]
         );
         assert!(statuses.is_empty());
+    }
+
+    #[test]
+    fn refused_download_cleanup_removes_payload_and_partial_file() {
+        let root = std::env::temp_dir().join(format!(
+            "zgx-cef-refused-download-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let target = root.join("refused.part");
+        let partial = root.join("refused.part.crdownload");
+        std::fs::write(&target, b"payload").unwrap();
+        std::fs::write(&partial, b"partial").unwrap();
+
+        super::remove_cancelled_download_files(&target);
+
+        assert!(!target.exists());
+        assert!(!partial.exists());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
