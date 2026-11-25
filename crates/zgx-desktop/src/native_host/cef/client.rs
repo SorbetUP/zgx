@@ -14,6 +14,7 @@ use super::{
 };
 
 pub(super) type HtmlDocuments = Arc<Mutex<HashMap<String, Arc<Vec<u8>>>>>;
+type HtmlHandlerKeepAlive = Arc<Mutex<HashMap<u64, ResourceRequestHandler>>>;
 
 pub(super) type FindReplies = Rc<RefCell<VecDeque<FindReply>>>;
 type FindReply = Box<dyn FnOnce(zgx::web_view::FindResult)>;
@@ -867,7 +868,7 @@ fn next_document_chunk<'a>(body: &'a [u8], offset: &mut usize, limit: usize) -> 
 }
 
 wrap_request_handler! {
-    struct CEFRequestHandler { html_documents: HtmlDocuments }
+    struct CEFRequestHandler { html_documents: HtmlDocuments, handlers: HtmlHandlerKeepAlive }
     impl RequestHandler {
         fn resource_request_handler(
             &self,
@@ -877,45 +878,109 @@ wrap_request_handler! {
             _is_navigation: i32,
             _is_download: i32,
             _request_initiator: Option<&CefString>,
-            _disable_default_handling: Option<&mut i32>,
+            disable_default_handling: Option<&mut i32>,
         ) -> Option<ResourceRequestHandler> {
-            let url = request.map(|request| CefString::from(&request.url()).to_string())?;
+            let request = request?;
+            let request_id = request.identifier();
+            let url = CefString::from(&request.url()).to_string();
             let url = normalize_document_url(&url)?;
-            if !self
+            let contains = self
                 .html_documents
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .contains_key(&url)
-            {
+                .contains_key(&url);
+            if !contains {
                 return None;
             }
-            Some(CEFHTMLResourceRequestHandler::new(self.html_documents.clone()))
+            if let Some(disable_default_handling) = disable_default_handling {
+                *disable_default_handling = 1;
+            }
+            let handler = CEFHTMLResourceRequestHandler::new(
+                self.html_documents.clone(),
+                request_id,
+                Arc::downgrade(&self.handlers),
+            );
+            self.handlers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(request_id, handler.clone());
+            Some(handler)
         }
     }
 }
 
 wrap_resource_request_handler! {
-    struct CEFHTMLResourceRequestHandler { html_documents: HtmlDocuments }
+    struct CEFHTMLResourceRequestHandler {
+        html_documents: HtmlDocuments,
+        request_id: u64,
+        handlers: std::sync::Weak<Mutex<HashMap<u64, ResourceRequestHandler>>>,
+    }
     impl ResourceRequestHandler {
+        fn on_before_resource_load(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            _request: Option<&mut Request>,
+            _callback: Option<&mut Callback>,
+        ) -> ReturnValue {
+            // cef-rs 156 defaults this callback to RV_CANCEL. A custom
+            // resource handler must explicitly allow the request to reach
+            // `resource_handler`.
+            ReturnValue::CONTINUE
+        }
+
         fn resource_handler(
             &self,
             _browser: Option<&mut Browser>,
-            frame: Option<&mut Frame>,
+            _frame: Option<&mut Frame>,
             request: Option<&mut Request>,
         ) -> Option<ResourceHandler> {
-            if !frame.is_some_and(|frame| frame.is_main() != 0) {
+            let Some(request) = request else { return None };
+            let raw_url = CefString::from(&request.url()).to_string();
+            self.release_keepalive();
+            let Some(url) = normalize_document_url(&raw_url) else {
                 return None;
-            }
-            let url = request.map(|request| CefString::from(&request.url()).to_string())?;
-            let url = normalize_document_url(&url)?;
+            };
             let body = self
                 .html_documents
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .get(&url)
-                .cloned()?;
+                .cloned();
+            let Some(body) = body else { return None };
             Some(CEFHTMLDocumentHandler::new(body, Arc::new(Mutex::new(0))))
         }
+
+        fn on_resource_load_complete(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            request: Option<&mut Request>,
+            _response: Option<&mut Response>,
+            _status: UrlrequestStatus,
+            _received_content_length: i64,
+        ) {
+            if request.is_some_and(|request| request.identifier() == self.request_id) {
+                self.release_keepalive();
+            }
+        }
+    }
+}
+
+impl CEFHTMLResourceRequestHandler {
+    fn release_keepalive(&self) {
+        if let Some(handlers) = self.handlers.upgrade() {
+            handlers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&self.request_id);
+        }
+    }
+}
+
+impl Drop for CEFHTMLResourceRequestHandler {
+    fn drop(&mut self) {
+        self.release_keepalive();
     }
 }
 
@@ -1090,7 +1155,7 @@ pub(super) fn client(
             permission,
             dialog,
         },
-        CEFRequestHandler::new(html_documents),
+        CEFRequestHandler::new(html_documents, Arc::new(Mutex::new(HashMap::new()))),
         web,
     )
 }

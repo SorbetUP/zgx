@@ -156,6 +156,7 @@ fn start_fixture_server(
     download_test: bool,
     site_data_test: bool,
     popup_test: bool,
+    html_base_result_path: Option<std::path::PathBuf>,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
     let address = listener.local_addr()?;
@@ -163,16 +164,26 @@ fn start_fixture_server(
     let result_path = std::env::var_os("ZGX_CEF_DOWNLOAD_RESULT").map(std::path::PathBuf::from);
     let site_data_result_path =
         std::env::var_os("ZGX_CEF_SITE_DATA_RESULT").map(std::path::PathBuf::from);
+    let html_base_log_path = html_base_result_path;
     thread::spawn(move || {
         for stream in listener.incoming().flatten() {
             let result_path = result_path.clone();
             let site_data_result_path = site_data_result_path.clone();
+            let html_base_log_path = html_base_log_path.clone();
             thread::spawn(move || {
                 let mut stream = stream;
                 let mut request = [0; 2048];
                 let count = stream.read(&mut request).unwrap_or(0);
                 let request = String::from_utf8_lossy(&request[..count]);
                 let path = request.split_whitespace().nth(1).unwrap_or("/");
+                if let Some(result_path) = html_base_log_path.as_ref()
+                    && let Ok(mut result) = fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(result_path)
+                {
+                    let _ = writeln!(result, "HTTP:{path}");
+                }
                 if let Some(result_path) = site_data_result_path.as_ref() {
                     if let Ok(mut result) = fs::OpenOptions::new()
                         .create(true)
@@ -275,8 +286,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let event_test = event_result_path.is_some();
     let eval_result_path = std::env::var_os("ZGX_CEF_EVAL_RESULT").map(std::path::PathBuf::from);
     let eval_test = eval_result_path.is_some();
-    let html_base_result_path =
-        std::env::var_os("ZGX_CEF_HTML_BASE_RESULT").map(std::path::PathBuf::from);
+    let html_base_result_path = std::env::args()
+        .find_map(|argument| {
+            argument
+                .strip_prefix("--cef-html-base-result=")
+                .map(std::path::PathBuf::from)
+        })
+        .or_else(|| std::env::var_os("ZGX_CEF_HTML_BASE_RESULT").map(std::path::PathBuf::from));
+    if let Some(path) = html_base_result_path.as_ref() {
+        unsafe { std::env::set_var("ZGX_CEF_HTML_BASE_RESULT", path) };
+    }
     let html_base_test = html_base_result_path.is_some();
     let site_data_result_path =
         std::env::var_os("ZGX_CEF_SITE_DATA_RESULT").map(std::path::PathBuf::from);
@@ -329,7 +348,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(result_path) = popup_result_path.as_ref() {
         fs::write(result_path, "START\n")?;
     }
-    let origin = start_fixture_server(download_test, site_data_test || late_load_test, popup_test)?;
+    let origin = start_fixture_server(
+        download_test,
+        site_data_test || late_load_test,
+        popup_test,
+        html_base_result_path.clone(),
+    )?;
     if let Some(result_path) = event_result_path.as_ref() {
         let mut result = fs::OpenOptions::new().append(true).open(result_path)?;
         writeln!(result, "ORIGIN:{origin}")?;
@@ -896,7 +920,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         zgx::timer::sleep(std::time::Duration::from_millis(50)).await;
                     }
                     if !ready {
-                        let _ = fs::write(&timeout_path, "FAIL:base-document-not-served");
+                        let state = page.state();
+                        let (url, loading, error) = state.with_untracked(|state| {
+                            (state.url.clone(), state.loading, state.error.clone())
+                        });
+                        let _ = fs::write(
+                            &timeout_path,
+                            format!(
+                                "FAIL:base-document-not-served:title={}:url={url}:loading={loading}:error={error:?}",
+                                page.title(),
+                            ),
+                        );
                         timeout_window.close();
                         return;
                     }

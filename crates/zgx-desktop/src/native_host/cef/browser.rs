@@ -421,12 +421,14 @@ fn apply(page: &Page, browser: &Browser, command: WebViewCommand) {
             if let Some(base) = base_url
                 && let Some(document_url) = client::normalize_document_url(&base)
             {
-                let mut documents = page
-                    .html_documents
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                documents.clear();
-                documents.insert(document_url, Arc::new(html.into_bytes()));
+                {
+                    let mut documents = page
+                        .html_documents
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    documents.clear();
+                    documents.insert(document_url, Arc::new(html.into_bytes()));
+                }
                 if let Some(frame) = frame {
                     frame.load_url(Some(&base.as_str().into()));
                 }
