@@ -34,7 +34,8 @@ pub(super) struct Page {
     web: zgx::web_view::WeakWebView,
     browser: Rc<RefCell<Option<Browser>>>,
     pending: RefCell<Vec<WebViewCommand>>,
-    evaluations: Rc<RefCell<HashMap<i32, EvaluationReply>>>,
+    evaluations: Rc<RefCell<HashMap<i32, (u64, EvaluationReply)>>>,
+    navigation_generation: Rc<Cell<u64>>,
     site_data: Rc<RefCell<HashMap<i32, SiteDataReply>>>,
     pending_site_data: RefCell<Vec<(String, SiteDataReply)>>,
     find_replies: client::FindReplies,
@@ -66,8 +67,9 @@ type SiteDataReply = Box<dyn FnOnce(Result<usize, String>)>;
 
 wrap_dev_tools_message_observer! {
     struct CEFScriptObserver {
-        evaluations: Rc<RefCell<HashMap<i32, EvaluationReply>>>,
+        evaluations: Rc<RefCell<HashMap<i32, (u64, EvaluationReply)>>>,
         site_data: Rc<RefCell<HashMap<i32, SiteDataReply>>>,
+        navigation_generation: Rc<Cell<u64>>,
     }
 
     impl DevToolsMessageObserver {
@@ -79,8 +81,13 @@ wrap_dev_tools_message_observer! {
             result: Option<&[u8]>,
         ) {
             let evaluation = self.evaluations.borrow_mut().remove(&message_id);
-            if let Some(reply) = evaluation {
-                let result = parse_evaluation_result(success, result);
+            if let Some((generation, reply)) = evaluation {
+                let result = parse_evaluation_for_generation(
+                    generation,
+                    self.navigation_generation.get(),
+                    success,
+                    result,
+                );
                 // CEF can invoke this observer while its DevTools observer
                 // list is being traversed. User callbacks may close a window
                 // (and drop this registration), so deliver them at ZGX's next
@@ -136,6 +143,18 @@ fn parse_evaluation_result(success: i32, result: Option<&[u8]>) -> Result<String
         .ok_or_else(|| "JavaScript result was not serializable by value".to_owned())?;
     serde_json::to_string(value)
         .map_err(|error| format!("cannot encode JavaScript result: {error}"))
+}
+
+fn parse_evaluation_for_generation(
+    requested_generation: u64,
+    current_generation: u64,
+    success: i32,
+    result: Option<&[u8]>,
+) -> Result<String, String> {
+    if requested_generation != current_generation {
+        return Err("JavaScript evaluation was superseded by a navigation".into());
+    }
+    parse_evaluation_result(success, result)
 }
 
 fn parse_site_data_result(success: i32, result: Option<&[u8]>) -> Result<usize, String> {
@@ -289,7 +308,7 @@ fn fail_pending(page: &Page, reason: &str) {
                 reply(Err(reason.clone()));
             }
         }
-        for (_, reply) in evaluations {
+        for (_, (_, reply)) in evaluations {
             reply(Err(reason.clone()));
         }
         for (_, reply) in site_data {
@@ -407,11 +426,13 @@ fn apply(page: &Page, browser: &Browser, command: WebViewCommand) {
                 let _ = params.set_string(Some(&expression_key), Some(&expression));
                 let _ = params.set_bool(Some(&by_value_key), 1);
                 let _ = params.set_bool(Some(&await_key), 1);
-                page.evaluations.borrow_mut().insert(id, reply);
+                page.evaluations
+                    .borrow_mut()
+                    .insert(id, (page.navigation_generation.get(), reply));
                 let method: CefString = "Runtime.evaluate".into();
                 let accepted = host.execute_dev_tools_method(id, Some(&method), Some(&mut params));
                 if accepted == 0
-                    && let Some(reply) = page.evaluations.borrow_mut().remove(&id)
+                    && let Some((_, reply)) = page.evaluations.borrow_mut().remove(&id)
                 {
                     reply(Err("CEF rejected Runtime.evaluate".into()));
                 }
@@ -477,6 +498,7 @@ pub(super) fn backend(web: &WebView) -> Result<Rc<Page>, String> {
         browser: browser.clone(),
         pending: RefCell::new(Vec::new()),
         evaluations: Rc::new(RefCell::new(HashMap::new())),
+        navigation_generation: Rc::new(Cell::new(0)),
         site_data: Rc::new(RefCell::new(HashMap::new())),
         pending_site_data: RefCell::new(Vec::new()),
         find_replies: Rc::new(RefCell::new(std::collections::VecDeque::new())),
@@ -500,6 +522,7 @@ pub(super) fn backend(web: &WebView) -> Result<Rc<Page>, String> {
         find_replies: page.find_replies.clone(),
         web: web.downgrade(),
         new_windows: web.options().new_windows,
+        navigation_generation: page.navigation_generation.clone(),
         created: Rc::new(move |browser| {
             runtime::browser_created(browser.identifier());
             if runtime::register_browser(&browser).is_err() {
@@ -524,8 +547,11 @@ pub(super) fn backend(web: &WebView) -> Result<Rc<Page>, String> {
             }
             page.lifecycle.set(BrowserLifecycle::Ready);
             if let Some(host) = browser.host() {
-                let mut observer =
-                    CEFScriptObserver::new(page.evaluations.clone(), page.site_data.clone());
+                let mut observer = CEFScriptObserver::new(
+                    page.evaluations.clone(),
+                    page.site_data.clone(),
+                    page.navigation_generation.clone(),
+                );
                 page.devtools_registration
                     .replace(host.add_dev_tools_message_observer(Some(&mut observer)));
                 host.was_hidden((page.visible.get() == 0) as i32);
@@ -885,7 +911,7 @@ fn percent_encode(value: &str) -> String {
 
 #[cfg(test)]
 mod evaluation_tests {
-    use super::{parse_evaluation_result, parse_site_data_result};
+    use super::{parse_evaluation_for_generation, parse_evaluation_result, parse_site_data_result};
 
     #[test]
     fn devtools_values_are_returned_as_json() {
@@ -923,6 +949,28 @@ mod evaluation_tests {
             parse_evaluation_result(1, Some(cef_response.as_bytes()))
                 .unwrap_err()
                 .contains("fixture")
+        );
+    }
+
+    #[test]
+    fn navigation_invalidates_results_from_the_previous_document() {
+        assert_eq!(
+            parse_evaluation_for_generation(
+                3,
+                4,
+                1,
+                Some(br#"{"result":{"type":"number","value":42}}"#),
+            ),
+            Err("JavaScript evaluation was superseded by a navigation".into())
+        );
+        assert_eq!(
+            parse_evaluation_for_generation(
+                4,
+                4,
+                1,
+                Some(br#"{"result":{"type":"number","value":42}}"#),
+            ),
+            Ok("42".into())
         );
     }
 
