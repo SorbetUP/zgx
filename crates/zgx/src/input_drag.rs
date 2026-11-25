@@ -90,6 +90,8 @@ pub struct DraggedText {
     /// Browser destinations need this as a link payload in addition to the
     /// display text and any HTML fragment.
     link_url: Option<String>,
+    /// Local files offered by a browser drag, when the browser exposes them.
+    files: Vec<std::path::PathBuf>,
     /// The editor it was selected in (its scene's `identity`, as node ids
     /// are each window's own, and its node), and where: a drop there moves
     /// it.
@@ -105,6 +107,7 @@ impl DraggedText {
             text: text.into(),
             html: None,
             link_url: None,
+            files: Vec::new(),
             from: None,
             taken: std::cell::Cell::new(false),
         }
@@ -132,6 +135,19 @@ impl DraggedText {
             ..Self::with_html(text, html)
         }
     }
+    /// Browser payload including any local files CEF exposed for the drag.
+    #[doc(hidden)]
+    pub fn with_link_and_files(
+        text: impl Into<String>,
+        html: Option<String>,
+        link_url: Option<String>,
+        files: Vec<std::path::PathBuf>,
+    ) -> Self {
+        Self {
+            files,
+            ..Self::with_link(text, html, link_url)
+        }
+    }
     pub(crate) fn from_editor(
         text: String,
         scene: u64,
@@ -142,6 +158,7 @@ impl DraggedText {
             text,
             html: None,
             link_url: None,
+            files: Vec::new(),
             from: Some((scene, editor, range)),
             taken: std::cell::Cell::new(false),
         }
@@ -169,6 +186,12 @@ impl DraggedText {
     #[doc(hidden)]
     pub fn link_url(&self) -> Option<&str> {
         self.link_url.as_deref()
+    }
+    /// Local files carried by this browser drag, when the browser supplied
+    /// accessible paths.
+    #[doc(hidden)]
+    pub fn files(&self) -> &[std::path::PathBuf] {
+        &self.files
     }
 }
 /// What a drag carries to other apps, when a host hands it to the platform

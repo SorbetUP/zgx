@@ -72,6 +72,7 @@ struct PageDrag {
     text: String,
     html: Option<String>,
     link_url: Option<String>,
+    files: Vec<std::path::PathBuf>,
     items: Vec<zgx::input::DragItem>,
     x: i32,
     y: i32,
@@ -1345,7 +1346,12 @@ fn input(page: &Page, event: &mut zgx::input::EventContext) {
                 page.drag_export.replace(Some(drag.items));
                 page.drag_source_active.set(true);
                 event.start_drag_from(
-                    DraggedText::with_link(drag.text, drag.html, drag.link_url),
+                    DraggedText::with_link_and_files(
+                        drag.text,
+                        drag.html,
+                        drag.link_url,
+                        drag.files,
+                    ),
                     origin.0,
                     origin.1,
                 );
@@ -1430,8 +1436,10 @@ fn input(page: &Page, event: &mut zgx::input::EventContext) {
 
 fn drag_data_for_text(text: &DraggedText) -> Option<DragData> {
     let data = drag_data_create()?;
-    let fragment_text: CefString = text.text().into();
-    data.set_fragment_text(Some(&fragment_text));
+    if !text.text().is_empty() {
+        let fragment_text: CefString = text.text().into();
+        data.set_fragment_text(Some(&fragment_text));
+    }
     if let Some(html) = text.html() {
         let fragment_html: CefString = html.into();
         data.set_fragment_html(Some(&fragment_html));
@@ -1439,6 +1447,17 @@ fn drag_data_for_text(text: &DraggedText) -> Option<DragData> {
     if let Some(url) = text.link_url() {
         let url: CefString = url.into();
         data.set_link_url(Some(&url));
+    }
+    for path in text.files() {
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name() else {
+            continue;
+        };
+        let path: CefString = path.to_string_lossy().as_ref().into();
+        let name: CefString = name.to_string_lossy().as_ref().into();
+        data.add_file(Some(&path), Some(&name));
     }
     Some(data)
 }
@@ -1460,9 +1479,18 @@ fn page_drag(data: &DragData, x: i32, y: i32) -> Option<PageDrag> {
     let url = CefString::from(&data.link_url()).to_string();
     let fragment_text = CefString::from(&data.fragment_text()).to_string();
     let fragment_html = CefString::from(&data.fragment_html()).to_string();
-    page_drag_fields(url, fragment_text, fragment_html, x, y)
+    let mut paths = CefStringList::new();
+    let _ = data.file_paths(Some(&mut paths));
+    let files = paths
+        .into_iter()
+        .map(std::path::PathBuf::from)
+        .filter(|path| path.is_file())
+        .take(128)
+        .collect();
+    page_drag_fields_with_files(url, fragment_text, fragment_html, files, x, y)
 }
 
+#[cfg(test)]
 fn page_drag_fields(
     url: String,
     fragment_text: String,
@@ -1470,13 +1498,32 @@ fn page_drag_fields(
     x: i32,
     y: i32,
 ) -> Option<PageDrag> {
+    page_drag_fields_with_files(url, fragment_text, fragment_html, Vec::new(), x, y)
+}
+
+fn page_drag_fields_with_files(
+    url: String,
+    fragment_text: String,
+    fragment_html: String,
+    files: Vec<std::path::PathBuf>,
+    x: i32,
+    y: i32,
+) -> Option<PageDrag> {
     const MAX_FIELD_BYTES: usize = 1_048_576;
+    let files: Vec<_> = files
+        .into_iter()
+        .filter(|path| path.is_file())
+        .take(128)
+        .collect();
     let text = if fragment_text.is_empty() {
         url.clone()
     } else {
         fragment_text
     };
-    if text.is_empty() || text.len() > MAX_FIELD_BYTES || url.len() > MAX_FIELD_BYTES {
+    if (text.is_empty() && files.is_empty())
+        || text.len() > MAX_FIELD_BYTES
+        || url.len() > MAX_FIELD_BYTES
+    {
         return None;
     }
     let html = (!fragment_html.is_empty() && fragment_html.len() <= MAX_FIELD_BYTES)
@@ -1485,11 +1532,15 @@ fn page_drag_fields(
     if !url.is_empty() {
         items.push(zgx::input::DragItem::Url(url.clone()));
     }
-    items.push(zgx::input::DragItem::Text(text.clone()));
+    if !text.is_empty() {
+        items.push(zgx::input::DragItem::Text(text.clone()));
+    }
+    items.extend(files.iter().cloned().map(zgx::input::DragItem::File));
     Some(PageDrag {
         text,
         html,
         link_url: (!url.is_empty()).then_some(url),
+        files,
         items,
         x,
         y,
@@ -1928,7 +1979,8 @@ mod tests {
 
     use super::{
         cef_key_code, cef_modifiers, cef_native_key_code, click_count, close_after_releasing_slot,
-        local_to_window, page_drag_fields, text_key_events, utf16_offset, window_to_local,
+        local_to_window, page_drag_fields, page_drag_fields_with_files, text_key_events,
+        utf16_offset, window_to_local,
     };
     use cef::KeyEventType;
     use zgx::input::{DraggedText, Key, Modifiers};
@@ -2040,6 +2092,43 @@ mod tests {
         assert!(
             page_drag_fields(String::new(), "x".repeat(1_048_577), String::new(), 0, 0,).is_none()
         );
+    }
+
+    #[test]
+    fn webpage_file_drag_keeps_only_existing_paths_in_the_typed_payload() {
+        let root = std::env::temp_dir().join(format!(
+            "zgx-cef-page-drag-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let file = root.join("fixture.txt");
+        std::fs::write(&file, b"fixture").unwrap();
+        let missing = root.join("missing.txt");
+
+        let drag = page_drag_fields_with_files(
+            String::new(),
+            String::new(),
+            String::new(),
+            vec![file.clone(), missing],
+            12,
+            34,
+        )
+        .expect("file-only drag is a valid payload");
+        assert!(drag.text.is_empty());
+        assert_eq!(drag.files, [file.clone()]);
+        assert!(
+            matches!(drag.items.as_slice(), [zgx::input::DragItem::File(path)] if path == &file)
+        );
+
+        let payload =
+            DraggedText::with_link_and_files(drag.text, drag.html, drag.link_url, drag.files);
+        assert_eq!(payload.files(), std::slice::from_ref(&file));
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
