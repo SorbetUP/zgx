@@ -30,7 +30,9 @@ static CLOSE_RACE_DIAGNOSTIC_LOCK: Mutex<()> = Mutex::new(());
 
 #[cfg(debug_assertions)]
 pub(super) fn trace_close_race_impl(message: &str) {
-    let Some(path) = std::env::var_os("ZGX_CEF_CLOSE_RACE_RESULT").map(PathBuf::from) else {
+    let result = std::env::var_os("ZGX_CEF_STRESS_RESULT")
+        .or_else(|| std::env::var_os("ZGX_CEF_CLOSE_RACE_RESULT"));
+    let Some(path) = result.map(PathBuf::from) else {
         return;
     };
     let executable = std::env::current_exe().ok().and_then(|path| {
@@ -43,7 +45,8 @@ pub(super) fn trace_close_race_impl(message: &str) {
         data_dir.as_deref(),
         path.parent(),
         &std::env::temp_dir(),
-        std::env::var_os("ZGX_CEF_CLOSE_RACE_RESULT").is_some(),
+        std::env::var_os("ZGX_CEF_CLOSE_RACE_RESULT").is_some()
+            || std::env::var_os("ZGX_CEF_STRESS_RESULT").is_some(),
     ) {
         return;
     }
@@ -51,7 +54,9 @@ pub(super) fn trace_close_race_impl(message: &str) {
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
     let diagnostic = path.with_extension("diagnostic");
-    if std::fs::metadata(&diagnostic).is_ok_and(|metadata| metadata.len() >= 32 * 1024) {
+    // The 100-cycle stress fixture emits a small lifecycle record for every
+    // browser. Keep the log bounded, but large enough to retain the full run.
+    if std::fs::metadata(&diagnostic).is_ok_and(|metadata| metadata.len() >= 1024 * 1024) {
         return;
     }
     let message: String = message.chars().take(240).collect();
@@ -495,6 +500,7 @@ fn mock_keychain_requested(mut present: impl FnMut(&str) -> bool) -> bool {
         "ZGX_CEF_SITE_DATA_RESULT",
         "ZGX_CEF_LATE_LOAD_RESULT",
         "ZGX_CEF_CLOSE_RACE_RESULT",
+        "ZGX_CEF_STRESS_RESULT",
         "ZGX_CEF_NAV_EVAL_RACE_RESULT",
         "ZGX_CEF_POPUP_RESULT",
     ]
@@ -938,6 +944,7 @@ mod tests {
             "ZGX_CEF_SITE_DATA_RESULT",
             "ZGX_CEF_LATE_LOAD_RESULT",
             "ZGX_CEF_CLOSE_RACE_RESULT",
+            "ZGX_CEF_STRESS_RESULT",
             "ZGX_CEF_NAV_EVAL_RACE_RESULT",
             "ZGX_CEF_POPUP_RESULT",
         ] {

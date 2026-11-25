@@ -1,6 +1,8 @@
 // Local CEF OSR smoke page. Run from a CEF bundle so Chromium's framework,
 // resources and sandbox helper are beside the app executable:
 // `cargo run -p zgx-desktop --features cef --bin cef_web_view`.
+// `ZGX_CEF_STRESS_RESULT=/tmp/cef-stress-result` runs 100 sequential browser
+// create/close cycles in one runtime and writes callback counts to the result.
 use std::{
     cell::RefCell,
     fs,
@@ -21,6 +23,29 @@ use zgx::{
 use zgx_desktop::{Application, WindowBounds, WindowOptions};
 
 const DOWNLOAD_PAYLOAD: &[u8] = b"cef-download-payload";
+const CEF_STRESS_CYCLES: usize = 100;
+
+async fn wait_for_diagnostic_count(
+    diagnostic: &Path,
+    prefix: &str,
+    expected: usize,
+    deadline: std::time::Instant,
+) -> bool {
+    loop {
+        let count = fs::read_to_string(diagnostic)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.starts_with(prefix))
+            .count();
+        if count >= expected {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        zgx::timer::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
 
 #[cfg(debug_assertions)]
 fn trace_close_race(result: Option<&Path>, message: &str) {
@@ -462,6 +487,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let close_race_result_path =
         std::env::var_os("ZGX_CEF_CLOSE_RACE_RESULT").map(std::path::PathBuf::from);
     let close_race_test = close_race_result_path.is_some();
+    let stress_result_path =
+        std::env::var_os("ZGX_CEF_STRESS_RESULT").map(std::path::PathBuf::from);
+    let stress_test = stress_result_path.is_some();
     let navigation_eval_race_result_path =
         std::env::var_os("ZGX_CEF_NAV_EVAL_RACE_RESULT").map(std::path::PathBuf::from);
     let navigation_eval_race_test = navigation_eval_race_result_path.is_some();
@@ -482,6 +510,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         || site_data_test
         || late_load_test
         || close_race_test
+        || stress_test
         || navigation_eval_race_test
         || popup_test
         || drag_test;
@@ -506,6 +535,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(result_path) = close_race_result_path.as_ref() {
         fs::write(result_path, "START\n")?;
         trace_close_race(Some(result_path), "FIXTURE_START");
+    }
+    if let Some(result_path) = stress_result_path.as_ref() {
+        fs::write(result_path, "START\n")?;
+        trace_close_race(Some(result_path), "STRESS_FIXTURE_START");
     }
     if let Some(result_path) = navigation_eval_race_result_path.as_ref() {
         fs::write(result_path, "START\n")?;
@@ -555,6 +588,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ..Default::default()
                 },
             );
+            let stress_pages: Vec<WebView> = if stress_test {
+                (0..CEF_STRESS_CYCLES)
+                    .map(|cycle| {
+                        let page = WebView::new(
+                            &cx.ui.runtime,
+                            WebViewOptions {
+                                profile: WebProfile::Ephemeral,
+                                ..Default::default()
+                            },
+                        );
+                        page.load_html(
+                            format!(
+                                "<!doctype html><meta charset=utf-8><title>CEF cycle {cycle}</title><body>CEF cycle {cycle}</body>"
+                            ),
+                            None,
+                        );
+                        page
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
             trace_close_race(close_race_result_path.as_deref(), "WEBVIEW_CONTROLLER_CREATED");
             let late_shared = late_load_test.then(|| {
                 WebView::new(
@@ -1521,6 +1576,72 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         trace_close_race(result_path.as_deref(), "FIXTURE_WINDOW_CLOSE");
                         window.close();
                     })
+            } else if stress_test {
+                let current = cx.ui.signal(0usize);
+                let selected = current.clone();
+                let pages_for_view = stress_pages.clone();
+                let result_path = stress_result_path.clone().expect("stress result path");
+                let diagnostic = result_path.with_extension("diagnostic");
+                let pages_for_task = stress_pages.clone();
+                let selected_for_task = current.clone();
+                let window_for_task = cx.window.clone();
+                cx.tasks.spawn(async move {
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+                    for (index, page) in pages_for_task.iter().enumerate() {
+                        selected_for_task.set(index);
+                        let created = wait_for_diagnostic_count(
+                            &diagnostic,
+                            "ON_AFTER_CREATED ",
+                            index + 1,
+                            deadline,
+                        )
+                        .await;
+                        if !created {
+                            let _ = fs::write(
+                                &result_path,
+                                format!("FAIL:create-timeout:{index}:{}", index + 1),
+                            );
+                            for page in &pages_for_task {
+                                page.close();
+                            }
+                            window_for_task.close();
+                            return;
+                        }
+
+                        page.close();
+                        let closed = wait_for_diagnostic_count(
+                            &diagnostic,
+                            "ON_BEFORE_CLOSE ",
+                            index + 1,
+                            deadline,
+                        )
+                        .await;
+                        if !closed {
+                            let _ = fs::write(
+                                &result_path,
+                                format!("FAIL:close-timeout:{index}:{}", index + 1),
+                            );
+                            for page in &pages_for_task {
+                                page.close();
+                            }
+                            window_for_task.close();
+                            return;
+                        }
+                    }
+                    window_for_task.close();
+                });
+                switch(
+                    move || selected.get(),
+                    move |index, _| {
+                        zgx::web_view::web_view(&pages_for_view[index])
+                            .grow()
+                            .w_full()
+                            .h_full()
+                    },
+                )
+                .grow()
+                .w_full()
+                .h_full()
             } else if late_load_test {
                 row()
                     .w_full()
@@ -1606,6 +1727,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         fs::write(result_path, if pass { "PASS" } else { "FAIL" })?;
         if !deferred_close_ok {
             return Err("close-race fixture missed a deferred CEF close lifecycle event".into());
+        }
+    }
+    if let Some(result_path) = stress_result_path {
+        let diagnostic = fs::read_to_string(result_path.with_extension("diagnostic"))?;
+        let created_ids: std::collections::HashSet<_> = diagnostic
+            .lines()
+            .filter_map(|line| line.strip_prefix("ON_AFTER_CREATED id="))
+            .filter_map(|line| line.split_whitespace().next())
+            .collect();
+        let closed_ids: std::collections::HashSet<_> = diagnostic
+            .lines()
+            .filter_map(|line| line.strip_prefix("ON_BEFORE_CLOSE browser="))
+            .filter_map(|line| line.split_whitespace().next())
+            .collect();
+        let counts_are_exact = created_ids.len() == CEF_STRESS_CYCLES
+            && closed_ids.len() == CEF_STRESS_CYCLES
+            && created_ids == closed_ids;
+        let shutdown_is_empty = diagnostic
+            .lines()
+            .any(|line| line == "SHUTDOWN_BEGIN pending=0 open=0");
+        let pass = run_result.is_ok() && counts_are_exact && shutdown_is_empty;
+        fs::write(
+            &result_path,
+            format!(
+                "{}:created={}:closed={}:shutdown_empty={}",
+                if pass { "PASS" } else { "FAIL" },
+                created_ids.len(),
+                closed_ids.len(),
+                shutdown_is_empty,
+            ),
+        )?;
+        if !pass {
+            return Err("CEF stress fixture did not close all created browsers cleanly".into());
         }
     }
     let _ = fs::remove_dir_all(fixture_data_dir);
