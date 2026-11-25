@@ -51,8 +51,8 @@ const POPUP_PARENT_FIXTURE: &str = r#"<!doctype html><meta charset=utf-8><title>
 window.addEventListener('message', event => {
   window.zgx.postMessage({source:'popup-parent',ok:event.origin===location.origin&&event.data?.ok===true});
 });
-setTimeout(() => window.open('/popup-child', 'fixture-popup'), 150);
-</script><p>Waiting for the child window</p>
+function openFixturePopup(){window.__popupClicked=(window.__popupClicked||0)+1;window.open('/popup-child', 'fixture-popup');}
+</script><button id="open-popup" onclick="openFixturePopup()">Open fixture popup</button>
 "#;
 
 const POPUP_CHILD_FIXTURE: &str = r#"<!doctype html><meta charset=utf-8><title>popup child</title>
@@ -348,6 +348,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &cx.ui.runtime,
                 WebViewOptions {
                     profile,
+                    new_windows: popup_test,
                     ..Default::default()
                 },
             );
@@ -723,7 +724,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let timeout_done = done.clone();
                 let timeout_path = result.clone();
                 let timeout_window = window.clone();
+                let timeout_web = web.clone();
+                let diagnostics = result.clone();
+                let callback_result = result.clone();
                 let subscription = web.on_event(move |event| {
+                    if let zgx::web_view::WebViewEvent::NewWindowRequested { url } = &event {
+                        let _ = fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(diagnostics.with_extension("diagnostic"))
+                            .and_then(|mut file| writeln!(file, "POPUP_REQUEST:{url}"));
+                        return;
+                    }
                     let zgx::web_view::WebViewEvent::Message {
                         body,
                         origin,
@@ -738,19 +750,93 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         return;
                     }
                     if !callback_done.swap(true, Ordering::AcqRel) {
-                        let _ = fs::write(&result, "PASS");
+                        let _ = fs::write(&callback_result, "PASS");
                         window.close();
                     }
                 });
                 cx.tasks.spawn(async move {
                     zgx::timer::sleep(std::time::Duration::from_secs(12)).await;
                     if !timeout_done.swap(true, Ordering::AcqRel) {
-                        let _ = fs::write(timeout_path, "FAIL:popup-timeout");
+                        let _ = fs::write(
+                            timeout_path,
+                            format!("FAIL:popup-timeout:title={}", timeout_web.title()),
+                        );
                         timeout_window.close();
                     }
                 });
                 popup_subscription = Some(subscription);
                 web.load_url(format!("{origin}/popup-parent"));
+                let popup_page = web.clone();
+                let popup_scene = cx.ui.scene.clone();
+                let popup_input = cx.ui.input.clone();
+                let popup_result = result.clone();
+                let popup_window = cx.window.clone();
+                cx.tasks.spawn(async move {
+                    let mut ready = false;
+                    for _ in 0..200 {
+                        if popup_page.title() == "popup parent"
+                            && !popup_page.state().with_untracked(|state| state.loading)
+                        {
+                            ready = true;
+                            break;
+                        }
+                        zgx::timer::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                    if !ready {
+                        let _ = fs::write(&popup_result, "FAIL:popup-parent-load");
+                        popup_window.close();
+                        return;
+                    }
+                    let position_result = popup_result.clone();
+                    let scene = popup_scene.clone();
+                    let input = popup_input.clone();
+                    let window = popup_window.clone();
+                    let popup_check_page = popup_page.clone();
+                    popup_page.evaluate_js(
+                        "(()=>{const r=document.querySelector('#open-popup').getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2}})()",
+                        move |result| {
+                            let position = result
+                                .ok()
+                                .and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok())
+                                .and_then(|value| Some((value["x"].as_f64()? as f32, value["y"].as_f64()? as f32)));
+                            let Some((x, y)) = position else {
+                                let _ = fs::write(position_result, "FAIL:popup-button-bounds");
+                                window.close();
+                                return;
+                            };
+                            let moved = input.dispatch(&scene, InputEvent::PointerMove { x, y });
+                            let down = input.dispatch(&scene, InputEvent::PointerDown {
+                                x,
+                                y,
+                                button: PointerButton::Primary,
+                            });
+                            let up = input.dispatch(&scene, InputEvent::PointerUp {
+                                x,
+                                y,
+                                button: PointerButton::Primary,
+                            });
+                            let _ = fs::OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open(position_result.with_extension("diagnostic"))
+                                .and_then(|mut file| writeln!(
+                                    file,
+                                    "INPUT_TARGETS:{:?}:{:?}:{:?}",
+                                    moved.target,
+                                    down.target,
+                                    up.target
+                                ));
+                            let click_result = position_result.clone();
+                            popup_check_page.evaluate_js("window.__popupClicked||0", move |clicked| {
+                                let _ = fs::OpenOptions::new()
+                                    .create(true)
+                                    .append(true)
+                                    .open(click_result.with_extension("diagnostic"))
+                                    .and_then(|mut file| writeln!(file, "CLICK_COUNT:{clicked:?}"));
+                            });
+                        },
+                    );
+                });
             } else if event_test {
                 web.load_html(EVENT_FIXTURE, None);
                 let web = web.clone();
@@ -965,7 +1051,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .child(zgx::web_view::web_view(&web).grow())
                     .child(zgx::web_view::web_view(late_shared.as_ref().unwrap()).grow())
                     .child(zgx::web_view::web_view(late_isolated.as_ref().unwrap()).grow())
-            } else if download_test {
+            } else if download_test || input_test || popup_test {
                 zgx::web_view::web_view(&web)
                     .grow()
                     .w_full()

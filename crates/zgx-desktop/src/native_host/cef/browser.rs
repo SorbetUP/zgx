@@ -1,7 +1,7 @@
 use std::{
     cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
-    rc::Rc,
+    rc::{Rc, Weak},
     sync::{Arc, Mutex},
     time::Instant,
 };
@@ -10,6 +10,7 @@ use cef::*;
 use zgx::{
     compose::{View, component, div, gpu_view, text},
     input::{DragPhase, DraggedText, InputEvent, Key, Modifiers, PointerButton},
+    scene::{NodeId, Scene},
     style::Styled,
     web_view::{FindOptions, FindResult, WebProfile, WebView, WebViewBackend, WebViewCommand},
 };
@@ -52,6 +53,8 @@ pub(super) struct Page {
     drag_export: RefCell<Option<Vec<zgx::input::DragItem>>>,
     drag_source_active: Cell<bool>,
     pressed: Cell<Option<(f32, f32)>>,
+    node: Cell<Option<NodeId>>,
+    scene: RefCell<Weak<RefCell<Scene>>>,
     last_click: RefCell<Option<LastClick>>,
     click_count: Cell<u32>,
     gpu: zgx::gpu_view::GpuView,
@@ -557,6 +560,8 @@ pub(super) fn backend(
         drag_export: RefCell::new(None),
         drag_source_active: Cell::new(false),
         pressed: Cell::new(None),
+        node: Cell::new(None),
+        scene: RefCell::new(Weak::new()),
         last_click: RefCell::new(None),
         click_count: Cell::new(1),
         gpu,
@@ -753,6 +758,8 @@ pub(super) fn prepare_popup(
         drag_export: RefCell::new(None),
         drag_source_active: Cell::new(false),
         pressed: Cell::new(None),
+        node: Cell::new(None),
+        scene: RefCell::new(Weak::new()),
         last_click: RefCell::new(None),
         click_count: Cell::new(1),
         gpu,
@@ -905,6 +912,7 @@ pub(super) fn view(page: Rc<Page>) -> View {
         let page = page.clone();
         let event_page = page.clone();
         let mount_page = page.clone();
+        let visible_page = page.clone();
         let gpu = page.gpu.clone();
         div()
             .focusable(true)
@@ -912,6 +920,11 @@ pub(super) fn view(page: Rc<Page>) -> View {
             .on_event(move |event| input(&event_page, event))
             .accessible_label("Web page")
             .on_mount(move |handle| {
+                mount_page.node.set(Some(handle.node()));
+                *mount_page.scene.borrow_mut() = handle
+                    .scene()
+                    .as_ref()
+                    .map_or_else(Weak::new, Rc::downgrade);
                 if mount_page.visible.replace(mount_page.visible.get() + 1) == 0
                     && let Some(browser) = mount_page.browser.borrow().as_ref()
                     && let Some(host) = browser.host()
@@ -919,7 +932,7 @@ pub(super) fn view(page: Rc<Page>) -> View {
                     host.was_hidden(0);
                     host.invalidate(PaintElementType::VIEW);
                 }
-                handle.retain(Visible(mount_page.clone()));
+                handle.retain(Visible(visible_page.clone(), handle.node()));
             })
             .child(
                 gpu_view("", &gpu)
@@ -951,9 +964,13 @@ pub(super) fn page_view(
     }
 }
 
-struct Visible(Rc<Page>);
+struct Visible(Rc<Page>, NodeId);
 impl Drop for Visible {
     fn drop(&mut self) {
+        if self.0.node.get() == Some(self.1) {
+            self.0.node.set(None);
+            *self.0.scene.borrow_mut() = Weak::new();
+        }
         if self.0.visible.get() > 0
             && self.0.visible.get() == 1
             && let Some(browser) = self.0.browser.borrow().as_ref()
@@ -962,6 +979,48 @@ impl Drop for Visible {
             host.was_hidden(1);
         }
         self.0.visible.set(self.0.visible.get().saturating_sub(1));
+    }
+}
+
+impl Page {
+    /// Convert a ZGX window point into the CEF view's logical coordinates.
+    /// CEF's windowless input APIs are relative to the browser view, unlike
+    /// ZGX input events which are relative to the native window.
+    fn local(&self, x: f32, y: f32) -> Option<(f32, f32)> {
+        let (node, scene) = (self.node.get()?, self.scene.borrow().upgrade()?);
+        let scene = scene.try_borrow().ok()?;
+        let bounds = scene.bounds(node);
+        let shown = scene.window_rect(node, bounds);
+        Some(window_to_local(
+            x as f64,
+            y as f64,
+            shown.x as f64,
+            shown.y as f64,
+            shown.width as f64,
+            shown.height as f64,
+            bounds.width as f64,
+            bounds.height as f64,
+        ))
+    }
+
+    /// Convert a CEF view point back to ZGX window coordinates. CEF reports
+    /// drag-source locations in view coordinates while ZGX starts its drag
+    /// session with window coordinates.
+    fn window_point(&self, x: f32, y: f32) -> Option<(f32, f32)> {
+        let (node, scene) = (self.node.get()?, self.scene.borrow().upgrade()?);
+        let scene = scene.try_borrow().ok()?;
+        let bounds = scene.bounds(node);
+        let shown = scene.window_rect(node, bounds);
+        Some(local_to_window(
+            x as f64,
+            y as f64,
+            shown.x as f64,
+            shown.y as f64,
+            shown.width as f64,
+            shown.height as f64,
+            bounds.width as f64,
+            bounds.height as f64,
+        ))
     }
 }
 
@@ -984,13 +1043,16 @@ fn input(page: &Page, event: &mut zgx::input::EventContext) {
                 let Some(text) = drag.payload.downcast_ref::<DraggedText>() else {
                     return;
                 };
+                let Some(mouse) = window_mouse_event(page, drag.x, drag.y) else {
+                    return;
+                };
                 if page.drag_target_data.borrow().is_none() {
                     let Some(mut data) = drag_data_for_text(text) else {
                         return;
                     };
                     host.drag_target_drag_enter(
                         Some(&mut data),
-                        Some(&mouse_event(page, drag.x, drag.y)),
+                        Some(&mouse),
                         DragOperationsMask::from(
                             cef::sys::cef_drag_operations_mask_t::DRAG_OPERATION_COPY,
                         ),
@@ -999,7 +1061,7 @@ fn input(page: &Page, event: &mut zgx::input::EventContext) {
                     page.drag_target_files.borrow_mut().clear();
                 } else {
                     host.drag_target_drag_over(
-                        Some(&mouse_event(page, drag.x, drag.y)),
+                        Some(&mouse),
                         DragOperationsMask::from(
                             cef::sys::cef_drag_operations_mask_t::DRAG_OPERATION_COPY,
                         ),
@@ -1008,8 +1070,10 @@ fn input(page: &Page, event: &mut zgx::input::EventContext) {
                 event.accept_drag();
             }
             DragPhase::Drop => {
-                if page.drag_target_data.borrow().is_some() {
-                    host.drag_target_drop(Some(&mouse_event(page, drag.x, drag.y)));
+                if page.drag_target_data.borrow().is_some()
+                    && let Some(mouse) = window_mouse_event(page, drag.x, drag.y)
+                {
+                    host.drag_target_drop(Some(&mouse));
                     page.drag_target_data.borrow_mut().take();
                     event.prevent_default();
                     event.stop_propagation();
@@ -1021,27 +1085,25 @@ fn input(page: &Page, event: &mut zgx::input::EventContext) {
                 }
                 page.drag_target_files.borrow_mut().clear();
                 if drag.phase == DragPhase::End && page.drag_source_active.replace(false) {
-                    let scale = page
-                        .scale
-                        .lock()
-                        .unwrap_or_else(|poison| poison.into_inner())
-                        .max(0.01);
                     let operation = if drag.accepted {
                         cef::sys::cef_drag_operations_mask_t::DRAG_OPERATION_COPY
                     } else {
                         cef::sys::cef_drag_operations_mask_t::DRAG_OPERATION_NONE
                     };
-                    host.drag_source_ended_at(
-                        (drag.x * scale) as i32,
-                        (drag.y * scale) as i32,
-                        operation.into(),
-                    );
+                    let (x, y) = page
+                        .local(drag.x, drag.y)
+                        .map(|(x, y)| (x as i32, y as i32))
+                        .unwrap_or((drag.x as i32, drag.y as i32));
+                    host.drag_source_ended_at(x, y, operation.into());
                     host.drag_source_system_drag_ended();
                 }
             }
             _ => {}
         },
         InputEvent::FileHover { x, y, path } => {
+            let Some(mouse) = window_mouse_event(page, x, y) else {
+                return;
+            };
             if page.drag_target_data.borrow().is_none() {
                 let Some(mut data) = drag_data_create() else {
                     return;
@@ -1051,7 +1113,7 @@ fn input(page: &Page, event: &mut zgx::input::EventContext) {
                 }
                 host.drag_target_drag_enter(
                     Some(&mut data),
-                    Some(&mouse_event(page, x, y)),
+                    Some(&mouse),
                     DragOperationsMask::from(
                         cef::sys::cef_drag_operations_mask_t::DRAG_OPERATION_COPY,
                     ),
@@ -1065,7 +1127,7 @@ fn input(page: &Page, event: &mut zgx::input::EventContext) {
                     let _ = add_file_to_drag_data(data, &path);
                 }
                 host.drag_target_drag_over(
-                    Some(&mouse_event(page, x, y)),
+                    Some(&mouse),
                     DragOperationsMask::from(
                         cef::sys::cef_drag_operations_mask_t::DRAG_OPERATION_COPY,
                     ),
@@ -1080,6 +1142,9 @@ fn input(page: &Page, event: &mut zgx::input::EventContext) {
             page.drag_target_files.borrow_mut().clear();
         }
         InputEvent::FileDrop { x, y, path } => {
+            let Some(mouse) = window_mouse_event(page, x, y) else {
+                return;
+            };
             if page.drag_target_data.borrow().is_none() {
                 let Some(mut data) = drag_data_create() else {
                     return;
@@ -1089,7 +1154,7 @@ fn input(page: &Page, event: &mut zgx::input::EventContext) {
                 }
                 host.drag_target_drag_enter(
                     Some(&mut data),
-                    Some(&mouse_event(page, x, y)),
+                    Some(&mouse),
                     DragOperationsMask::from(
                         cef::sys::cef_drag_operations_mask_t::DRAG_OPERATION_COPY,
                     ),
@@ -1105,7 +1170,7 @@ fn input(page: &Page, event: &mut zgx::input::EventContext) {
                     files.insert(path);
                 }
                 host.drag_target_drag_over(
-                    Some(&mouse_event(page, x, y)),
+                    Some(&mouse),
                     DragOperationsMask::from(
                         cef::sys::cef_drag_operations_mask_t::DRAG_OPERATION_COPY,
                     ),
@@ -1116,6 +1181,9 @@ fn input(page: &Page, event: &mut zgx::input::EventContext) {
             }
         }
         InputEvent::FilesDrop { x, y, paths } => {
+            let Some(mouse) = window_mouse_event(page, x, y) else {
+                return;
+            };
             if page.drag_target_data.borrow().is_none() {
                 let Some(mut data) = drag_data_create() else {
                     return;
@@ -1131,7 +1199,7 @@ fn input(page: &Page, event: &mut zgx::input::EventContext) {
                 }
                 host.drag_target_drag_enter(
                     Some(&mut data),
-                    Some(&mouse_event(page, x, y)),
+                    Some(&mouse),
                     DragOperationsMask::from(
                         cef::sys::cef_drag_operations_mask_t::DRAG_OPERATION_COPY,
                     ),
@@ -1147,7 +1215,7 @@ fn input(page: &Page, event: &mut zgx::input::EventContext) {
                 }
             }
             if page.drag_target_data.borrow().is_some() {
-                host.drag_target_drop(Some(&mouse_event(page, x, y)));
+                host.drag_target_drop(Some(&mouse));
                 page.drag_target_data.borrow_mut().take();
                 page.drag_target_files.borrow_mut().clear();
                 event.prevent_default();
@@ -1193,25 +1261,27 @@ fn input(page: &Page, event: &mut zgx::input::EventContext) {
                 page.click_count.set(count);
                 count
             };
+            let Some(mouse) = window_mouse_event(page, x, y) else {
+                return;
+            };
             host.send_mouse_click_event(
-                Some(&mouse_event(page, x, y)),
+                Some(&mouse),
                 button_type,
                 mouse_up as i32,
                 click_count as i32,
             );
         }
         InputEvent::PointerMove { x, y } => {
-            host.send_mouse_move_event(Some(&mouse_event(page, x, y)), 0);
+            let Some(mouse) = window_mouse_event(page, x, y) else {
+                return;
+            };
+            host.send_mouse_move_event(Some(&mouse), 0);
             if let Some(drag) = page.drag_source_pending.borrow_mut().take() {
-                let scale = page
-                    .scale
-                    .lock()
-                    .unwrap_or_else(|poison| poison.into_inner())
-                    .max(0.01);
                 let origin = page
                     .pressed
                     .take()
-                    .unwrap_or((drag.x as f32 / scale, drag.y as f32 / scale));
+                    .or_else(|| page.window_point(drag.x as f32, drag.y as f32))
+                    .unwrap_or((0., 0.));
                 page.drag_export.replace(Some(drag.items));
                 page.drag_source_active.set(true);
                 event.start_drag_from(
@@ -1228,7 +1298,7 @@ fn input(page: &Page, event: &mut zgx::input::EventContext) {
             delta_x,
             delta_y,
         } => host.send_mouse_wheel_event(
-            Some(&mouse_event(page, x, y)),
+            window_mouse_event(page, x, y).as_ref(),
             delta_x as i32,
             delta_y as i32,
         ),
@@ -1380,6 +1450,44 @@ fn mouse_event(page: &Page, x: f32, y: f32) -> MouseEvent {
         y: y as i32,
         modifiers: cef_modifiers(page.input_modifiers.get()) | page.mouse_buttons.get(),
     }
+}
+
+fn window_mouse_event(page: &Page, x: f32, y: f32) -> Option<MouseEvent> {
+    let (x, y) = page.local(x, y)?;
+    Some(mouse_event(page, x, y))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn window_to_local(
+    x: f64,
+    y: f64,
+    shown_x: f64,
+    shown_y: f64,
+    shown_width: f64,
+    shown_height: f64,
+    device_width: f64,
+    device_height: f64,
+) -> (f32, f32) {
+    let sx = device_width / shown_width.max(0.001);
+    let sy = device_height / shown_height.max(0.001);
+    (((x - shown_x) * sx) as f32, ((y - shown_y) * sy) as f32)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn local_to_window(
+    x: f64,
+    y: f64,
+    shown_x: f64,
+    shown_y: f64,
+    shown_width: f64,
+    shown_height: f64,
+    device_width: f64,
+    device_height: f64,
+) -> (f32, f32) {
+    (
+        (shown_x + x * shown_width / device_width.max(0.001)) as f32,
+        (shown_y + y * shown_height / device_height.max(0.001)) as f32,
+    )
 }
 
 fn update_mouse_button_flags(current: u32, button: u32, pressed: bool) -> u32 {
@@ -1599,8 +1707,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        cef_key_code, cef_modifiers, click_count, close_after_releasing_slot, page_drag_fields,
-        text_key_events, utf16_offset,
+        cef_key_code, cef_modifiers, click_count, close_after_releasing_slot, local_to_window,
+        page_drag_fields, text_key_events, utf16_offset, window_to_local,
     };
     use cef::KeyEventType;
     use zgx::input::{Key, Modifiers};
@@ -1624,6 +1732,22 @@ mod tests {
             meta: true,
         });
         assert_eq!(flags, 2 | 4 | 8 | 128);
+    }
+
+    #[test]
+    fn window_input_becomes_page_local_view_coordinates() {
+        assert_eq!(
+            window_to_local(140., 95., 40., 20., 200., 150., 400., 300.),
+            (200., 150.)
+        );
+        assert_eq!(
+            window_to_local(90., 45., 40., 20., 100., 50., 100., 50.),
+            (50., 25.)
+        );
+        assert_eq!(
+            local_to_window(200., 150., 40., 20., 200., 150., 400., 300.),
+            (140., 95.)
+        );
     }
 
     #[test]
