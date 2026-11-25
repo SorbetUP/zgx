@@ -827,6 +827,39 @@ mod tests {
     }
 
     #[test]
+    fn permission_grants_do_not_cross_origin_or_capability_boundaries() {
+        let mut store = super::SitePermissionStore {
+            decisions: Default::default(),
+            path: None,
+        };
+        store
+            .remember("https://meet.example", "camera", true)
+            .unwrap();
+
+        assert_eq!(store.decision("https://meet.example", "camera"), Some(true));
+        assert_eq!(
+            store.decision("https://meet.example.evil", "camera"),
+            None,
+            "a lookalike host must not inherit another origin's grant"
+        );
+        assert_eq!(
+            store.decision("http://meet.example", "camera"),
+            None,
+            "HTTP and HTTPS are distinct origins"
+        );
+        assert_eq!(
+            store.decision("https://meet.example:8443", "camera"),
+            None,
+            "a different port is a different origin"
+        );
+        assert_eq!(
+            store.decision("https://meet.example", "microphone"),
+            None,
+            "camera approval must not authorize microphone access"
+        );
+    }
+
+    #[test]
     fn tracks_pending_creations_and_actual_browser_ids() {
         assert!(!has_browsers());
         let creation = browser_creation_started();
