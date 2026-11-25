@@ -11,6 +11,7 @@ use std::{
 };
 use zgx::{
     compose::prelude::*,
+    input::{InputEvent, PointerButton},
     web_view::{WebProfile, WebView, WebViewOptions},
 };
 use zgx_desktop::{Application, WindowBounds, WindowOptions};
@@ -170,7 +171,7 @@ fn start_fixture_server(
                         "",
                         EVENT_FIXTURE.as_bytes(),
                     )
-                } else if download_test && (path == "/download" || path == "/") {
+                } else if download_test && path == "/download" {
                     (
                         "200 OK",
                         "text/plain",
@@ -202,7 +203,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::env::set_var("ZGX_CEF_TEST_FIXTURE", "1");
         std::env::set_var("POLYSCALE_CEF_DATA_DIR", &fixture_data_dir);
     }
-    let download_test = std::env::var_os("ZGX_CEF_DOWNLOAD_RESULT").is_some();
+    let download_result_path =
+        std::env::var_os("ZGX_CEF_DOWNLOAD_RESULT").map(std::path::PathBuf::from);
+    let download_test = download_result_path.is_some();
     let event_result_path = std::env::var_os("ZGX_CEF_EVENT_RESULT").map(std::path::PathBuf::from);
     let event_test = event_result_path.is_some();
     let eval_result_path = std::env::var_os("ZGX_CEF_EVAL_RESULT").map(std::path::PathBuf::from);
@@ -214,7 +217,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::env::var_os("ZGX_CEF_LATE_LOAD_RESULT").map(std::path::PathBuf::from);
     let late_load_test = late_load_result_path.is_some();
     let automated = download_test || event_test || eval_test || site_data_test || late_load_test;
-    if let Some(result_path) = std::env::var_os("ZGX_CEF_DOWNLOAD_RESULT") {
+    if let Some(result_path) = download_result_path.as_ref() {
         fs::write(result_path, format!("START:auto={automated}\n"))?;
     }
     if let Some(result_path) = event_result_path.as_ref() {
@@ -278,8 +281,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let _ = fs::remove_file(&download_path);
             let completed_path = download_path.clone();
             let window = cx.window.clone();
-            let result_path =
-                std::env::var_os("ZGX_CEF_DOWNLOAD_RESULT").map(std::path::PathBuf::from);
+            let result_path = download_result_path.clone();
             web.set_download_handler(move |request, responder| {
                 println!("CEF_DOWNLOAD_REQUEST {} {}", request.name, request.mime);
                 let completed_path = completed_path.clone();
@@ -592,6 +594,68 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 });
             } else if download_test {
                 web.load_url(origin);
+                let download_page = web.clone();
+                let download_window = cx.window.clone();
+                let download_scene = cx.ui.scene.clone();
+                let download_input = cx.ui.input.clone();
+                let download_result = download_result_path
+                    .clone()
+                    .expect("download test has a result path");
+                cx.tasks.spawn(async move {
+                    let mut ready = false;
+                    for _ in 0..200 {
+                        if download_page.title() == "CEF OSR fixture"
+                            && !download_page.state().with_untracked(|state| state.loading)
+                        {
+                            ready = true;
+                            break;
+                        }
+                        zgx::timer::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                    if !ready {
+                        let _ = fs::write(&download_result, "TIMEOUT:fixture-page");
+                        download_window.close();
+                        return;
+                    }
+
+                    let click_result = download_result.clone();
+                    let scene = download_scene.clone();
+                    let input = download_input.clone();
+                    download_page.evaluate_js(
+                        "(()=>{const r=document.querySelector('#download').getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2}})()",
+                        move |result| {
+                            let position = result
+                                .ok()
+                                .and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok())
+                                .and_then(|value| Some((value["x"].as_f64()? as f32, value["y"].as_f64()? as f32)));
+                            let Some((x, y)) = position else {
+                                let _ = fs::write(click_result, "FAIL:download-link-bounds");
+                                return;
+                            };
+                            // Send a real ZGX pointer sequence through the
+                            // normal WebView input path, so Chromium treats the
+                            // attachment as a user-initiated download.
+                            input.dispatch(&scene, InputEvent::PointerMove { x, y });
+                            input.dispatch(&scene, InputEvent::PointerDown {
+                                x,
+                                y,
+                                button: PointerButton::Primary,
+                            });
+                            input.dispatch(&scene, InputEvent::PointerUp {
+                                x,
+                                y,
+                                button: PointerButton::Primary,
+                            });
+                        },
+                    );
+                    zgx::timer::sleep(std::time::Duration::from_secs(15)).await;
+                    if !fs::read_to_string(&download_result)
+                        .is_ok_and(|result| result == "PASS")
+                    {
+                        let _ = fs::write(&download_result, "TIMEOUT:download");
+                        download_window.close();
+                    }
+                });
             } else {
                 let fixture = FIXTURE.to_owned();
                 web.load_html(&fixture, Some(&origin));
@@ -633,6 +697,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .child(zgx::web_view::web_view(&web).grow())
                     .child(zgx::web_view::web_view(late_shared.as_ref().unwrap()).grow())
                     .child(zgx::web_view::web_view(late_isolated.as_ref().unwrap()).grow())
+            } else if download_test {
+                zgx::web_view::web_view(&web)
+                    .grow()
+                    .w_full()
+                    .h_full()
             } else {
                 app
             };
