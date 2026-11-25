@@ -559,6 +559,11 @@ wrap_permission_handler! {
                 return 1;
             };
             let kinds = [
+                (
+                    PermissionRequestTypes::CAMERA_PAN_TILT_ZOOM.get_raw(),
+                    "camera",
+                    "camera",
+                ),
                 (PermissionRequestTypes::CAMERA_STREAM.get_raw(), "camera", "camera"),
                 (PermissionRequestTypes::MIC_STREAM.get_raw(), "microphone", "microphone"),
                 (PermissionRequestTypes::NOTIFICATIONS.get_raw(), "notifications", "notifications"),

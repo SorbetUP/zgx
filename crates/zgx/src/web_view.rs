@@ -318,8 +318,9 @@ pub struct WebViewOptions {
     /// Pages may post to the app: `window.webkit.messageHandlers.zgx
     /// .postMessage(value)` arrives as [`WebViewEvent::Message`] (JSON).
     pub messages: bool,
-    /// Pages may open windows (`window.open`, target=_blank): each request
-    /// arrives as [`WebViewEvent::NewWindowRequested`] and opens nothing.
+    /// Pages may open windows (`window.open`, target=_blank). Requests arrive
+    /// as [`WebViewEvent::NewWindowRequested`]; the CEF backend presents a
+    /// child window, while other backends may only report the request.
     pub new_windows: bool,
     /// Scripts injected at document start, in order, before the page's own.
     pub scripts: Vec<UserScript>,
@@ -443,8 +444,8 @@ pub enum WebViewEvent {
         /// Sent by the top frame, not an iframe.
         main_frame: bool,
     },
-    /// A page asked to open a window (see [`WebViewOptions::new_windows`]);
-    /// nothing opened.
+    /// A page asked to open a window (see [`WebViewOptions::new_windows`]).
+    /// CEF also opens this as a linked child browser when enabled.
     NewWindowRequested {
         /// What it asked to open.
         url: String,

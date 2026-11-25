@@ -359,6 +359,7 @@ fn mock_keychain_requested(mut present: impl FnMut(&str) -> bool) -> bool {
         "ZGX_CEF_LATE_LOAD_RESULT",
         "ZGX_CEF_CLOSE_RACE_RESULT",
         "ZGX_CEF_NAV_EVAL_RACE_RESULT",
+        "ZGX_CEF_POPUP_RESULT",
     ]
     .iter()
     .any(|name| present(name))
@@ -382,8 +383,10 @@ pub(super) fn request_context(profile: &str, persistent: bool) -> Result<Request
     RUNTIME.with(|runtime| {
         let mut runtime = runtime.borrow_mut();
         let runtime = runtime.as_mut().expect("runtime initialized");
-        if let Some(context) = runtime.contexts.get(profile) {
-            return Ok(context.clone());
+        if persistent {
+            if let Some(context) = runtime.contexts.get(profile) {
+                return Ok(context.clone());
+            }
         }
         let mut settings = RequestContextSettings::default();
         if persistent {
@@ -399,7 +402,9 @@ pub(super) fn request_context(profile: &str, persistent: bool) -> Result<Request
             cef::request_context_create_context(Some(&settings), None).ok_or_else(|| {
                 format!("CEF could not create request context for profile `{profile}`")
             })?;
-        runtime.contexts.insert(profile.to_owned(), context.clone());
+        if persistent {
+            runtime.contexts.insert(profile.to_owned(), context.clone());
+        }
         Ok(context)
     })
 }
@@ -412,8 +417,10 @@ pub(super) fn permission_store(
     RUNTIME.with(|runtime| {
         let mut runtime = runtime.borrow_mut();
         let runtime = runtime.as_mut().expect("runtime initialized");
-        if let Some(store) = runtime.permissions.get(profile) {
-            return Ok(store.clone());
+        if persistent {
+            if let Some(store) = runtime.permissions.get(profile) {
+                return Ok(store.clone());
+            }
         }
         let path = if persistent {
             let directory = data_root()?.join(profile_component(profile)?);
@@ -433,9 +440,11 @@ pub(super) fn permission_store(
             _ => HashMap::new(),
         };
         let store = Rc::new(RefCell::new(SitePermissionStore { decisions, path }));
-        runtime
-            .permissions
-            .insert(profile.to_owned(), store.clone());
+        if persistent {
+            runtime
+                .permissions
+                .insert(profile.to_owned(), store.clone());
+        }
         Ok(store)
     })
 }
@@ -622,6 +631,7 @@ mod tests {
             "ZGX_CEF_LATE_LOAD_RESULT",
             "ZGX_CEF_CLOSE_RACE_RESULT",
             "ZGX_CEF_NAV_EVAL_RACE_RESULT",
+            "ZGX_CEF_POPUP_RESULT",
         ] {
             assert!(mock_keychain_requested(|name| name == fixture), "{fixture}");
         }

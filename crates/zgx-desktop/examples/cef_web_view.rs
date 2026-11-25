@@ -46,6 +46,23 @@ const EVENT_CHANGED_FIXTURE: &str = r#"<!doctype html>
 <script>window.webkit.messageHandlers.zgx.postMessage({source:"cef-fixture",value:42})</script>
 "#;
 
+const POPUP_PARENT_FIXTURE: &str = r#"<!doctype html><meta charset=utf-8><title>popup parent</title>
+<script>
+window.addEventListener('message', event => {
+  window.zgx.postMessage({source:'popup-parent',ok:event.origin===location.origin&&event.data?.ok===true});
+});
+setTimeout(() => window.open('/popup-child', 'fixture-popup'), 150);
+</script><p>Waiting for the child window</p>
+"#;
+
+const POPUP_CHILD_FIXTURE: &str = r#"<!doctype html><meta charset=utf-8><title>popup child</title>
+<script>
+const ok=!!window.opener&&document.cookie.includes('popup_cookie=shared');
+if(window.opener)window.opener.postMessage({ok},location.origin);
+setTimeout(()=>window.close(),150);
+</script><p>Completing popup fixture</p>
+"#;
+
 fn run_evaluation_test(
     web: WebView,
     result_path: std::path::PathBuf,
@@ -138,6 +155,7 @@ fn run_evaluation_test(
 fn start_fixture_server(
     download_test: bool,
     site_data_test: bool,
+    popup_test: bool,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
     let address = listener.local_addr()?;
@@ -173,9 +191,22 @@ fn start_fixture_server(
                         let _ = writeln!(result, "HTTP:{path} download={download_test}");
                     }
                 }
-                let (status, content_type, headers, body) = if site_data_test
-                    && path == "/site-data"
+                let (status, content_type, headers, body) = if popup_test && path == "/popup-parent"
                 {
+                    (
+                        "200 OK",
+                        "text/html; charset=utf-8",
+                        "Set-Cookie: popup_cookie=shared; SameSite=Lax\r\n",
+                        POPUP_PARENT_FIXTURE.as_bytes(),
+                    )
+                } else if popup_test && path == "/popup-child" {
+                    (
+                        "200 OK",
+                        "text/html; charset=utf-8",
+                        "",
+                        POPUP_CHILD_FIXTURE.as_bytes(),
+                    )
+                } else if site_data_test && path == "/site-data" {
                     (
                         "200 OK",
                         "text/html; charset=utf-8",
@@ -256,6 +287,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let navigation_eval_race_result_path =
         std::env::var_os("ZGX_CEF_NAV_EVAL_RACE_RESULT").map(std::path::PathBuf::from);
     let navigation_eval_race_test = navigation_eval_race_result_path.is_some();
+    let popup_result_path = std::env::var_os("ZGX_CEF_POPUP_RESULT").map(std::path::PathBuf::from);
+    let popup_test = popup_result_path.is_some();
     let automated = download_test
         || input_test
         || event_test
@@ -263,7 +296,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         || site_data_test
         || late_load_test
         || close_race_test
-        || navigation_eval_race_test;
+        || navigation_eval_race_test
+        || popup_test;
     if let Some(result_path) = download_result_path.as_ref() {
         fs::write(result_path, format!("START:auto={automated}\n"))?;
     }
@@ -285,7 +319,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(result_path) = navigation_eval_race_result_path.as_ref() {
         fs::write(result_path, "START\n")?;
     }
-    let origin = start_fixture_server(download_test, site_data_test || late_load_test)?;
+    if let Some(result_path) = popup_result_path.as_ref() {
+        fs::write(result_path, "START\n")?;
+    }
+    let origin = start_fixture_server(download_test, site_data_test || late_load_test, popup_test)?;
     if let Some(result_path) = event_result_path.as_ref() {
         let mut result = fs::OpenOptions::new().append(true).open(result_path)?;
         writeln!(result, "ORIGIN:{origin}")?;
@@ -459,6 +496,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 subscription
             });
             let eval_done = Arc::new(AtomicBool::new(false));
+            let mut popup_subscription = None;
             if navigation_eval_race_test {
                 let page = web.clone();
                 let navigation = web.clone();
@@ -674,6 +712,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 });
                 web.load_url(format!("{origin}/site-data"));
+            } else if popup_test {
+                let result = popup_result_path
+                    .clone()
+                    .expect("popup fixture has a result path");
+                let expected_origin = origin.clone();
+                let window = cx.window.clone();
+                let done = Arc::new(AtomicBool::new(false));
+                let callback_done = done.clone();
+                let timeout_done = done.clone();
+                let timeout_path = result.clone();
+                let timeout_window = window.clone();
+                let subscription = web.on_event(move |event| {
+                    let zgx::web_view::WebViewEvent::Message {
+                        body,
+                        origin,
+                        main_frame: true,
+                    } = event
+                    else {
+                        return;
+                    };
+                    if origin != &expected_origin
+                        || body != r#"{"source":"popup-parent","ok":true}"#
+                    {
+                        return;
+                    }
+                    if !callback_done.swap(true, Ordering::AcqRel) {
+                        let _ = fs::write(&result, "PASS");
+                        window.close();
+                    }
+                });
+                cx.tasks.spawn(async move {
+                    zgx::timer::sleep(std::time::Duration::from_secs(12)).await;
+                    if !timeout_done.swap(true, Ordering::AcqRel) {
+                        let _ = fs::write(timeout_path, "FAIL:popup-timeout");
+                        timeout_window.close();
+                    }
+                });
+                popup_subscription = Some(subscription);
+                web.load_url(format!("{origin}/popup-parent"));
             } else if event_test {
                 web.load_html(EVENT_FIXTURE, None);
                 let web = web.clone();
@@ -896,9 +973,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 app
             };
-            let app = if event_subscription.is_some() {
+            let app = if event_subscription.is_some() || popup_subscription.is_some() {
                 app.on_mount(move |handle| {
                     if let Some(subscription) = event_subscription {
+                        handle.retain(subscription);
+                    }
+                    if let Some(subscription) = popup_subscription {
                         handle.retain(subscription);
                     }
                 })

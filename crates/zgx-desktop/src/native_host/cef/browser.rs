@@ -713,7 +713,6 @@ pub(super) fn prepare_popup(
     let handle_slot = Rc::new(RefCell::new(None::<crate::WindowHandle>));
     let created_page = Rc::downgrade(&page);
     let closed_page = Rc::downgrade(&page);
-    let created_handle = handle_slot.clone();
     let closed_handle = handle_slot.clone();
     let created_pending = settled.clone();
     let created_map = pending_popups.clone();
@@ -767,7 +766,6 @@ pub(super) fn prepare_popup(
                 host.was_hidden((page.visible.get() == 0) as i32);
                 host.invalidate(PaintElementType::VIEW);
             }
-            let _ = created_handle;
         }),
         before_close: Rc::new(move |identifier| {
             runtime::browser_closed(identifier);
