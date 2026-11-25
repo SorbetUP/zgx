@@ -336,6 +336,19 @@ wrap_load_handler! {
         fn on_load_error(&self, _browser: Option<&mut Browser>, frame: Option<&mut cef::Frame>, code: Errorcode, text: Option<&CefString>, url: Option<&CefString>) {
             let Some(frame) = frame.filter(|frame| frame.is_main() != 0) else { return };
             let url = url.map(ToString::to_string).unwrap_or_else(|| CefString::from(&frame.url()).to_string());
+            if is_user_cancelled_load(code) {
+                let web = self.web.clone();
+                zgx::native_view::post(move || {
+                    if let Some(web) = web.upgrade() {
+                        web.update_state(|state| {
+                            state.loading = false;
+                            state.progress = 0.0;
+                            state.error = None;
+                        });
+                    }
+                });
+                return;
+            }
             let error = format!("{code:?}: {}", text.map(ToString::to_string).unwrap_or_default());
             let web = self.web.clone();
             zgx::native_view::post(move || {
@@ -350,6 +363,10 @@ wrap_load_handler! {
             });
         }
     }
+}
+
+fn is_user_cancelled_load(code: Errorcode) -> bool {
+    code == Errorcode::ABORTED
 }
 
 wrap_display_handler! {
@@ -645,7 +662,9 @@ pub(super) fn origin_from_url(url: &str) -> Option<String> {
 mod tests {
     use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
-    use super::{DownloadUpdate, file_dialog_selection, update_download_status};
+    use super::{
+        DownloadUpdate, file_dialog_selection, is_user_cancelled_load, update_download_status,
+    };
     use cef::FileDialogMode;
     use zgx::web_view::DownloadStatus;
 
@@ -762,5 +781,11 @@ mod tests {
             Some((false, true))
         );
         assert_eq!(file_dialog_selection(FileDialogMode::SAVE), None);
+    }
+
+    #[test]
+    fn intentional_navigation_abort_is_not_a_page_failure() {
+        assert!(is_user_cancelled_load(cef::Errorcode::ABORTED));
+        assert!(!is_user_cancelled_load(cef::Errorcode::FAILED));
     }
 }
