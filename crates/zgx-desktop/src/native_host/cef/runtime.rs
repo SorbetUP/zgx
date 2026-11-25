@@ -271,7 +271,34 @@ fn initialize_inner() -> Result<Runtime, String> {
 }
 
 fn use_mock_keychain() -> bool {
-    mock_keychain_requested(|name| std::env::var_os(name).is_some())
+    let executable = std::env::current_exe().ok().and_then(|path| {
+        path.file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+    });
+    let data_dir = std::env::var_os("POLYSCALE_CEF_DATA_DIR").map(PathBuf::from);
+    mock_keychain_allowed(
+        executable.as_deref(),
+        data_dir.as_deref(),
+        &std::env::temp_dir(),
+        mock_keychain_requested(|name| std::env::var_os(name).is_some()),
+    )
+}
+
+fn mock_keychain_allowed(
+    executable: Option<&str>,
+    data_dir: Option<&std::path::Path>,
+    temp_dir: &std::path::Path,
+    fixture_flag: bool,
+) -> bool {
+    if !fixture_flag || !matches!(executable, Some("cef_web_view" | "browser_profile_fixture")) {
+        return false;
+    }
+    let (Some(data_dir), Ok(temp_dir)) = (data_dir, temp_dir.canonicalize()) else {
+        return false;
+    };
+    data_dir
+        .canonicalize()
+        .is_ok_and(|data_dir| data_dir.starts_with(temp_dir))
 }
 
 fn mock_keychain_requested(mut present: impl FnMut(&str) -> bool) -> bool {
@@ -496,8 +523,9 @@ pub(super) fn shutdown() -> Result<(), String> {
 mod tests {
     use super::{
         browser_closed, browser_created, browser_creation_failed, browser_creation_started,
-        has_browsers, mock_keychain_requested,
+        has_browsers, mock_keychain_allowed, mock_keychain_requested,
     };
+    use std::{fs, path::Path, time::SystemTime};
 
     #[test]
     fn every_automated_fixture_uses_the_mock_keychain() {
@@ -516,6 +544,53 @@ mod tests {
             assert!(mock_keychain_requested(|name| name == fixture), "{fixture}");
         }
         assert!(!mock_keychain_requested(|_| false));
+    }
+
+    #[test]
+    fn mock_keychain_requires_a_fixture_binary_and_temporary_profile_data() {
+        let temp_root = std::env::temp_dir();
+        let profile = temp_root.join(format!(
+            "zgx-cef-keychain-test-{}-{:?}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&profile).unwrap();
+
+        assert!(mock_keychain_allowed(
+            Some("cef_web_view"),
+            Some(&profile),
+            &temp_root,
+            true,
+        ));
+        assert!(mock_keychain_allowed(
+            Some("browser_profile_fixture"),
+            Some(&profile),
+            &temp_root,
+            true,
+        ));
+        assert!(!mock_keychain_allowed(
+            Some("Polyscale"),
+            Some(&profile),
+            &temp_root,
+            true,
+        ));
+        assert!(!mock_keychain_allowed(
+            Some("cef_web_view"),
+            Some(Path::new("/")),
+            &temp_root,
+            true,
+        ));
+        assert!(!mock_keychain_allowed(
+            Some("cef_web_view"),
+            Some(&profile),
+            &temp_root,
+            false,
+        ));
+
+        fs::remove_dir_all(profile).unwrap();
     }
 
     #[test]
