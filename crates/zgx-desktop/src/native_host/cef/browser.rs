@@ -458,6 +458,8 @@ pub(super) fn backend(web: &WebView) -> Result<Rc<Page>, String> {
     let closed_weak = weak;
     let callbacks = BrowserCallbacks {
         find_replies: page.find_replies.clone(),
+        web: web.downgrade(),
+        new_windows: web.options().new_windows,
         created: Rc::new(move |browser| {
             runtime::browser_created(browser.identifier());
             if runtime::register_browser(&browser).is_err() {

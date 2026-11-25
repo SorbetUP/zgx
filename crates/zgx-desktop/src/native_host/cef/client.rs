@@ -26,6 +26,8 @@ pub(super) struct BrowserCallbacks {
     pub created: Rc<dyn Fn(Browser)>,
     pub before_close: Rc<dyn Fn(i32)>,
     pub find_replies: FindReplies,
+    pub web: zgx::web_view::WeakWebView,
+    pub new_windows: bool,
 }
 
 wrap_download_handler! {
@@ -154,6 +156,36 @@ fn update_download_status(
 wrap_life_span_handler! {
     pub(super) struct CEFLifeSpanHandler { callbacks: BrowserCallbacks }
     impl LifeSpanHandler {
+        fn on_before_popup(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            _popup_id: i32,
+            target_url: Option<&CefString>,
+            _target_frame_name: Option<&CefString>,
+            _target_disposition: WindowOpenDisposition,
+            _user_gesture: i32,
+            _popup_features: Option<&PopupFeatures>,
+            _window_info: Option<&mut WindowInfo>,
+            _client: Option<&mut Option<Client>>,
+            _settings: Option<&mut BrowserSettings>,
+            _extra_info: Option<&mut Option<DictionaryValue>>,
+            _no_javascript_access: Option<&mut i32>,
+        ) -> i32 {
+            if self.callbacks.new_windows {
+                let url = target_url.map(ToString::to_string).unwrap_or_default();
+                let web = self.callbacks.web.clone();
+                zgx::native_view::post(move || {
+                    if let Some(web) = web.upgrade() {
+                        web.emit(zgx::web_view::WebViewEvent::NewWindowRequested { url });
+                    }
+                });
+            }
+            // ZGX's existing contract surfaces the request to the app and
+            // deliberately does not create an unmanaged native window.
+            1
+        }
+
         fn on_after_created(&self, browser: Option<&mut Browser>) {
             if let Some(browser) = browser {
                 (self.callbacks.created)(browser.clone());
