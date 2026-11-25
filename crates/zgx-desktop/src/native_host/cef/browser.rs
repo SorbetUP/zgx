@@ -71,6 +71,7 @@ pub(super) struct Page {
 struct PageDrag {
     text: String,
     html: Option<String>,
+    link_url: Option<String>,
     items: Vec<zgx::input::DragItem>,
     x: i32,
     y: i32,
@@ -1344,7 +1345,7 @@ fn input(page: &Page, event: &mut zgx::input::EventContext) {
                 page.drag_export.replace(Some(drag.items));
                 page.drag_source_active.set(true);
                 event.start_drag_from(
-                    DraggedText::with_html(drag.text, drag.html),
+                    DraggedText::with_link(drag.text, drag.html, drag.link_url),
                     origin.0,
                     origin.1,
                 );
@@ -1435,6 +1436,10 @@ fn drag_data_for_text(text: &DraggedText) -> Option<DragData> {
         let fragment_html: CefString = html.into();
         data.set_fragment_html(Some(&fragment_html));
     }
+    if let Some(url) = text.link_url() {
+        let url: CefString = url.into();
+        data.set_link_url(Some(&url));
+    }
     Some(data)
 }
 
@@ -1478,12 +1483,13 @@ fn page_drag_fields(
         .then_some(fragment_html);
     let mut items = Vec::with_capacity(2);
     if !url.is_empty() {
-        items.push(zgx::input::DragItem::Url(url));
+        items.push(zgx::input::DragItem::Url(url.clone()));
     }
     items.push(zgx::input::DragItem::Text(text.clone()));
     Some(PageDrag {
         text,
         html,
+        link_url: (!url.is_empty()).then_some(url),
         items,
         x,
         y,
@@ -1925,7 +1931,7 @@ mod tests {
         local_to_window, page_drag_fields, text_key_events, utf16_offset, window_to_local,
     };
     use cef::KeyEventType;
-    use zgx::input::{Key, Modifiers};
+    use zgx::input::{DraggedText, Key, Modifiers};
 
     #[test]
     fn browser_keys_map_to_chromium_virtual_keys() {
@@ -2007,6 +2013,15 @@ mod tests {
 
         assert_eq!(drag.text, "Selected text");
         assert_eq!(drag.html.as_deref(), Some("<b>Selected text</b>"));
+        assert_eq!(
+            drag.link_url.as_deref(),
+            Some("https://example.test/document")
+        );
+        let payload =
+            DraggedText::with_link(drag.text.clone(), drag.html.clone(), drag.link_url.clone());
+        assert_eq!(payload.text(), "Selected text");
+        assert_eq!(payload.html(), Some("<b>Selected text</b>"));
+        assert_eq!(payload.link_url(), Some("https://example.test/document"));
         assert_eq!(drag.items.len(), 2);
         assert!(matches!(
             &drag.items[0],

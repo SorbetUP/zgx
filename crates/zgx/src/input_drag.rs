@@ -86,6 +86,10 @@ pub struct DraggedText {
     /// selection, a document's): a rich destination drops it as it pastes
     /// HTML.
     html: Option<String>,
+    /// The hyperlink associated with this drag, when the source was a link.
+    /// Browser destinations need this as a link payload in addition to the
+    /// display text and any HTML fragment.
+    link_url: Option<String>,
     /// The editor it was selected in (its scene's `identity`, as node ids
     /// are each window's own, and its node), and where: a drop there moves
     /// it.
@@ -100,6 +104,7 @@ impl DraggedText {
         Self {
             text: text.into(),
             html: None,
+            link_url: None,
             from: None,
             taken: std::cell::Cell::new(false),
         }
@@ -113,6 +118,20 @@ impl DraggedText {
             ..Self::new(text)
         }
     }
+    /// Browser link payload with its original URL preserved for another
+    /// browser view. Kept hidden while the typed drag contract is still
+    /// evolving.
+    #[doc(hidden)]
+    pub fn with_link(
+        text: impl Into<String>,
+        html: Option<String>,
+        link_url: Option<String>,
+    ) -> Self {
+        Self {
+            link_url,
+            ..Self::with_html(text, html)
+        }
+    }
     pub(crate) fn from_editor(
         text: String,
         scene: u64,
@@ -122,6 +141,7 @@ impl DraggedText {
         Self {
             text,
             html: None,
+            link_url: None,
             from: Some((scene, editor, range)),
             taken: std::cell::Cell::new(false),
         }
@@ -144,6 +164,11 @@ impl DraggedText {
     #[doc(hidden)]
     pub fn html(&self) -> Option<&str> {
         self.html.as_deref()
+    }
+    /// The original URL when this text was dragged from a browser link.
+    #[doc(hidden)]
+    pub fn link_url(&self) -> Option<&str> {
+        self.link_url.as_deref()
     }
 }
 /// What a drag carries to other apps, when a host hands it to the platform
