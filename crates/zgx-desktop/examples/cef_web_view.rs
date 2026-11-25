@@ -2,17 +2,20 @@
 // resources and sandbox helper are beside the app executable:
 // `cargo run -p zgx-desktop --features cef --bin cef_web_view`.
 use std::{
+    cell::RefCell,
     fs,
     io::{Read, Write},
     net::TcpListener,
     path::Path,
+    rc::Rc,
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     sync::{Arc, Mutex},
     thread,
 };
 use zgx::{
     compose::prelude::*,
-    input::{InputEvent, Key, Modifiers, PointerButton},
+    input::{DraggedText, InputDispatcher, InputEvent, Key, Modifiers, PointerButton},
+    scene::Scene,
     web_view::{FindOptions, WebProfile, WebView, WebViewOptions},
 };
 use zgx_desktop::{Application, WindowBounds, WindowOptions};
@@ -92,6 +95,96 @@ if(window.opener)window.opener.postMessage({ok},location.origin);
 setTimeout(()=>window.close(),150);
 </script><p>Completing popup fixture</p>
 "#;
+
+const DRAG_SOURCE_FIXTURE: &str = r#"<!doctype html><meta charset=utf-8><title>drag source</title>
+<style>html,body{margin:0;width:100%;height:100%;font:24px system-ui}body{display:grid;place-items:center}a{display:inline-block;padding:24px;background:#d5e9ff}</style>
+<a id="drag-link" draggable="true" href="/drag-linked">Drag this link</a>
+"#;
+
+const DRAG_TARGET_FIXTURE: &str = r#"<!doctype html><meta charset=utf-8><title>drag target</title>
+<style>html,body{margin:0;width:100%;height:100%;font:24px system-ui}#drop{width:100%;height:100%;display:grid;place-items:center;border:4px dashed #579;box-sizing:border-box}</style>
+<div id="drop">Drop here</div>
+<script>
+const target=document.querySelector('#drop');
+target.addEventListener('dragover',event=>event.preventDefault());
+target.addEventListener('drop',event=>{
+  event.preventDefault();
+  const html=event.dataTransfer.getData('text/html');
+  const link=new DOMParser().parseFromString(html,'text/html').querySelector('a')?.href||'';
+  const files=Array.from(event.dataTransfer.files).map(file=>({name:file.name,size:file.size}));
+  window.zgx.postMessage({source:'drag-target',uri:event.dataTransfer.getData('text/uri-list'),plain:event.dataTransfer.getData('text/plain'),htmlLink:link,files});
+});
+</script>
+"#;
+
+type FixtureRect = Rc<RefCell<Option<zgx::compose::NodeHandle>>>;
+
+fn capture_fixture_rect(handle: zgx::compose::NodeHandle, output: FixtureRect) {
+    *output.borrow_mut() = Some(handle);
+}
+
+fn fixture_rect(output: &FixtureRect) -> Option<(f32, f32, f32, f32)> {
+    let handle = output.borrow().clone()?;
+    let rect = handle.window_bounds()?;
+    (rect.width > 0. && rect.height > 0.).then_some((rect.x, rect.y, rect.width, rect.height))
+}
+
+async fn perform_drag(
+    input: &InputDispatcher,
+    scene: &Rc<RefCell<Scene>>,
+    from: (f32, f32),
+    to: (f32, f32),
+) {
+    let moved = input.dispatch(
+        scene,
+        InputEvent::PointerMove {
+            x: from.0,
+            y: from.1,
+        },
+    );
+    let down = input.dispatch(
+        scene,
+        InputEvent::PointerDown {
+            x: from.0,
+            y: from.1,
+            button: PointerButton::Primary,
+        },
+    );
+    let _ = (moved, down);
+    zgx::timer::sleep(std::time::Duration::from_millis(40)).await;
+    let threshold = (from.0 + 12.0, from.1 + 8.0);
+    let threshold_result = input.dispatch(
+        scene,
+        InputEvent::PointerMove {
+            x: threshold.0,
+            y: threshold.1,
+        },
+    );
+    let _ = threshold_result;
+    zgx::timer::sleep(std::time::Duration::from_millis(120)).await;
+    for step in 1..=12 {
+        let fraction = step as f32 / 12.0;
+        let result = input.dispatch(
+            scene,
+            InputEvent::PointerMove {
+                x: threshold.0 + (to.0 - threshold.0) * fraction,
+                y: threshold.1 + (to.1 - threshold.1) * fraction,
+            },
+        );
+        if step == 12 {
+            let _ = result;
+        }
+        zgx::timer::sleep(std::time::Duration::from_millis(30)).await;
+    }
+    input.dispatch(
+        scene,
+        InputEvent::PointerUp {
+            x: to.0,
+            y: to.1,
+            button: PointerButton::Primary,
+        },
+    );
+}
 
 fn run_evaluation_test(
     web: WebView,
@@ -186,6 +279,7 @@ fn start_fixture_server(
     download_test: bool,
     site_data_test: bool,
     popup_test: bool,
+    drag_test: bool,
     html_base_result_path: Option<std::path::PathBuf>,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
@@ -257,6 +351,27 @@ fn start_fixture_server(
                         "text/html; charset=utf-8",
                         "",
                         POPUP_CHILD_FIXTURE.as_bytes(),
+                    )
+                } else if drag_test && path == "/drag-source" {
+                    (
+                        "200 OK",
+                        "text/html; charset=utf-8",
+                        "",
+                        DRAG_SOURCE_FIXTURE.as_bytes(),
+                    )
+                } else if drag_test && path == "/drag-target" {
+                    (
+                        "200 OK",
+                        "text/html; charset=utf-8",
+                        "",
+                        DRAG_TARGET_FIXTURE.as_bytes(),
+                    )
+                } else if drag_test && path == "/drag-linked" {
+                    (
+                        "200 OK",
+                        "text/plain; charset=utf-8",
+                        "",
+                        b"drag-link-destination".as_slice(),
                     )
                 } else if site_data_test && path == "/site-data" {
                     (
@@ -352,6 +467,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let navigation_eval_race_test = navigation_eval_race_result_path.is_some();
     let popup_result_path = std::env::var_os("ZGX_CEF_POPUP_RESULT").map(std::path::PathBuf::from);
     let popup_test = popup_result_path.is_some();
+    let drag_result_path = std::env::var_os("ZGX_CEF_DRAG_RESULT").map(std::path::PathBuf::from);
+    let drag_test = drag_result_path.is_some();
+    let drag_fixture_file = fixture_data_dir.join("drag-payload.txt");
+    if drag_test {
+        fs::create_dir_all(&fixture_data_dir)?;
+        fs::write(&drag_fixture_file, b"cef-native-file-drag")?;
+    }
     let automated = download_test
         || input_test
         || event_test
@@ -361,7 +483,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         || late_load_test
         || close_race_test
         || navigation_eval_race_test
-        || popup_test;
+        || popup_test
+        || drag_test;
     if let Some(result_path) = download_result_path.as_ref() {
         fs::write(result_path, format!("START:auto={automated}\n"))?;
     }
@@ -390,10 +513,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(result_path) = popup_result_path.as_ref() {
         fs::write(result_path, "START\n")?;
     }
+    if let Some(result_path) = drag_result_path.as_ref() {
+        fs::write(result_path, "START\n")?;
+    }
     let origin = start_fixture_server(
         download_test,
         site_data_test || late_load_test,
         popup_test,
+        drag_test,
         html_base_result_path.clone(),
     )?;
     if let Some(result_path) = event_result_path.as_ref() {
@@ -412,7 +539,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ..Default::default()
         })
         .run(|cx| {
-            let profile = if late_load_test {
+            let profile = if drag_test {
+                WebProfile::Named("zgx-drag-integration-fixture".into())
+            } else if late_load_test {
                 WebProfile::Named("zgx-late-load-fixture".into())
             } else {
                 WebProfile::Ephemeral
@@ -422,6 +551,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 WebViewOptions {
                     profile,
                     new_windows: popup_test,
+                    messages: drag_test,
                     ..Default::default()
                 },
             );
@@ -444,6 +574,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     },
                 )
             });
+            let drag_target_web = drag_test.then(|| {
+                WebView::new(
+                    &cx.ui.runtime,
+                    WebViewOptions {
+                        profile: WebProfile::Named("zgx-drag-integration-fixture".into()),
+                        messages: true,
+                        ..Default::default()
+                    },
+                )
+            });
+            let source_rect = Rc::new(RefCell::new(None));
+            let file_source_rect = Rc::new(RefCell::new(None));
+            let target_rect = Rc::new(RefCell::new(None));
+            let drag_file_path = drag_fixture_file.clone();
+            let drag_file_source = div()
+                .w(290.)
+                .h_full()
+                .child(text("CEF file drag source"))
+                .on_drag(move || {
+                    DraggedText::with_link_and_files(
+                        "",
+                        None,
+                        None,
+                        vec![drag_file_path.clone()],
+                    )
+                })
+                .on_mount({
+                    let output = file_source_rect.clone();
+                    move |handle| capture_fixture_rect(handle, output.clone())
+                });
             let download_path =
                 std::env::temp_dir().join(format!("zgx-cef-download-{}.txt", std::process::id()));
             let _ = fs::remove_file(&download_path);
@@ -572,7 +732,183 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             });
             let eval_done = Arc::new(AtomicBool::new(false));
             let mut popup_subscription = None;
-            if navigation_eval_race_test {
+            let mut drag_subscription = None;
+            if drag_test {
+                let target = drag_target_web
+                    .as_ref()
+                    .expect("drag target WebView exists")
+                    .clone();
+                let result_path = drag_result_path
+                    .clone()
+                    .expect("drag integration result path exists");
+                let expected_link = format!("{origin}/drag-linked");
+                let expected_file = fixture_data_dir.join("drag-payload.txt");
+                let expected_file_size = fs::metadata(&expected_file)
+                    .map(|metadata| metadata.len())
+                    .unwrap_or_default();
+                let file_received = Arc::new(AtomicBool::new(false));
+                let link_received = Arc::new(AtomicBool::new(false));
+                let event_done = Arc::new(AtomicBool::new(false));
+                let callback_file_received = file_received.clone();
+                let callback_link_received = link_received.clone();
+                let callback_done = event_done.clone();
+                let callback_path = result_path.clone();
+                let callback_link = expected_link.clone();
+                let callback_name = expected_file
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let callback_window = cx.window.clone();
+                let target_origin = origin.clone();
+                let subscription = target.on_event(move |event| {
+                    let zgx::web_view::WebViewEvent::Message {
+                        body,
+                        origin,
+                        main_frame: true,
+                    } = event
+                    else {
+                        return;
+                    };
+                    if origin != &target_origin {
+                        return;
+                    }
+                    let Ok(message) = serde_json::from_str::<serde_json::Value>(body) else {
+                        return;
+                    };
+                    if message["source"] != "drag-target" {
+                        return;
+                    }
+                    let files = message["files"].as_array().cloned().unwrap_or_default();
+                    if !files.is_empty() {
+                        let passed = files.iter().any(|file| {
+                            file["name"] == callback_name
+                                && file["size"].as_u64() == Some(expected_file_size)
+                        });
+                        callback_file_received.store(passed, Ordering::Release);
+                        let _ = fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(&callback_path)
+                            .and_then(|mut result| writeln!(result, "FILE_DROP:{message}:pass={passed}"));
+                    } else {
+                        let uri = message["uri"].as_str().unwrap_or_default().trim();
+                        let html_link = message["htmlLink"].as_str().unwrap_or_default();
+                        let passed = uri == callback_link || html_link == callback_link;
+                        callback_link_received.store(passed, Ordering::Release);
+                        let _ = fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(&callback_path)
+                            .and_then(|mut result| writeln!(result, "LINK_DROP:{message}:pass={passed}"));
+                    }
+                    if callback_file_received.load(Ordering::Acquire)
+                        && callback_link_received.load(Ordering::Acquire)
+                        && !callback_done.swap(true, Ordering::AcqRel)
+                    {
+                        let _ = fs::write(&callback_path, "PASS");
+                        callback_window.close();
+                    }
+                });
+                drag_subscription = Some(subscription);
+
+                let source = web.clone();
+                let task_target = target.clone();
+                let input = cx.ui.input.clone();
+                let scene = cx.ui.scene.clone();
+                let task_source_rect = source_rect.clone();
+                let task_file_source_rect = file_source_rect.clone();
+                let task_target_rect = target_rect.clone();
+                let window = cx.window.clone();
+                let timeout_result = result_path.clone();
+                let timeout_done = event_done.clone();
+                cx.tasks.spawn(async move {
+                    source.load_url(format!("{origin}/drag-source"));
+                    task_target.load_url(format!("{origin}/drag-target"));
+                    let mut ready = false;
+                    for _ in 0..200 {
+                        if source.title() == "drag source"
+                            && task_target.title() == "drag target"
+                            && !source.state().with_untracked(|state| state.loading)
+                            && !task_target.state().with_untracked(|state| state.loading)
+                        {
+                            ready = true;
+                            break;
+                        }
+                        zgx::timer::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                    if !ready {
+                        let _ = fs::write(&timeout_result, "FAIL:drag-pages-not-ready");
+                        window.close();
+                        return;
+                    }
+                    let mut fixture_rects = None;
+                    for _ in 0..100 {
+                        let source = fixture_rect(&task_source_rect);
+                        let file = fixture_rect(&task_file_source_rect);
+                        let target = fixture_rect(&task_target_rect);
+                        if let (Some(source), Some(file), Some(target)) = (source, file, target) {
+                            fixture_rects = Some((source, file, target));
+                            break;
+                        }
+                        zgx::timer::sleep(std::time::Duration::from_millis(20)).await;
+                    }
+                    let Some((source, file_source, target)) = fixture_rects else {
+                        let _ = fs::write(&timeout_result, "FAIL:fixture-rects-not-mounted");
+                        window.close();
+                        return;
+                    };
+                    let center = |(x, y, width, height): (f32, f32, f32, f32)| {
+                        (x + width / 2., y + height / 2.)
+                    };
+                    let source_link = center(source);
+                    let file_source = center(file_source);
+                    let target_drop = center(target);
+
+                    // First inject a typed file payload through ZGX's normal
+                    // drag dispatcher into the target's CEF DragTarget API.
+                    // The URL phase below uses Chromium's real StartDragging
+                    // callback as its source.
+                    // The file payload begins at the center of the actual
+                    // middle-column ZGX drag-source card.
+                    perform_drag(&input, &scene, file_source, target_drop).await;
+                    let mut file_ok = false;
+                    for _ in 0..100 {
+                        if file_received.load(Ordering::Acquire) {
+                            file_ok = true;
+                            break;
+                        }
+                        zgx::timer::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                    if !file_ok {
+                        let _ = fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(&timeout_result)
+                            .and_then(|mut result| writeln!(result, "FILE_DROP_NOT_RECEIVED"));
+                    }
+
+                    // Now drag a real link from the source Chromium page to
+                    // the second Chromium page, preserving the URI metadata.
+                    perform_drag(&input, &scene, source_link, target_drop).await;
+                    for _ in 0..120 {
+                        if event_done.load(Ordering::Acquire) {
+                            return;
+                        }
+                        zgx::timer::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                    if !timeout_done.swap(true, Ordering::AcqRel) {
+                        let status = if file_received.load(Ordering::Acquire)
+                            && link_received.load(Ordering::Acquire)
+                        {
+                            "PASS"
+                        } else {
+                            "FAIL:drag-drop-incomplete"
+                        };
+                        let _ = fs::write(&timeout_result, status);
+                        window.close();
+                    }
+                });
+            } else if navigation_eval_race_test {
                 let page = web.clone();
                 let navigation = web.clone();
                 let result_path = navigation_eval_race_result_path
@@ -1192,6 +1528,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .child(zgx::web_view::web_view(&web).grow())
                     .child(zgx::web_view::web_view(late_shared.as_ref().unwrap()).grow())
                     .child(zgx::web_view::web_view(late_isolated.as_ref().unwrap()).grow())
+            } else if drag_test {
+                let source_rect_capture = source_rect.clone();
+                let target_rect_capture = target_rect.clone();
+                let source_view = zgx::web_view::web_view(&web)
+                    .w(290.)
+                    .h_full()
+                    .on_mount(move |handle| {
+                        capture_fixture_rect(handle, source_rect_capture.clone())
+                    });
+                let target_view = zgx::web_view::web_view(
+                    drag_target_web.as_ref().expect("drag target WebView exists"),
+                )
+                .w(290.)
+                .h_full()
+                .on_mount(move |handle| {
+                    capture_fixture_rect(handle, target_rect_capture.clone())
+                });
+                row()
+                    .w_full()
+                    .h_full()
+                    .child(source_view)
+                    .child(drag_file_source.grow())
+                    .child(target_view)
             } else if download_test || input_test || popup_test || html_base_test {
                 zgx::web_view::web_view(&web)
                     .grow()
@@ -1200,12 +1559,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 app
             };
-            let app = if event_subscription.is_some() || popup_subscription.is_some() {
+            let app = if event_subscription.is_some()
+                || popup_subscription.is_some()
+                || drag_subscription.is_some()
+            {
                 app.on_mount(move |handle| {
                     if let Some(subscription) = event_subscription {
                         handle.retain(subscription);
                     }
                     if let Some(subscription) = popup_subscription {
+                        handle.retain(subscription);
+                    }
+                    if let Some(subscription) = drag_subscription {
                         handle.retain(subscription);
                     }
                 })
