@@ -355,6 +355,20 @@ wrap_load_handler! {
 wrap_display_handler! {
     pub(super) struct CEFDisplayHandler { web: zgx::web_view::WeakWebView }
     impl DisplayHandler {
+        fn on_loading_progress_change(&self, _browser: Option<&mut Browser>, progress: f64) {
+            let web = self.web.clone();
+            let progress = progress.clamp(0.0, 1.0);
+            zgx::native_view::post(move || {
+                if let Some(web) = web.upgrade() {
+                    web.update_state(|state| {
+                        if state.loading {
+                            state.progress = progress;
+                        }
+                    });
+                }
+            });
+        }
+
         fn on_address_change(
             &self,
             _browser: Option<&mut Browser>,

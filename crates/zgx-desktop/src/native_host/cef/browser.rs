@@ -44,6 +44,7 @@ pub(super) struct Page {
     lifecycle: Cell<BrowserLifecycle>,
     visible: Cell<u32>,
     input_modifiers: Cell<Modifiers>,
+    mouse_buttons: Cell<u32>,
     last_click: RefCell<Option<LastClick>>,
     click_count: Cell<u32>,
     gpu: zgx::gpu_view::GpuView,
@@ -516,6 +517,7 @@ pub(super) fn backend(web: &WebView) -> Result<Rc<Page>, String> {
         lifecycle: Cell::new(BrowserLifecycle::Creating),
         visible: Cell::new(0),
         input_modifiers: Cell::new(Modifiers::default()),
+        mouse_buttons: Cell::new(0),
         last_click: RefCell::new(None),
         click_count: Cell::new(1),
         gpu,
@@ -714,12 +716,27 @@ fn input(page: &Page, event: &InputEvent) {
     match event.clone() {
         InputEvent::PointerDown { x, y, button } | InputEvent::PointerUp { x, y, button } => {
             let mouse_up = matches!(event, InputEvent::PointerUp { .. });
-            let (button_type, button_id) = match button {
-                PointerButton::Primary => (MouseButtonType::LEFT, 1),
-                PointerButton::Secondary => (MouseButtonType::RIGHT, 2),
-                PointerButton::Middle => (MouseButtonType::MIDDLE, 3),
+            let (button_type, button_id, cef_flag) = match button {
+                PointerButton::Primary => (
+                    MouseButtonType::LEFT,
+                    1,
+                    cef::sys::cef_event_flags_t::EVENTFLAG_LEFT_MOUSE_BUTTON.0,
+                ),
+                PointerButton::Secondary => (
+                    MouseButtonType::RIGHT,
+                    2,
+                    cef::sys::cef_event_flags_t::EVENTFLAG_RIGHT_MOUSE_BUTTON.0,
+                ),
+                PointerButton::Middle => (
+                    MouseButtonType::MIDDLE,
+                    3,
+                    cef::sys::cef_event_flags_t::EVENTFLAG_MIDDLE_MOUSE_BUTTON.0,
+                ),
                 PointerButton::Other(_) => return,
             };
+            let buttons = page.mouse_buttons.get();
+            page.mouse_buttons
+                .set(update_mouse_button_flags(buttons, cef_flag, !mouse_up));
             let click_count = if mouse_up {
                 page.click_count.get()
             } else {
@@ -831,7 +848,15 @@ fn mouse_event(page: &Page, x: f32, y: f32) -> MouseEvent {
     MouseEvent {
         x: x as i32,
         y: y as i32,
-        modifiers: cef_modifiers(page.input_modifiers.get()),
+        modifiers: cef_modifiers(page.input_modifiers.get()) | page.mouse_buttons.get(),
+    }
+}
+
+fn update_mouse_button_flags(current: u32, button: u32, pressed: bool) -> u32 {
+    if pressed {
+        current | button
+    } else {
+        current & !button
     }
 }
 
@@ -1069,6 +1094,23 @@ mod tests {
             meta: true,
         });
         assert_eq!(flags, 2 | 4 | 8 | 128);
+    }
+
+    #[test]
+    fn mouse_button_flags_follow_press_and_release_state() {
+        let left = cef::sys::cef_event_flags_t::EVENTFLAG_LEFT_MOUSE_BUTTON.0;
+        let right = cef::sys::cef_event_flags_t::EVENTFLAG_RIGHT_MOUSE_BUTTON.0;
+        let left_pressed = super::update_mouse_button_flags(0, left, true);
+        let both_pressed = super::update_mouse_button_flags(left_pressed, right, true);
+        let right_released = super::update_mouse_button_flags(both_pressed, right, false);
+
+        assert_eq!(left_pressed, left);
+        assert_eq!(both_pressed, left | right);
+        assert_eq!(right_released, left);
+        assert_eq!(
+            super::update_mouse_button_flags(right_released, left, false),
+            0
+        );
     }
 
     #[test]
