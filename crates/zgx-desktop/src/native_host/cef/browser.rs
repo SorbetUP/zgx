@@ -32,6 +32,7 @@ enum BrowserLifecycle {
 
 pub(super) struct Page {
     web: zgx::web_view::WeakWebView,
+    permissions: runtime::PermissionStoreHandle,
     browser: Rc<RefCell<Option<Browser>>>,
     pending: RefCell<Vec<WebViewCommand>>,
     evaluations: Rc<RefCell<HashMap<i32, (u64, EvaluationReply)>>>,
@@ -365,6 +366,17 @@ fn start_clear_site_data(page: &Page, browser: &Browser, url: &str, done: SiteDa
     let types_value: CefString = "all".into();
     let _ = params.set_string(Some(&origin_key), Some(&origin_value));
     let _ = params.set_string(Some(&types_key), Some(&types_value));
+    let store = page.permissions.clone();
+    let cleared_origin = origin.clone();
+    let done: SiteDataReply = Box::new(move |result| match result {
+        Ok(count) => match store.borrow_mut().forget_origin(&cleared_origin) {
+            Ok(()) => done(Ok(count)),
+            Err(error) => done(Err(format!(
+                "site data was cleared but its saved permissions could not be removed: {error}"
+            ))),
+        },
+        Err(error) => done(Err(error)),
+    });
     page.site_data.borrow_mut().insert(id, done);
     let method: CefString = "Storage.clearDataForOrigin".into();
     if host.execute_dev_tools_method(id, Some(&method), Some(&mut params)) == 0
@@ -511,6 +523,7 @@ pub(super) fn backend(
     ));
     let page = Rc::new(Page {
         web: web.downgrade(),
+        permissions: permissions.clone(),
         browser: browser.clone(),
         pending: RefCell::new(Vec::new()),
         evaluations: Rc::new(RefCell::new(HashMap::new())),
@@ -689,6 +702,7 @@ pub(super) fn prepare_popup(
     ));
     let page = Rc::new(Page {
         web: web.clone(),
+        permissions: permissions.clone(),
         browser: browser.clone(),
         pending: RefCell::new(Vec::new()),
         evaluations: Rc::new(RefCell::new(HashMap::new())),

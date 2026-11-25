@@ -59,6 +59,16 @@ impl SitePermissionStore {
     ) -> Result<(), String> {
         self.decisions
             .insert(permission_key(origin, permission), allowed);
+        self.persist()
+    }
+
+    pub(super) fn forget_origin(&mut self, origin: &str) -> Result<(), String> {
+        let prefix = format!("{origin}\n");
+        self.decisions.retain(|key, _| !key.starts_with(&prefix));
+        self.persist()
+    }
+
+    fn persist(&self) -> Result<(), String> {
         let Some(path) = &self.path else {
             return Ok(());
         };
@@ -705,19 +715,28 @@ mod tests {
         first
             .remember("https://meet.example", "camera", true)
             .unwrap();
+        first
+            .remember("https://other.example", "notifications", false)
+            .unwrap();
         assert_eq!(first.decision("https://meet.example", "camera"), Some(true));
         assert_eq!(first.decision("https://meet.example", "microphone"), None);
         assert_eq!(first.decision("https://other.example", "camera"), None);
 
         let restored: HashMap<String, bool> =
             serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        let restored = super::SitePermissionStore {
+        let mut restored = super::SitePermissionStore {
             decisions: restored,
             path: Some(path.clone()),
         };
         assert_eq!(
             restored.decision("https://meet.example", "camera"),
             Some(true)
+        );
+        restored.forget_origin("https://meet.example").unwrap();
+        assert_eq!(restored.decision("https://meet.example", "camera"), None);
+        assert_eq!(
+            restored.decision("https://other.example", "notifications"),
+            Some(false)
         );
         let other_profile = super::SitePermissionStore {
             decisions: Default::default(),
