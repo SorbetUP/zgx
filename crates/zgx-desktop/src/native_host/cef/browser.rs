@@ -477,7 +477,12 @@ fn apply(page: &Page, browser: &Browser, command: WebViewCommand) {
     }
 }
 
-pub(super) fn backend(web: &WebView) -> Result<Rc<Page>, String> {
+pub(super) fn backend(
+    web: &WebView,
+    dialogs: crate::FileDialogs,
+    tasks: crate::TaskSpawner,
+    windows: crate::WindowFactory,
+) -> Result<Rc<Page>, String> {
     if let Some(existing) = web.backend()
         && let Some(page) = existing.as_any().downcast_ref::<CefWebView>()
     {
@@ -491,6 +496,7 @@ pub(super) fn backend(web: &WebView) -> Result<Rc<Page>, String> {
         WebProfile::Named(id) => (format!("named:{id}"), true),
     };
     let context = runtime::request_context(&profile, persistent)?;
+    let permissions = runtime::permission_store(&profile, persistent)?;
     let frame = Arc::new(Mutex::default());
     let popup = Arc::new(Mutex::default());
     let size = Arc::new(Mutex::new((1024, 768)));
@@ -614,6 +620,11 @@ pub(super) fn backend(web: &WebView) -> Result<Rc<Page>, String> {
         Rc::new(move || invalidator.invalidate()),
         callbacks,
         web.downgrade(),
+        profile.clone(),
+        permissions,
+        dialogs,
+        tasks,
+        windows,
     );
     let info = WindowInfo {
         windowless_rendering_enabled: 1,
@@ -644,6 +655,181 @@ pub(super) fn backend(web: &WebView) -> Result<Rc<Page>, String> {
     runtime::schedule_work(0);
     web.attach(Rc::new(CefWebView(page.clone())));
     Ok(page)
+}
+
+pub(super) struct PreparedPopup {
+    pub client: Client,
+    pub window_info: WindowInfo,
+    pub window: crate::WindowHandle,
+}
+
+pub(super) fn prepare_popup(
+    web: zgx::web_view::WeakWebView,
+    profile: String,
+    permissions: runtime::PermissionStoreHandle,
+    dialogs: crate::FileDialogs,
+    tasks: crate::TaskSpawner,
+    windows: crate::WindowFactory,
+    popup_id: i32,
+    settled: Rc<Cell<bool>>,
+    pending_popups: Rc<RefCell<HashMap<i32, client::PopupPending>>>,
+) -> Option<PreparedPopup> {
+    runtime::ensure_accepting_browsers().ok()?;
+    let frame = Arc::new(Mutex::default());
+    let popup = Arc::new(Mutex::default());
+    let size = Arc::new(Mutex::new((800, 640)));
+    let scale = Arc::new(Mutex::new(1.));
+    let browser = Rc::new(RefCell::new(None));
+    let gpu = zgx_gpu::viewport::view(Painter::new(
+        frame.clone(),
+        popup.clone(),
+        size.clone(),
+        scale.clone(),
+        browser.clone(),
+    ));
+    let page = Rc::new(Page {
+        web: web.clone(),
+        browser: browser.clone(),
+        pending: RefCell::new(Vec::new()),
+        evaluations: Rc::new(RefCell::new(HashMap::new())),
+        navigation_generation: Rc::new(Cell::new(0)),
+        site_data: Rc::new(RefCell::new(HashMap::new())),
+        pending_site_data: RefCell::new(Vec::new()),
+        find_replies: Rc::new(RefCell::new(std::collections::VecDeque::new())),
+        next_evaluation: Cell::new(0),
+        devtools_registration: RefCell::new(None),
+        lifecycle: Cell::new(BrowserLifecycle::Creating),
+        visible: Cell::new(0),
+        input_modifiers: Cell::new(Modifiers::default()),
+        mouse_buttons: Cell::new(0),
+        last_click: RefCell::new(None),
+        click_count: Cell::new(1),
+        gpu,
+        frame,
+        popup,
+        size,
+        scale,
+    });
+    let handle_slot = Rc::new(RefCell::new(None::<crate::WindowHandle>));
+    let created_page = Rc::downgrade(&page);
+    let closed_page = Rc::downgrade(&page);
+    let created_handle = handle_slot.clone();
+    let closed_handle = handle_slot.clone();
+    let created_pending = settled.clone();
+    let created_map = pending_popups.clone();
+    let callbacks = BrowserCallbacks {
+        find_replies: page.find_replies.clone(),
+        web: web.clone(),
+        new_windows: web.upgrade().is_some_and(|web| web.options().new_windows),
+        navigation_started: Rc::new({
+            let weak = Rc::downgrade(&page);
+            move || {
+                if let Some(page) = weak.upgrade() {
+                    page.navigation_generation
+                        .set(page.navigation_generation.get().wrapping_add(1));
+                }
+            }
+        }),
+        created: Rc::new(move |browser| {
+            if !created_pending.replace(true) {
+                runtime::browser_created(browser.identifier());
+            }
+            if runtime::register_browser(&browser).is_err() {
+                if let Some(host) = browser.host() {
+                    host.close_browser(1);
+                }
+                return;
+            }
+            let Some(page) = created_page.upgrade() else {
+                if let Some(host) = browser.host() {
+                    host.close_browser(1);
+                }
+                return;
+            };
+            *page.browser.borrow_mut() = Some(browser.clone());
+            created_map.borrow_mut().remove(&popup_id);
+            if page.lifecycle.get() != BrowserLifecycle::Creating {
+                page.lifecycle.set(BrowserLifecycle::Closing);
+                if let Some(host) = browser.host() {
+                    host.close_browser(1);
+                }
+                return;
+            }
+            page.lifecycle.set(BrowserLifecycle::Ready);
+            if let Some(host) = browser.host() {
+                let mut observer = CEFScriptObserver::new(
+                    page.evaluations.clone(),
+                    page.site_data.clone(),
+                    page.navigation_generation.clone(),
+                );
+                page.devtools_registration
+                    .replace(host.add_dev_tools_message_observer(Some(&mut observer)));
+                host.was_hidden((page.visible.get() == 0) as i32);
+                host.invalidate(PaintElementType::VIEW);
+            }
+            let _ = created_handle;
+        }),
+        before_close: Rc::new(move |identifier| {
+            runtime::browser_closed(identifier);
+            if let Some(page) = closed_page.upgrade() {
+                page.lifecycle.set(BrowserLifecycle::Closed);
+                fail_pending(&page, "CEF popup closed before the operation completed");
+                page.browser.borrow_mut().take();
+            }
+            if let Some(window) = closed_handle.borrow().as_ref() {
+                window.close();
+            }
+        }),
+    };
+    let invalidator = page.gpu.clone();
+    let client = client::client(
+        page.frame.clone(),
+        page.popup.clone(),
+        page.size.clone(),
+        page.scale.clone(),
+        Rc::new(move || invalidator.invalidate()),
+        callbacks,
+        web,
+        profile,
+        permissions,
+        dialogs,
+        tasks,
+        windows.clone(),
+    );
+    let content = view(page.clone());
+    let window = windows.open(
+        crate::WindowOptions {
+            title: "Sign in".into(),
+            width: 800.,
+            height: 640.,
+            min_size: Some((360., 280.)),
+            decorations: true,
+            ..Default::default()
+        },
+        move |cx| {
+            let closing_page = page.clone();
+            cx.on_closed(move || {
+                closing_page.lifecycle.set(BrowserLifecycle::Closing);
+                if let Some(browser) = closing_page.browser.borrow().as_ref()
+                    && let Some(host) = browser.host()
+                {
+                    host.close_browser(1);
+                }
+            });
+            cx.render(content);
+        },
+    );
+    *handle_slot.borrow_mut() = Some(window.clone());
+    Some(PreparedPopup {
+        client,
+        window_info: WindowInfo {
+            windowless_rendering_enabled: 1,
+            shared_texture_enabled: 0,
+            external_begin_frame_enabled: 0,
+            ..Default::default()
+        },
+        window,
+    })
 }
 
 pub(super) fn view(page: Rc<Page>) -> View {
@@ -678,8 +864,13 @@ pub(super) fn view(page: Rc<Page>) -> View {
     })
 }
 
-pub(super) fn page_view(web: &WebView) -> View {
-    match backend(web) {
+pub(super) fn page_view(
+    web: &WebView,
+    dialogs: crate::FileDialogs,
+    tasks: crate::TaskSpawner,
+    windows: crate::WindowFactory,
+) -> View {
+    match backend(web, dialogs, tasks, windows) {
         Ok(page) => view(page),
         Err(error) => {
             let message = format!("Chromium could not start: {error}");

@@ -1,4 +1,4 @@
-use std::{cell::RefCell, collections::HashMap, path::PathBuf, sync::Arc};
+use std::{cell::RefCell, collections::HashMap, path::PathBuf, rc::Rc, sync::Arc};
 
 use cef::{self, args::Args, *};
 use std::collections::HashSet;
@@ -32,8 +32,53 @@ thread_local! {
 
 struct Runtime {
     contexts: HashMap<String, RequestContext>,
+    permissions: HashMap<String, PermissionStoreHandle>,
     browsers: HashMap<i32, Browser>,
     shutting_down: bool,
+}
+
+pub(super) type PermissionStoreHandle = Rc<RefCell<SitePermissionStore>>;
+
+pub(super) struct SitePermissionStore {
+    decisions: HashMap<String, bool>,
+    path: Option<PathBuf>,
+}
+
+impl SitePermissionStore {
+    pub(super) fn decision(&self, origin: &str, permission: &str) -> Option<bool> {
+        self.decisions
+            .get(&permission_key(origin, permission))
+            .copied()
+    }
+
+    pub(super) fn remember(
+        &mut self,
+        origin: &str,
+        permission: &str,
+        allowed: bool,
+    ) -> Result<(), String> {
+        self.decisions
+            .insert(permission_key(origin, permission), allowed);
+        let Some(path) = &self.path else {
+            return Ok(());
+        };
+        let bytes = serde_json::to_vec(&self.decisions)
+            .map_err(|error| format!("cannot encode website permissions: {error}"))?;
+        let temporary = path.with_extension("json.tmp");
+        std::fs::write(&temporary, bytes)
+            .map_err(|error| format!("cannot write website permissions: {error}"))?;
+        #[cfg(target_os = "windows")]
+        if path.exists() {
+            std::fs::remove_file(path)
+                .map_err(|error| format!("cannot replace website permissions: {error}"))?;
+        }
+        std::fs::rename(&temporary, path)
+            .map_err(|error| format!("cannot save website permissions: {error}"))
+    }
+}
+
+fn permission_key(origin: &str, permission: &str) -> String {
+    format!("{origin}\n{permission}")
 }
 
 wrap_browser_process_handler! {
@@ -265,6 +310,7 @@ fn initialize_inner() -> Result<Runtime, String> {
     }
     Ok(Runtime {
         contexts: HashMap::new(),
+        permissions: HashMap::new(),
         browsers: HashMap::new(),
         shutting_down: false,
     })
@@ -355,6 +401,42 @@ pub(super) fn request_context(profile: &str, persistent: bool) -> Result<Request
             })?;
         runtime.contexts.insert(profile.to_owned(), context.clone());
         Ok(context)
+    })
+}
+
+pub(super) fn permission_store(
+    profile: &str,
+    persistent: bool,
+) -> Result<PermissionStoreHandle, String> {
+    initialize()?;
+    RUNTIME.with(|runtime| {
+        let mut runtime = runtime.borrow_mut();
+        let runtime = runtime.as_mut().expect("runtime initialized");
+        if let Some(store) = runtime.permissions.get(profile) {
+            return Ok(store.clone());
+        }
+        let path = if persistent {
+            let directory = data_root()?.join(profile_component(profile)?);
+            std::fs::create_dir_all(&directory)
+                .map_err(|error| format!("cannot create website permission store: {error}"))?;
+            Some(directory.join("site-permissions.json"))
+        } else {
+            None
+        };
+        let decisions = match path.as_ref().filter(|path| path.is_file()) {
+            Some(path) => {
+                let bytes = std::fs::read(path)
+                    .map_err(|error| format!("cannot read website permissions: {error}"))?;
+                serde_json::from_slice(&bytes)
+                    .map_err(|error| format!("invalid website permission store: {error}"))?
+            }
+            _ => HashMap::new(),
+        };
+        let store = Rc::new(RefCell::new(SitePermissionStore { decisions, path }));
+        runtime
+            .permissions
+            .insert(profile.to_owned(), store.clone());
+        Ok(store)
     })
 }
 
@@ -525,7 +607,7 @@ mod tests {
         browser_closed, browser_created, browser_creation_failed, browser_creation_started,
         has_browsers, mock_keychain_allowed, mock_keychain_requested,
     };
-    use std::{fs, path::Path, time::SystemTime};
+    use std::{collections::HashMap, fs, path::Path, time::SystemTime};
 
     #[test]
     fn every_automated_fixture_uses_the_mock_keychain() {
@@ -591,6 +673,51 @@ mod tests {
         ));
 
         fs::remove_dir_all(profile).unwrap();
+    }
+
+    #[test]
+    fn permission_decisions_are_origin_and_profile_scoped_and_persisted() {
+        let root = std::env::temp_dir().join(format!(
+            "zgx-cef-permission-test-{}-{:?}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("site-permissions.json");
+        let mut first = super::SitePermissionStore {
+            decisions: Default::default(),
+            path: Some(path.clone()),
+        };
+        assert_eq!(first.decision("https://meet.example", "camera"), None);
+        first
+            .remember("https://meet.example", "camera", true)
+            .unwrap();
+        assert_eq!(first.decision("https://meet.example", "camera"), Some(true));
+        assert_eq!(first.decision("https://meet.example", "microphone"), None);
+        assert_eq!(first.decision("https://other.example", "camera"), None);
+
+        let restored: HashMap<String, bool> =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let restored = super::SitePermissionStore {
+            decisions: restored,
+            path: Some(path.clone()),
+        };
+        assert_eq!(
+            restored.decision("https://meet.example", "camera"),
+            Some(true)
+        );
+        let other_profile = super::SitePermissionStore {
+            decisions: Default::default(),
+            path: None,
+        };
+        assert_eq!(
+            other_profile.decision("https://meet.example", "camera"),
+            None
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -911,7 +911,14 @@ impl WindowContext {
         }));
         // Pages as images of WebKitGTK's (`web_view` asks it first).
         #[cfg(feature = "cef")]
-        let view = zgx::compose::provide(crate::native_host::cef::page_views(), view);
+        let view = zgx::compose::provide(
+            crate::native_host::cef::page_views(
+                self.dialogs.clone(),
+                self.tasks.clone(),
+                self.windows.clone(),
+            ),
+            view,
+        );
         #[cfg(all(target_os = "linux", feature = "webkitgtk", not(feature = "cef")))]
         let view = zgx::compose::provide(
             crate::native_host::webkitgtk::page_views(self.windows.clipboard.clone(), {

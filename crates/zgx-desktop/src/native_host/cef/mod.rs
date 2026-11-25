@@ -6,8 +6,19 @@ mod runtime;
 
 use zgx::web_view::PageViews;
 
-pub(crate) fn page_views() -> PageViews {
-    PageViews::new(|web| Some(browser::page_view(web)))
+pub(crate) fn page_views(
+    dialogs: crate::FileDialogs,
+    tasks: crate::TaskSpawner,
+    windows: crate::WindowFactory,
+) -> PageViews {
+    PageViews::new(move |web| {
+        Some(browser::page_view(
+            web,
+            dialogs.clone(),
+            tasks.clone(),
+            windows.clone(),
+        ))
+    })
 }
 
 pub(crate) fn pump() {

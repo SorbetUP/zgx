@@ -1,5 +1,5 @@
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::{HashMap, VecDeque},
     rc::Rc,
     sync::{Arc, Mutex},
@@ -7,7 +7,11 @@ use std::{
 
 use cef::{self, *};
 
-use super::rendering::{SharedFrame, SharedPopup};
+use super::runtime::PermissionStoreHandle;
+use super::{
+    rendering::{SharedFrame, SharedPopup},
+    runtime,
+};
 
 pub(super) type FindReplies = Rc<RefCell<VecDeque<FindReply>>>;
 type FindReply = Box<dyn FnOnce(zgx::web_view::FindResult)>;
@@ -155,36 +159,75 @@ fn update_download_status(
 }
 
 wrap_life_span_handler! {
-    pub(super) struct CEFLifeSpanHandler { callbacks: BrowserCallbacks }
+    pub(super) struct CEFLifeSpanHandler {
+        callbacks: BrowserCallbacks,
+        profile: String,
+        store: PermissionStoreHandle,
+        dialogs: crate::FileDialogs,
+        tasks: crate::TaskSpawner,
+        windows: crate::WindowFactory,
+        pending_popups: Rc<RefCell<HashMap<i32, PopupPending>>>,
+    }
     impl LifeSpanHandler {
         fn on_before_popup(
             &self,
             _browser: Option<&mut Browser>,
             _frame: Option<&mut Frame>,
-            _popup_id: i32,
+            popup_id: i32,
             target_url: Option<&CefString>,
             _target_frame_name: Option<&CefString>,
             _target_disposition: WindowOpenDisposition,
             _user_gesture: i32,
             _popup_features: Option<&PopupFeatures>,
-            _window_info: Option<&mut WindowInfo>,
-            _client: Option<&mut Option<Client>>,
+            window_info: Option<&mut WindowInfo>,
+            client: Option<&mut Option<Client>>,
             _settings: Option<&mut BrowserSettings>,
             _extra_info: Option<&mut Option<DictionaryValue>>,
             _no_javascript_access: Option<&mut i32>,
         ) -> i32 {
-            if self.callbacks.new_windows {
-                let url = target_url.map(ToString::to_string).unwrap_or_default();
-                let web = self.callbacks.web.clone();
-                zgx::native_view::post(move || {
-                    if let Some(web) = web.upgrade() {
-                        web.emit(zgx::web_view::WebViewEvent::NewWindowRequested { url });
-                    }
-                });
+            let url = target_url.map(ToString::to_string).unwrap_or_default();
+            if !self.callbacks.new_windows {
+                return 1;
             }
-            // ZGX's existing contract surfaces the request to the app and
-            // deliberately does not create an unmanaged native window.
-            1
+            let event_url = url.clone();
+            let web = self.callbacks.web.clone();
+            zgx::native_view::post(move || {
+                if let Some(web) = web.upgrade() {
+                    web.emit(zgx::web_view::WebViewEvent::NewWindowRequested { url: event_url });
+                }
+            });
+            let (Some(window_info), Some(client)) = (window_info, client) else { return 1 };
+            let settled = Rc::new(Cell::new(false));
+            let Some(prepared) = super::browser::prepare_popup(
+                self.callbacks.web.clone(),
+                self.profile.clone(),
+                self.store.clone(),
+                self.dialogs.clone(),
+                self.tasks.clone(),
+                self.windows.clone(),
+                popup_id,
+                settled.clone(),
+                self.pending_popups.clone(),
+            ) else {
+                return 1;
+            };
+            runtime::browser_creation_started();
+            self.pending_popups.borrow_mut().insert(
+                popup_id,
+                PopupPending { settled, window: prepared.window },
+            );
+            *window_info = prepared.window_info;
+            *client = Some(prepared.client);
+            0
+        }
+
+        fn on_before_popup_aborted(&self, _browser: Option<&mut Browser>, popup_id: i32) {
+            if let Some(pending) = self.pending_popups.borrow_mut().remove(&popup_id) {
+                if !pending.settled.replace(true) {
+                    runtime::browser_creation_failed();
+                }
+                pending.window.close();
+            }
         }
 
         fn on_after_created(&self, browser: Option<&mut Browser>) {
@@ -442,19 +485,59 @@ wrap_find_handler! {
 }
 
 wrap_permission_handler! {
-    pub(super) struct CEFPermissionHandler {}
+    pub(super) struct CEFPermissionHandler {
+        profile: String,
+        store: PermissionStoreHandle,
+        dialogs: crate::FileDialogs,
+        tasks: crate::TaskSpawner,
+    }
     impl PermissionHandler {
         fn on_request_media_access_permission(
             &self,
             _browser: Option<&mut Browser>,
             _frame: Option<&mut Frame>,
-            _requesting_origin: Option<&CefString>,
-            _requested_permissions: u32,
+            requesting_origin: Option<&CefString>,
+            requested_permissions: u32,
             callback: Option<&mut MediaAccessCallback>,
         ) -> i32 {
-            if let Some(callback) = callback {
+            let Some(callback) = callback else { return 1 };
+            let callback = callback.clone();
+            let Some(origin) = requesting_origin
+                .map(ToString::to_string)
+                .and_then(|origin| permission_origin(&origin))
+            else {
                 callback.cancel();
+                return 1;
+            };
+            let audio = MediaAccessPermissionTypes::DEVICE_AUDIO_CAPTURE.get_raw();
+            let video = MediaAccessPermissionTypes::DEVICE_VIDEO_CAPTURE.get_raw();
+            let supported = audio | video;
+            if requested_permissions == 0 || requested_permissions & !supported != 0 {
+                callback.cancel();
+                return 1;
             }
+            let mut requests = Vec::new();
+            if requested_permissions & audio != 0 {
+                requests.push((audio, "microphone", "microphone"));
+            }
+            if requested_permissions & video != 0 {
+                requests.push((video, "camera", "camera"));
+            }
+            let profile = self.profile.clone();
+            let store = self.store.clone();
+            let dialogs = self.dialogs.clone();
+            self.tasks.spawn(async move {
+                let mut granted = 0;
+                for (flag, permission, label) in requests {
+                    if request_permission(&profile, &store, &dialogs, &origin, permission, label).await {
+                        granted |= flag;
+                    } else {
+                        callback.cancel();
+                        return;
+                    }
+                }
+                callback.cont(granted);
+            });
             1
         }
 
@@ -462,16 +545,88 @@ wrap_permission_handler! {
             &self,
             _browser: Option<&mut Browser>,
             _prompt_id: u64,
-            _requesting_origin: Option<&CefString>,
-            _requested_permissions: u32,
+            requesting_origin: Option<&CefString>,
+            requested_permissions: u32,
             callback: Option<&mut PermissionPromptCallback>,
         ) -> i32 {
-            if let Some(callback) = callback {
+            let Some(callback) = callback else { return 1 };
+            let callback = callback.clone();
+            let Some(origin) = requesting_origin
+                .map(ToString::to_string)
+                .and_then(|origin| permission_origin(&origin))
+            else {
                 callback.cont(PermissionRequestResult::DENY);
+                return 1;
+            };
+            let kinds = [
+                (PermissionRequestTypes::CAMERA_STREAM.get_raw(), "camera", "camera"),
+                (PermissionRequestTypes::MIC_STREAM.get_raw(), "microphone", "microphone"),
+                (PermissionRequestTypes::NOTIFICATIONS.get_raw(), "notifications", "notifications"),
+                (PermissionRequestTypes::GEOLOCATION.get_raw(), "location", "location"),
+            ];
+            let supported = kinds.iter().fold(0, |mask, (flag, _, _)| mask | flag);
+            if requested_permissions == 0 || requested_permissions & !supported != 0 {
+                callback.cont(PermissionRequestResult::DENY);
+                return 1;
             }
+            let requests: Vec<_> = kinds
+                .into_iter()
+                .filter(|(flag, _, _)| requested_permissions & flag != 0)
+                .collect();
+            let profile = self.profile.clone();
+            let store = self.store.clone();
+            let dialogs = self.dialogs.clone();
+            self.tasks.spawn(async move {
+                for (_, permission, label) in requests {
+                    if !request_permission(&profile, &store, &dialogs, &origin, permission, label).await {
+                        callback.cont(PermissionRequestResult::DENY);
+                        return;
+                    }
+                }
+                callback.cont(PermissionRequestResult::ACCEPT);
+            });
             1
         }
     }
+}
+
+async fn request_permission(
+    profile: &str,
+    store: &PermissionStoreHandle,
+    dialogs: &crate::FileDialogs,
+    origin: &str,
+    permission: &str,
+    label: &str,
+) -> bool {
+    if let Some(decision) = store.borrow().decision(origin, permission) {
+        return decision;
+    }
+    let prompt = crate::PromptOptions::new(
+        format!("Allow {label}?"),
+        format!("{origin} is requesting access to your {label} ({profile} profile)."),
+    )
+    .buttons(crate::PromptButtons::YesNo);
+    let result = dialogs.prompt(prompt).await;
+    match result {
+        Ok(crate::PromptResponse::Yes) => {
+            if let Err(error) = store.borrow_mut().remember(origin, permission, true) {
+                eprintln!("cannot save CEF site permission: {error}");
+            }
+            true
+        }
+        Ok(crate::PromptResponse::No) => {
+            if let Err(error) = store.borrow_mut().remember(origin, permission, false) {
+                eprintln!("cannot save CEF site permission: {error}");
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+fn permission_origin(origin: &str) -> Option<String> {
+    let origin = origin_from_url(origin)?;
+    (origin.starts_with("https://") || origin.starts_with("http://")).then_some(origin)
 }
 
 wrap_dialog_handler! {
@@ -590,6 +745,11 @@ pub(super) fn client(
     invalidate: Rc<dyn Fn()>,
     callbacks: BrowserCallbacks,
     web: zgx::web_view::WeakWebView,
+    profile: String,
+    store: PermissionStoreHandle,
+    dialogs: crate::FileDialogs,
+    tasks: crate::TaskSpawner,
+    windows: crate::WindowFactory,
 ) -> Client {
     let state = RenderState {
         frame,
@@ -601,12 +761,20 @@ pub(super) fn client(
     let render = CEFRenderHandler::new(state);
     let find_replies = callbacks.find_replies.clone();
     let navigation_started = callbacks.navigation_started.clone();
-    let life = CEFLifeSpanHandler::new(callbacks);
+    let life = CEFLifeSpanHandler::new(
+        callbacks,
+        profile.clone(),
+        store.clone(),
+        dialogs.clone(),
+        tasks.clone(),
+        windows,
+        Rc::new(RefCell::new(HashMap::new())),
+    );
     let load = CEFLoadHandler::new(web.clone(), navigation_started);
     let display = CEFDisplayHandler::new(web.clone());
     let download = CEFDownloadHandler::new(web.clone(), Rc::new(RefCell::new(HashMap::new())));
     let find = CEFFindHandler::new(find_replies);
-    let permission = CEFPermissionHandler::new();
+    let permission = CEFPermissionHandler::new(profile, store, dialogs, tasks);
     let dialog = CEFDialogHandler::new(web.clone());
     CEFClient::new(
         render,
@@ -621,6 +789,11 @@ pub(super) fn client(
         },
         web,
     )
+}
+
+pub(super) struct PopupPending {
+    pub(super) settled: Rc<Cell<bool>>,
+    pub(super) window: crate::WindowHandle,
 }
 
 pub(super) fn origin_from_url(url: &str) -> Option<String> {
@@ -764,6 +937,21 @@ mod tests {
             Some("null".into())
         );
         assert_eq!(super::origin_from_url("https:///missing-host"), None);
+    }
+
+    #[test]
+    fn permissions_only_accept_real_http_origins() {
+        assert_eq!(
+            super::permission_origin("https://Meet.Example:443/room?id=1"),
+            Some("https://meet.example".into())
+        );
+        assert_eq!(
+            super::permission_origin("http://127.0.0.1:8123/"),
+            Some("http://127.0.0.1:8123".into())
+        );
+        assert_eq!(super::permission_origin("data:text/html,hello"), None);
+        assert_eq!(super::permission_origin("file:///tmp/page.html"), None);
+        assert_eq!(super::permission_origin("javascript:alert(1)"), None);
     }
 
     #[test]
