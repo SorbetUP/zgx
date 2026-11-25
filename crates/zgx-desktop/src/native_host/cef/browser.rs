@@ -1,6 +1,6 @@
 use std::{
     cell::{Cell, RefCell},
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     rc::Rc,
     sync::{Arc, Mutex},
     time::Instant,
@@ -9,7 +9,7 @@ use std::{
 use cef::*;
 use zgx::{
     compose::{View, component, div, gpu_view, text},
-    input::{InputEvent, Key, Modifiers, PointerButton},
+    input::{DragPhase, DraggedText, InputEvent, Key, Modifiers, PointerButton},
     style::Styled,
     web_view::{FindOptions, FindResult, WebProfile, WebView, WebViewBackend, WebViewCommand},
 };
@@ -46,6 +46,8 @@ pub(super) struct Page {
     visible: Cell<u32>,
     input_modifiers: Cell<Modifiers>,
     mouse_buttons: Cell<u32>,
+    drag_target_data: RefCell<Option<DragData>>,
+    drag_target_files: RefCell<HashSet<std::path::PathBuf>>,
     last_click: RefCell<Option<LastClick>>,
     click_count: Cell<u32>,
     gpu: zgx::gpu_view::GpuView,
@@ -537,6 +539,8 @@ pub(super) fn backend(
         visible: Cell::new(0),
         input_modifiers: Cell::new(Modifiers::default()),
         mouse_buttons: Cell::new(0),
+        drag_target_data: RefCell::new(None),
+        drag_target_files: RefCell::new(HashSet::new()),
         last_click: RefCell::new(None),
         click_count: Cell::new(1),
         gpu,
@@ -716,6 +720,8 @@ pub(super) fn prepare_popup(
         visible: Cell::new(0),
         input_modifiers: Cell::new(Modifiers::default()),
         mouse_buttons: Cell::new(0),
+        drag_target_data: RefCell::new(None),
+        drag_target_files: RefCell::new(HashSet::new()),
         last_click: RefCell::new(None),
         click_count: Cell::new(1),
         gpu,
@@ -861,7 +867,7 @@ pub(super) fn view(page: Rc<Page>) -> View {
         div()
             .focusable(true)
             .overflow_hidden()
-            .on_event(move |event| input(&event_page, &event.event))
+            .on_event(move |event| input(&event_page, event))
             .accessible_label("Web page")
             .on_mount(move |handle| {
                 if mount_page.visible.replace(mount_page.visible.get() + 1) == 0
@@ -917,16 +923,124 @@ impl Drop for Visible {
     }
 }
 
-fn input(page: &Page, event: &InputEvent) {
+fn input(page: &Page, event: &mut zgx::input::EventContext) {
+    let input_event = &event.event;
     let Some(browser) = page.browser.borrow().as_ref().cloned() else {
         return;
     };
     let Some(host) = browser.host() else {
         return;
     };
-    match event.clone() {
+    match input_event.clone() {
+        InputEvent::Drag(drag) => match drag.phase {
+            DragPhase::Over => {
+                let Some(text) = drag.payload.downcast_ref::<DraggedText>() else {
+                    return;
+                };
+                if page.drag_target_data.borrow().is_none() {
+                    let Some(mut data) = drag_data_for_text(text) else {
+                        return;
+                    };
+                    host.drag_target_drag_enter(
+                        Some(&mut data),
+                        Some(&mouse_event(page, drag.x, drag.y)),
+                        DragOperationsMask::from(
+                            cef::sys::cef_drag_operations_mask_t::DRAG_OPERATION_COPY,
+                        ),
+                    );
+                    page.drag_target_data.replace(Some(data));
+                    page.drag_target_files.borrow_mut().clear();
+                } else {
+                    host.drag_target_drag_over(
+                        Some(&mouse_event(page, drag.x, drag.y)),
+                        DragOperationsMask::from(
+                            cef::sys::cef_drag_operations_mask_t::DRAG_OPERATION_COPY,
+                        ),
+                    );
+                }
+                event.accept_drag();
+            }
+            DragPhase::Drop => {
+                if page.drag_target_data.borrow().is_some() {
+                    host.drag_target_drop(Some(&mouse_event(page, drag.x, drag.y)));
+                    page.drag_target_data.borrow_mut().take();
+                    event.prevent_default();
+                    event.stop_propagation();
+                }
+            }
+            DragPhase::Leave | DragPhase::End => {
+                if page.drag_target_data.borrow_mut().take().is_some() {
+                    host.drag_target_drag_leave();
+                }
+                page.drag_target_files.borrow_mut().clear();
+            }
+            _ => {}
+        },
+        InputEvent::FileHover { x, y, path } => {
+            if page.drag_target_data.borrow().is_none() {
+                let Some(mut data) = drag_data_create() else {
+                    return;
+                };
+                if !add_file_to_drag_data(&data, &path) {
+                    return;
+                }
+                host.drag_target_drag_enter(
+                    Some(&mut data),
+                    Some(&mouse_event(page, x, y)),
+                    DragOperationsMask::from(
+                        cef::sys::cef_drag_operations_mask_t::DRAG_OPERATION_COPY,
+                    ),
+                );
+                page.drag_target_data.replace(Some(data));
+                page.drag_target_files.borrow_mut().insert(path);
+            } else {
+                if page.drag_target_files.borrow_mut().insert(path.clone())
+                    && let Some(data) = page.drag_target_data.borrow().as_ref()
+                {
+                    let _ = add_file_to_drag_data(data, &path);
+                }
+                host.drag_target_drag_over(
+                    Some(&mouse_event(page, x, y)),
+                    DragOperationsMask::from(
+                        cef::sys::cef_drag_operations_mask_t::DRAG_OPERATION_COPY,
+                    ),
+                );
+            }
+            event.accept_drag();
+        }
+        InputEvent::FileHoverCancelled => {
+            if page.drag_target_data.borrow_mut().take().is_some() {
+                host.drag_target_drag_leave();
+            }
+            page.drag_target_files.borrow_mut().clear();
+        }
+        InputEvent::FileDrop { x, y, path } => {
+            if page.drag_target_data.borrow().is_none()
+                && let Some(mut data) = drag_data_create()
+            {
+                if !add_file_to_drag_data(&data, &path) {
+                    return;
+                }
+                host.drag_target_drag_enter(
+                    Some(&mut data),
+                    Some(&mouse_event(page, x, y)),
+                    DragOperationsMask::from(
+                        cef::sys::cef_drag_operations_mask_t::DRAG_OPERATION_COPY,
+                    ),
+                );
+                page.drag_target_data.replace(Some(data));
+                page.drag_target_files.borrow_mut().insert(path);
+            }
+            if page.drag_target_data.borrow().is_some() {
+                host.drag_target_drop(Some(&mouse_event(page, x, y)));
+                page.drag_target_data.borrow_mut().take();
+                page.drag_target_files.borrow_mut().clear();
+                event.prevent_default();
+                event.stop_propagation();
+            }
+        }
         InputEvent::PointerDown { x, y, button } | InputEvent::PointerUp { x, y, button } => {
-            let mouse_up = matches!(event, InputEvent::PointerUp { .. });
+            let mouse_up = matches!(input_event, InputEvent::PointerUp { .. });
             let (button_type, button_id, cef_flag) = match button {
                 PointerButton::Primary => (
                     MouseButtonType::LEFT,
@@ -1036,6 +1150,30 @@ fn input(page: &Page, event: &InputEvent) {
         }
         _ => {}
     }
+}
+
+fn drag_data_for_text(text: &DraggedText) -> Option<DragData> {
+    let data = drag_data_create()?;
+    let fragment_text: CefString = text.text().into();
+    data.set_fragment_text(Some(&fragment_text));
+    if let Some(html) = text.html() {
+        let fragment_html: CefString = html.into();
+        data.set_fragment_html(Some(&fragment_html));
+    }
+    Some(data)
+}
+
+fn add_file_to_drag_data(data: &DragData, path: &std::path::Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    let path_string: CefString = path.to_string_lossy().as_ref().into();
+    let Some(file_name) = path.file_name() else {
+        return false;
+    };
+    let display_name: CefString = file_name.to_string_lossy().as_ref().into();
+    data.add_file(Some(&path_string), Some(&display_name));
+    true
 }
 
 fn send_text(host: &BrowserHost, text: &str) {
