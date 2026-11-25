@@ -3966,9 +3966,15 @@ impl Host {
             repeat: false,
         };
         match item {
-            StandardItem::Copy => self.clipboard_command("c"),
-            StandardItem::Cut => self.clipboard_command("x"),
-            StandardItem::Paste => self.clipboard_command("v"),
+            StandardItem::Copy => {
+                self.clipboard_command("c") || self.dispatch_webview_edit_shortcut("c")
+            }
+            StandardItem::Cut => {
+                self.clipboard_command("x") || self.dispatch_webview_edit_shortcut("x")
+            }
+            StandardItem::Paste => {
+                self.clipboard_command("v") || self.dispatch_webview_edit_shortcut("v")
+            }
             // The focused editor's text, else a selectable region's, as ⌘A.
             StandardItem::SelectAll => self.context.ui.select_all(),
             StandardItem::Undo | StandardItem::Redo => {
@@ -3987,6 +3993,27 @@ impl Host {
                 true
             }
         }
+    }
+    /// A native menu item's edit command must reach a focused web view too.
+    /// Web views are not ZGX text editors, so `clipboard_command` has no
+    /// editor to operate on; dispatch the platform's normal shortcut through
+    /// the focused scene node instead.
+    fn dispatch_webview_edit_shortcut(&mut self, key: &str) -> bool {
+        let modifiers = zgx::input::Modifiers {
+            control: !cfg!(target_os = "macos"),
+            meta: cfg!(target_os = "macos"),
+            ..Default::default()
+        };
+        let key = Key::Character(key.to_owned());
+        let down = InputEvent::KeyDown {
+            key: key.clone(),
+            modifiers,
+            repeat: false,
+        };
+        let up = InputEvent::KeyUp { key, modifiers };
+        let down_result = self.dispatch_prevented(down).unwrap_or(false);
+        let up_result = self.dispatch_prevented(up).unwrap_or(false);
+        down_result || up_result
     }
     fn clipboard_key(&mut self, key: &Key) -> bool {
         #[cfg(windows)]
