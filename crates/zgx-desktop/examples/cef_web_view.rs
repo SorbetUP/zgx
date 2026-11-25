@@ -253,13 +253,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let close_race_result_path =
         std::env::var_os("ZGX_CEF_CLOSE_RACE_RESULT").map(std::path::PathBuf::from);
     let close_race_test = close_race_result_path.is_some();
+    let navigation_eval_race_result_path =
+        std::env::var_os("ZGX_CEF_NAV_EVAL_RACE_RESULT").map(std::path::PathBuf::from);
+    let navigation_eval_race_test = navigation_eval_race_result_path.is_some();
     let automated = download_test
         || input_test
         || event_test
         || eval_test
         || site_data_test
         || late_load_test
-        || close_race_test;
+        || close_race_test
+        || navigation_eval_race_test;
     if let Some(result_path) = download_result_path.as_ref() {
         fs::write(result_path, format!("START:auto={automated}\n"))?;
     }
@@ -276,6 +280,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         fs::write(result_path, "START\n")?;
     }
     if let Some(result_path) = close_race_result_path.as_ref() {
+        fs::write(result_path, "START\n")?;
+    }
+    if let Some(result_path) = navigation_eval_race_result_path.as_ref() {
         fs::write(result_path, "START\n")?;
     }
     let origin = start_fixture_server(download_test, site_data_test || late_load_test)?;
@@ -452,7 +459,57 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 subscription
             });
             let eval_done = Arc::new(AtomicBool::new(false));
-            if late_load_test {
+            if navigation_eval_race_test {
+                let page = web.clone();
+                let navigation = web.clone();
+                let result_path = navigation_eval_race_result_path
+                    .clone()
+                    .expect("navigation-evaluation race result path exists");
+                let window = cx.window.clone();
+                let done = Arc::new(AtomicBool::new(false));
+                let callback_done = done.clone();
+                web.load_html(EVENT_FIXTURE, None);
+                cx.tasks.spawn(async move {
+                    for _ in 0..100 {
+                        if page.title() == "CEF event initial"
+                            && !page.state().with_untracked(|state| state.loading)
+                        {
+                            break;
+                        }
+                        zgx::timer::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                    if page.title() != "CEF event initial" {
+                        let _ = fs::write(&result_path, "FAIL:initial-navigation");
+                        window.close();
+                        return;
+                    }
+                    let result_path_callback = result_path.clone();
+                    let callback_window = window.clone();
+                    page.evaluate_js(
+                        "new Promise(resolve => setTimeout(() => resolve('late'), 500))",
+                        move |result| {
+                            let passed = result.as_ref().err().is_some_and(|error| {
+                                error.contains("superseded by a navigation")
+                            });
+                            let status = if passed {
+                                "PASS"
+                            } else {
+                                "FAIL:stale-evaluation-result"
+                            };
+                            let _ = fs::write(result_path_callback, status);
+                            callback_done.store(true, Ordering::Release);
+                            callback_window.close();
+                        },
+                    );
+                    zgx::timer::sleep(std::time::Duration::from_millis(25)).await;
+                    navigation.load_html(EVENT_CHANGED_FIXTURE, None);
+                    zgx::timer::sleep(std::time::Duration::from_secs(6)).await;
+                    if !done.swap(true, Ordering::AcqRel) {
+                        let _ = fs::write(result_path, "TIMEOUT:evaluation-callback");
+                        window.close();
+                    }
+                });
+            } else if late_load_test {
                 let pages = [
                     web.clone(),
                     late_shared.clone().expect("late shared page exists"),
@@ -779,7 +836,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         download_window.close();
                     }
                 });
-            } else if !close_race_test {
+            } else if !close_race_test && !navigation_eval_race_test {
                 let fixture = FIXTURE.to_owned();
                 web.load_html(&fixture, Some(&origin));
             }

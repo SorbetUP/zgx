@@ -25,6 +25,10 @@ set `ZGX_CEF_CLOSE_RACE_RESULT` to a result-file path before launching the
 fixture. The fixture closes the page at mount and writes `PASS` only after the
 desktop event loop finishes its normal CEF shutdown.
 
+Set `ZGX_CEF_NAV_EVAL_RACE_RESULT` to test that an evaluation's pending
+JavaScript promise is rejected when its document navigates away before the
+promise resolves. The expected result is `PASS` in the selected file.
+
 Production CEF retains Chromium's normal macOS Safe Storage behavior for
 persistent browser data. macOS may ask once whether the signed app may access
 Chromium's encryption key; this is required for encrypted persistent storage.
