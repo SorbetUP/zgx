@@ -127,6 +127,48 @@ wrap_download_handler! {
     }
 }
 
+wrap_audio_handler! {
+    pub(super) struct CEFAudioHandler {
+        web: zgx::web_view::WeakWebView,
+    }
+    impl AudioHandler {
+        fn on_audio_stream_started(
+            &self,
+            _browser: Option<&mut Browser>,
+            _params: Option<&AudioParameters>,
+            _channels: i32,
+        ) {
+            emit_native_audio_activity(&self.web, true);
+        }
+
+        fn on_audio_stream_stopped(&self, _browser: Option<&mut Browser>) {
+            emit_native_audio_activity(&self.web, false);
+        }
+
+        fn on_audio_stream_error(&self, _browser: Option<&mut Browser>, _message: Option<&CefString>) {
+            emit_native_audio_activity(&self.web, false);
+        }
+    }
+}
+
+fn emit_native_audio_activity(web: &zgx::web_view::WeakWebView, active: bool) {
+    let web = web.clone();
+    zgx::native_view::post(move || {
+        if let Some(web) = web.upgrade() {
+            web.emit(zgx::web_view::WebViewEvent::Message {
+                body: serde_json::json!({
+                    "polyscale": "native-activity",
+                    "reason": "native-audio",
+                    "active": active,
+                })
+                .to_string(),
+                origin: "native://cef".into(),
+                main_frame: true,
+            });
+        }
+    });
+}
+
 enum DownloadUpdate {
     Progress { received: u64, total: Option<u64> },
     Finished,
@@ -696,13 +738,14 @@ struct CEFPolicyHandlers {
 }
 
 wrap_client! {
-pub(super) struct CEFClient { render: RenderHandler, life: LifeSpanHandler, load: LoadHandler, download: DownloadHandler, display: DisplayHandler, policy: CEFPolicyHandlers, web: zgx::web_view::WeakWebView }
+pub(super) struct CEFClient { render: RenderHandler, life: LifeSpanHandler, load: LoadHandler, download: DownloadHandler, display: DisplayHandler, audio: AudioHandler, policy: CEFPolicyHandlers, web: zgx::web_view::WeakWebView }
     impl Client {
         fn render_handler(&self) -> Option<RenderHandler> { Some(self.render.clone()) }
         fn life_span_handler(&self) -> Option<LifeSpanHandler> { Some(self.life.clone()) }
         fn load_handler(&self) -> Option<LoadHandler> { Some(self.load.clone()) }
         fn download_handler(&self) -> Option<DownloadHandler> { Some(self.download.clone()) }
         fn display_handler(&self) -> Option<DisplayHandler> { Some(self.display.clone()) }
+        fn audio_handler(&self) -> Option<AudioHandler> { Some(self.audio.clone()) }
         fn find_handler(&self) -> Option<FindHandler> { Some(self.policy.find.clone()) }
         fn permission_handler(&self) -> Option<PermissionHandler> { Some(self.policy.permission.clone()) }
         fn dialog_handler(&self) -> Option<DialogHandler> { Some(self.policy.dialog.clone()) }
@@ -778,6 +821,7 @@ pub(super) fn client(
     let load = CEFLoadHandler::new(web.clone(), navigation_started);
     let display = CEFDisplayHandler::new(web.clone());
     let download = CEFDownloadHandler::new(web.clone(), Rc::new(RefCell::new(HashMap::new())));
+    let audio = CEFAudioHandler::new(web.clone());
     let find = CEFFindHandler::new(find_replies);
     let permission = CEFPermissionHandler::new(profile, store, dialogs, tasks);
     let dialog = CEFDialogHandler::new(web.clone());
@@ -787,6 +831,7 @@ pub(super) fn client(
         load,
         download,
         display,
+        audio,
         CEFPolicyHandlers {
             find,
             permission,
