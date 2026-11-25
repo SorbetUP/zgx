@@ -1015,9 +1015,10 @@ fn input(page: &Page, event: &mut zgx::input::EventContext) {
             page.drag_target_files.borrow_mut().clear();
         }
         InputEvent::FileDrop { x, y, path } => {
-            if page.drag_target_data.borrow().is_none()
-                && let Some(mut data) = drag_data_create()
-            {
+            if page.drag_target_data.borrow().is_none() {
+                let Some(mut data) = drag_data_create() else {
+                    return;
+                };
                 if !add_file_to_drag_data(&data, &path) {
                     return;
                 }
@@ -1030,6 +1031,55 @@ fn input(page: &Page, event: &mut zgx::input::EventContext) {
                 );
                 page.drag_target_data.replace(Some(data));
                 page.drag_target_files.borrow_mut().insert(path);
+            } else {
+                let mut files = page.drag_target_files.borrow_mut();
+                if !files.contains(&path)
+                    && let Some(data) = page.drag_target_data.borrow().as_ref()
+                    && add_file_to_drag_data(data, &path)
+                {
+                    files.insert(path);
+                }
+                host.drag_target_drag_over(
+                    Some(&mouse_event(page, x, y)),
+                    DragOperationsMask::from(
+                        cef::sys::cef_drag_operations_mask_t::DRAG_OPERATION_COPY,
+                    ),
+                );
+            }
+            if page.drag_target_data.borrow().is_some() {
+                event.prevent_default();
+            }
+        }
+        InputEvent::FilesDrop { x, y, paths } => {
+            if page.drag_target_data.borrow().is_none() {
+                let Some(mut data) = drag_data_create() else {
+                    return;
+                };
+                let mut inserted = HashSet::new();
+                for path in paths.iter() {
+                    if !inserted.contains(path) && add_file_to_drag_data(&data, path) {
+                        inserted.insert(path.clone());
+                    }
+                }
+                if inserted.is_empty() {
+                    return;
+                }
+                host.drag_target_drag_enter(
+                    Some(&mut data),
+                    Some(&mouse_event(page, x, y)),
+                    DragOperationsMask::from(
+                        cef::sys::cef_drag_operations_mask_t::DRAG_OPERATION_COPY,
+                    ),
+                );
+                page.drag_target_data.replace(Some(data));
+                page.drag_target_files.replace(inserted);
+            } else if let Some(data) = page.drag_target_data.borrow().as_ref() {
+                let mut files = page.drag_target_files.borrow_mut();
+                for path in paths.iter() {
+                    if !files.contains(path) && add_file_to_drag_data(data, path) {
+                        files.insert(path.clone());
+                    }
+                }
             }
             if page.drag_target_data.borrow().is_some() {
                 host.drag_target_drop(Some(&mouse_event(page, x, y)));
@@ -1038,6 +1088,12 @@ fn input(page: &Page, event: &mut zgx::input::EventContext) {
                 event.prevent_default();
                 event.stop_propagation();
             }
+        }
+        InputEvent::FilesDropRejected { .. } => {
+            if page.drag_target_data.borrow_mut().take().is_some() {
+                host.drag_target_drag_leave();
+            }
+            page.drag_target_files.borrow_mut().clear();
         }
         InputEvent::PointerDown { x, y, button } | InputEvent::PointerUp { x, y, button } => {
             let mouse_up = matches!(input_event, InputEvent::PointerUp { .. });
