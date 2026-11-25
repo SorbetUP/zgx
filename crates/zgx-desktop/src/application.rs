@@ -3981,16 +3981,24 @@ impl Host {
         };
         match item {
             StandardItem::Copy => {
-                self.clipboard_command("c") || self.dispatch_webview_edit_shortcut("c")
+                self.clipboard_command("c")
+                    || self.dispatch_webview_edit_shortcut(standard_webview_edit_key(item).unwrap())
             }
             StandardItem::Cut => {
-                self.clipboard_command("x") || self.dispatch_webview_edit_shortcut("x")
+                self.clipboard_command("x")
+                    || self.dispatch_webview_edit_shortcut(standard_webview_edit_key(item).unwrap())
             }
             StandardItem::Paste => {
-                self.clipboard_command("v") || self.dispatch_webview_edit_shortcut("v")
+                self.clipboard_command("v")
+                    || self.dispatch_webview_edit_shortcut(standard_webview_edit_key(item).unwrap())
             }
             // The focused editor's text, else a selectable region's, as ⌘A.
-            StandardItem::SelectAll => self.context.ui.select_all(),
+            // A WebView is not a ZGX editor; route the same platform shortcut
+            // to its focused scene node when ZGX has no editor to select.
+            StandardItem::SelectAll => {
+                self.context.ui.select_all()
+                    || self.dispatch_webview_edit_shortcut(standard_webview_edit_key(item).unwrap())
+            }
             StandardItem::Undo | StandardItem::Redo => {
                 self.context.ui.focused_editor().is_some()
                     && self
@@ -10016,9 +10024,36 @@ fn copy_or_cut_editor(
 ) -> bool {
     ui.copy_from(editor, cut, write)
 }
+
+fn standard_webview_edit_key(item: crate::app_menu::StandardItem) -> Option<&'static str> {
+    use crate::app_menu::StandardItem;
+    match item {
+        StandardItem::Copy => Some("c"),
+        StandardItem::Cut => Some("x"),
+        StandardItem::Paste => Some("v"),
+        StandardItem::SelectAll => Some("a"),
+        StandardItem::Undo | StandardItem::Redo | StandardItem::ToggleFullScreen => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use zgx::scene::Rect;
+
+    #[test]
+    fn standard_webview_edit_shortcuts_include_select_all() {
+        use super::standard_webview_edit_key;
+        use crate::app_menu::StandardItem;
+
+        assert_eq!(standard_webview_edit_key(StandardItem::Copy), Some("c"));
+        assert_eq!(standard_webview_edit_key(StandardItem::Cut), Some("x"));
+        assert_eq!(standard_webview_edit_key(StandardItem::Paste), Some("v"));
+        assert_eq!(
+            standard_webview_edit_key(StandardItem::SelectAll),
+            Some("a")
+        );
+        assert_eq!(standard_webview_edit_key(StandardItem::Undo), None);
+    }
 
     #[cfg(feature = "cef")]
     #[test]
