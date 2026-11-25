@@ -9,9 +9,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .parent()
         .ok_or("bundle executable has no directory")?
         .to_path_buf();
+    // A fixed bundle identifier makes AppKit offer to restore old windows
+    // after a previous fixture crash. That modal recovery prompt blocks the
+    // offscreen event loop before the fixture can run. Keep each packaged test
+    // app isolated from that persisted state; CEF data persistence is still
+    // controlled separately through POLYSCALE_CEF_DATA_DIR.
+    let bundle_id = std::env::var("ZGX_CEF_FIXTURE_BUNDLE_ID").unwrap_or_else(|_| {
+        let run_id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or_default();
+        format!("dev.zgx.cef-fixture.run-{run_id}")
+    });
     let info = BundleInfo::new(
         "cef_web_view",
-        "dev.zgx.cef-fixture",
+        &bundle_id,
         "CEF OSR fixture",
         "English",
         semver::Version::new(0, 1, 0),
