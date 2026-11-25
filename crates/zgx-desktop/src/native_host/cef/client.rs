@@ -1,6 +1,7 @@
 use std::{
     cell::{Cell, RefCell},
     collections::{HashMap, VecDeque},
+    io::Write,
     rc::Rc,
     sync::{Arc, Mutex},
 };
@@ -12,6 +13,16 @@ use super::{
     rendering::{SharedFrame, SharedPopup},
     runtime,
 };
+
+pub(super) fn trace_popup_fixture(message: &str) {
+    if let Some(path) = std::env::var_os("ZGX_CEF_POPUP_RESULT").map(std::path::PathBuf::from) {
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path.with_extension("diagnostic"))
+            .and_then(|mut file| writeln!(file, "{message}"));
+    }
+}
 
 pub(super) type HtmlDocuments = Arc<Mutex<HashMap<String, Arc<Vec<u8>>>>>;
 type HtmlHandlerKeepAlive = Arc<Mutex<HashMap<u64, ResourceRequestHandler>>>;
@@ -287,6 +298,7 @@ wrap_life_span_handler! {
             _no_javascript_access: Option<&mut i32>,
         ) -> i32 {
             let url = target_url.map(ToString::to_string).unwrap_or_default();
+            trace_popup_fixture(&format!("CEF_BEFORE_POPUP:{popup_id}:{url}"));
             if !self.callbacks.new_windows {
                 return 1;
             }
@@ -307,6 +319,7 @@ wrap_life_span_handler! {
                 self.tasks.clone(),
                 self.windows.clone(),
                 popup_id,
+                url.clone(),
                 settled.clone(),
                 self.pending_popups.clone(),
             ) else {

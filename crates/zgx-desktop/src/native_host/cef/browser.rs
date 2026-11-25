@@ -735,6 +735,7 @@ pub(super) fn prepare_popup(
     tasks: crate::TaskSpawner,
     windows: crate::WindowFactory,
     popup_id: i32,
+    popup_url: String,
     settled: Rc<Cell<bool>>,
     pending_popups: Rc<RefCell<HashMap<i32, client::PopupPending>>>,
 ) -> Option<PreparedPopup> {
@@ -792,6 +793,7 @@ pub(super) fn prepare_popup(
     let closed_handle = handle_slot.clone();
     let created_pending = settled.clone();
     let created_map = pending_popups.clone();
+    let diagnostic_url = popup_url;
     let callbacks = BrowserCallbacks {
         find_replies: page.find_replies.clone(),
         web: web.clone(),
@@ -806,6 +808,14 @@ pub(super) fn prepare_popup(
             }
         }),
         created: Rc::new(move |browser| {
+            let current_url = browser
+                .main_frame()
+                .map(|frame| CefString::from(&frame.url()).to_string())
+                .unwrap_or_default();
+            client::trace_popup_fixture(&format!(
+                "CEF_POPUP_CREATED:{}:target={diagnostic_url}:current={current_url}",
+                browser.identifier()
+            ));
             if !created_pending.replace(true) {
                 runtime::browser_created(browser.identifier());
             }
@@ -849,6 +859,7 @@ pub(super) fn prepare_popup(
             }
         }),
         before_close: Rc::new(move |identifier| {
+            client::trace_popup_fixture(&format!("CEF_POPUP_CLOSED:{identifier}"));
             client::emit_native_activity(&popup_closed, format!("popup:{identifier}"), false);
             runtime::browser_closed(identifier);
             if let Some(page) = closed_page.upgrade() {

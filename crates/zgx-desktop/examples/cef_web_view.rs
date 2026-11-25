@@ -164,11 +164,15 @@ fn start_fixture_server(
     let result_path = std::env::var_os("ZGX_CEF_DOWNLOAD_RESULT").map(std::path::PathBuf::from);
     let site_data_result_path =
         std::env::var_os("ZGX_CEF_SITE_DATA_RESULT").map(std::path::PathBuf::from);
+    let popup_diagnostic_path = std::env::var_os("ZGX_CEF_POPUP_RESULT")
+        .map(std::path::PathBuf::from)
+        .map(|path| path.with_extension("diagnostic"));
     let html_base_log_path = html_base_result_path;
     thread::spawn(move || {
         for stream in listener.incoming().flatten() {
             let result_path = result_path.clone();
             let site_data_result_path = site_data_result_path.clone();
+            let popup_diagnostic_path = popup_diagnostic_path.clone();
             let html_base_log_path = html_base_log_path.clone();
             thread::spawn(move || {
                 let mut stream = stream;
@@ -176,6 +180,13 @@ fn start_fixture_server(
                 let count = stream.read(&mut request).unwrap_or(0);
                 let request = String::from_utf8_lossy(&request[..count]);
                 let path = request.split_whitespace().nth(1).unwrap_or("/");
+                if let Some(path_out) = popup_diagnostic_path.as_ref() {
+                    let _ = fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(path_out)
+                        .and_then(|mut result| writeln!(result, "POPUP_HTTP:{path}"));
+                }
                 if let Some(result_path) = html_base_log_path.as_ref()
                     && let Ok(mut result) = fs::OpenOptions::new()
                         .create(true)
