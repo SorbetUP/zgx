@@ -11,7 +11,7 @@ use std::{
 };
 use zgx::{
     compose::prelude::*,
-    input::{InputEvent, PointerButton},
+    input::{InputEvent, Key, Modifiers, PointerButton},
     web_view::{FindOptions, WebProfile, WebView, WebViewOptions},
 };
 use zgx_desktop::{Application, WindowBounds, WindowOptions};
@@ -238,6 +238,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let download_result_path =
         std::env::var_os("ZGX_CEF_DOWNLOAD_RESULT").map(std::path::PathBuf::from);
     let download_test = download_result_path.is_some();
+    let input_result_path = std::env::var_os("ZGX_CEF_INPUT_RESULT").map(std::path::PathBuf::from);
+    let input_test = input_result_path.is_some();
     let event_result_path = std::env::var_os("ZGX_CEF_EVENT_RESULT").map(std::path::PathBuf::from);
     let event_test = event_result_path.is_some();
     let eval_result_path = std::env::var_os("ZGX_CEF_EVAL_RESULT").map(std::path::PathBuf::from);
@@ -248,11 +250,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let late_load_result_path =
         std::env::var_os("ZGX_CEF_LATE_LOAD_RESULT").map(std::path::PathBuf::from);
     let late_load_test = late_load_result_path.is_some();
-    let automated = download_test || event_test || eval_test || site_data_test || late_load_test;
+    let automated =
+        download_test || input_test || event_test || eval_test || site_data_test || late_load_test;
     if let Some(result_path) = download_result_path.as_ref() {
         fs::write(result_path, format!("START:auto={automated}\n"))?;
     }
     if let Some(result_path) = event_result_path.as_ref() {
+        fs::write(result_path, "START\n")?;
+    }
+    if let Some(result_path) = input_result_path.as_ref() {
         fs::write(result_path, "START\n")?;
     }
     if let Some(result_path) = eval_result_path.as_ref() {
@@ -623,6 +629,77 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let _ = fs::write(eval_path, "TIMEOUT");
                         window.close();
                     }
+                });
+            } else if input_test {
+                web.load_url(origin);
+                let input_page = web.clone();
+                let input_window = cx.window.clone();
+                let input_tasks = cx.tasks.clone();
+                let scene = cx.ui.scene.clone();
+                let input = cx.ui.input.clone();
+                let input_result = input_result_path
+                    .clone()
+                    .expect("input test has result path");
+                cx.tasks.spawn(async move {
+                    let mut ready = false;
+                    for _ in 0..200 {
+                        if input_page.title() == "CEF OSR fixture"
+                            && !input_page.state().with_untracked(|state| state.loading)
+                        {
+                            ready = true;
+                            break;
+                        }
+                        zgx::timer::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                    if !ready {
+                        let _ = fs::write(&input_result, "TIMEOUT:fixture-page");
+                        input_window.close();
+                        return;
+                    }
+                    let page = input_page.clone();
+                    let scene = scene.clone();
+                    input_page.evaluate_js(
+                        "(()=>{const r=document.querySelector('#typing').getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2}})()",
+                        move |result| {
+                            let position = result
+                                .ok()
+                                .and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok())
+                                .and_then(|value| Some((value["x"].as_f64()? as f32, value["y"].as_f64()? as f32)));
+                            let Some((x, y)) = position else {
+                                let _ = fs::write(&input_result, "FAIL:input-bounds");
+                                input_window.close();
+                                return;
+                            };
+                            input.dispatch(&scene, InputEvent::PointerMove { x, y });
+                            input.dispatch(&scene, InputEvent::PointerDown { x, y, button: PointerButton::Primary });
+                            input.dispatch(&scene, InputEvent::PointerUp { x, y, button: PointerButton::Primary });
+                            input.dispatch(&scene, InputEvent::Focus);
+                            input.dispatch(&scene, InputEvent::KeyDown { key: Key::Character("a".into()), modifiers: Modifiers::default(), repeat: false });
+                            input.dispatch(&scene, InputEvent::Text("fixture-".into()));
+                            input.dispatch(&scene, InputEvent::KeyUp { key: Key::Character("a".into()), modifiers: Modifiers::default() });
+                            input.dispatch(&scene, InputEvent::ImePreedit { text: "🦀".into(), cursor: Some((4, 4)) });
+                            input.dispatch(&scene, InputEvent::ImeCommit("🦀".into()));
+                            input_tasks.spawn(async move {
+                                // CEF forwards OSR IME updates asynchronously to
+                                // the renderer; wait for that renderer task
+                                // before issuing the readback over DevTools.
+                                zgx::timer::sleep(std::time::Duration::from_millis(100)).await;
+                                page.evaluate_js(
+                                    "document.querySelector('#typing').value",
+                                    move |value| {
+                                        let passed = value.as_deref() == Ok("\"fixture-🦀\"");
+                                        let status = if passed {
+                                            "PASS".to_owned()
+                                        } else {
+                                            format!("FAIL:{value:?}")
+                                        };
+                                        let _ = fs::write(&input_result, status);
+                                        input_window.close();
+                                    },
+                                );
+                            });
+                        },
+                    );
                 });
             } else if download_test {
                 web.load_url(origin);

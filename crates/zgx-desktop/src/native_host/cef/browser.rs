@@ -3,6 +3,7 @@ use std::{
     collections::HashMap,
     rc::Rc,
     sync::{Arc, Mutex},
+    time::Instant,
 };
 
 use cef::*;
@@ -35,16 +36,29 @@ pub(super) struct Page {
     pending: RefCell<Vec<WebViewCommand>>,
     evaluations: Rc<RefCell<HashMap<i32, EvaluationReply>>>,
     site_data: Rc<RefCell<HashMap<i32, SiteDataReply>>>,
+    pending_site_data: RefCell<Vec<(String, SiteDataReply)>>,
     find_replies: client::FindReplies,
     next_evaluation: Cell<i32>,
     devtools_registration: RefCell<Option<Registration>>,
     lifecycle: Cell<BrowserLifecycle>,
     visible: Cell<u32>,
+    input_modifiers: Cell<Modifiers>,
+    last_click: RefCell<Option<LastClick>>,
+    click_count: Cell<u32>,
     gpu: zgx::gpu_view::GpuView,
     frame: SharedFrame,
     popup: SharedPopup,
     size: Arc<Mutex<(i32, i32)>>,
     scale: Arc<Mutex<f32>>,
+}
+
+#[derive(Clone, Copy)]
+struct LastClick {
+    at: Instant,
+    x: i32,
+    y: i32,
+    button: u8,
+    count: u32,
 }
 
 type EvaluationReply = Box<dyn FnOnce(Result<String, String>)>;
@@ -196,51 +210,34 @@ impl WebViewBackend for CefWebView {
         }
     }
 
+    fn print(&self) {
+        if let Some(browser) = self.0.browser.borrow().as_ref()
+            && let Some(host) = browser.host()
+        {
+            host.print();
+        }
+    }
+
     fn clear_site_data(&self, url: &str, done: Box<dyn FnOnce(Result<usize, String>)>) {
+        if matches!(
+            self.0.lifecycle.get(),
+            BrowserLifecycle::Closing | BrowserLifecycle::Closed
+        ) {
+            done(Err("CEF browser is closing".into()));
+            return;
+        }
         let Some(browser) = self.0.browser.borrow().as_ref().cloned() else {
-            done(Err("CEF browser is not available".into()));
+            if self.0.lifecycle.get() == BrowserLifecycle::Creating {
+                self.0
+                    .pending_site_data
+                    .borrow_mut()
+                    .push((url.to_owned(), done));
+            } else {
+                done(Err("CEF browser is not available".into()));
+            }
             return;
         };
-        let Some(host) = browser.host() else {
-            done(Err("CEF browser host is not available".into()));
-            return;
-        };
-        let Some(origin) = super::client::origin_from_url(url)
-            .filter(|origin| origin.starts_with("http://") || origin.starts_with("https://"))
-        else {
-            done(Err(
-                "CEF site-data removal requires an HTTP or HTTPS origin".into(),
-            ));
-            return;
-        };
-        if self.0.devtools_registration.borrow().is_none() {
-            done(Err("CEF site-data observer is unavailable".into()));
-            return;
-        }
-        let mut id = self.0.next_evaluation.get().wrapping_add(1).max(1);
-        while self.0.evaluations.borrow().contains_key(&id)
-            || self.0.site_data.borrow().contains_key(&id)
-        {
-            id = id.wrapping_add(1).max(1);
-        }
-        self.0.next_evaluation.set(id);
-        let Some(mut params) = dictionary_value_create() else {
-            done(Err("CEF could not allocate site-data parameters".into()));
-            return;
-        };
-        let origin_key: CefString = "origin".into();
-        let origin_value: CefString = origin.as_str().into();
-        let types_key: CefString = "storageTypes".into();
-        let types_value: CefString = "all".into();
-        let _ = params.set_string(Some(&origin_key), Some(&origin_value));
-        let _ = params.set_string(Some(&types_key), Some(&types_value));
-        self.0.site_data.borrow_mut().insert(id, done);
-        let method: CefString = "Storage.clearDataForOrigin".into();
-        if host.execute_dev_tools_method(id, Some(&method), Some(&mut params)) == 0
-            && let Some(done) = self.0.site_data.borrow_mut().remove(&id)
-        {
-            done(Err("CEF rejected Storage.clearDataForOrigin".into()));
-        }
+        start_clear_site_data(&self.0, &browser, url, done);
     }
 }
 
@@ -272,10 +269,12 @@ fn fail_pending(page: &Page, reason: &str) {
     let commands = std::mem::take(&mut *page.pending.borrow_mut());
     let evaluations = std::mem::take(&mut *page.evaluations.borrow_mut());
     let site_data = std::mem::take(&mut *page.site_data.borrow_mut());
+    let pending_site_data = std::mem::take(&mut *page.pending_site_data.borrow_mut());
     let find_replies = std::mem::take(&mut *page.find_replies.borrow_mut());
     if commands.is_empty()
         && evaluations.is_empty()
         && site_data.is_empty()
+        && pending_site_data.is_empty()
         && find_replies.is_empty()
     {
         return;
@@ -296,10 +295,54 @@ fn fail_pending(page: &Page, reason: &str) {
         for (_, reply) in site_data {
             reply(Err(reason.clone()));
         }
+        for (_, reply) in pending_site_data {
+            reply(Err(reason.clone()));
+        }
         for reply in find_replies {
             reply(FindResult::default());
         }
     });
+}
+
+fn start_clear_site_data(page: &Page, browser: &Browser, url: &str, done: SiteDataReply) {
+    let Some(host) = browser.host() else {
+        done(Err("CEF browser host is not available".into()));
+        return;
+    };
+    let Some(origin) = super::client::origin_from_url(url)
+        .filter(|origin| origin.starts_with("http://") || origin.starts_with("https://"))
+    else {
+        done(Err(
+            "CEF site-data removal requires an HTTP or HTTPS origin".into(),
+        ));
+        return;
+    };
+    if page.devtools_registration.borrow().is_none() {
+        done(Err("CEF site-data observer is unavailable".into()));
+        return;
+    }
+    let mut id = page.next_evaluation.get().wrapping_add(1).max(1);
+    while page.evaluations.borrow().contains_key(&id) || page.site_data.borrow().contains_key(&id) {
+        id = id.wrapping_add(1).max(1);
+    }
+    page.next_evaluation.set(id);
+    let Some(mut params) = dictionary_value_create() else {
+        done(Err("CEF could not allocate site-data parameters".into()));
+        return;
+    };
+    let origin_key: CefString = "origin".into();
+    let origin_value: CefString = origin.as_str().into();
+    let types_key: CefString = "storageTypes".into();
+    let types_value: CefString = "all".into();
+    let _ = params.set_string(Some(&origin_key), Some(&origin_value));
+    let _ = params.set_string(Some(&types_key), Some(&types_value));
+    page.site_data.borrow_mut().insert(id, done);
+    let method: CefString = "Storage.clearDataForOrigin".into();
+    if host.execute_dev_tools_method(id, Some(&method), Some(&mut params)) == 0
+        && let Some(done) = page.site_data.borrow_mut().remove(&id)
+    {
+        done(Err("CEF rejected Storage.clearDataForOrigin".into()));
+    }
 }
 
 fn apply(page: &Page, browser: &Browser, command: WebViewCommand) {
@@ -329,20 +372,13 @@ fn apply(page: &Page, browser: &Browser, command: WebViewCommand) {
         WebViewCommand::GoBack => browser.go_back(),
         WebViewCommand::GoForward => browser.go_forward(),
         WebViewCommand::GoToHistory(n) => {
-            if n < 0 {
-                for _ in 0..n.unsigned_abs().min(100) {
-                    if browser.can_go_back() == 0 {
-                        break;
-                    }
-                    browser.go_back();
-                }
-            } else {
-                for _ in 0..(n as u32).min(100) {
-                    if browser.can_go_forward() == 0 {
-                        break;
-                    }
-                    browser.go_forward();
-                }
+            // A single History API navigation is deterministic; repeated
+            // GoBack/GoForward calls race CEF's asynchronous history updates.
+            if let Some(frame) = browser.main_frame() {
+                let script = format!("history.go({n})");
+                let script: CefString = script.as_str().into();
+                let source: CefString = "zgx://history/go".into();
+                frame.execute_java_script(Some(&script), Some(&source), 1);
             }
         }
         WebViewCommand::Evaluate { script, reply } => {
@@ -442,11 +478,15 @@ pub(super) fn backend(web: &WebView) -> Result<Rc<Page>, String> {
         pending: RefCell::new(Vec::new()),
         evaluations: Rc::new(RefCell::new(HashMap::new())),
         site_data: Rc::new(RefCell::new(HashMap::new())),
+        pending_site_data: RefCell::new(Vec::new()),
         find_replies: Rc::new(RefCell::new(std::collections::VecDeque::new())),
         next_evaluation: Cell::new(0),
         devtools_registration: RefCell::new(None),
         lifecycle: Cell::new(BrowserLifecycle::Creating),
         visible: Cell::new(0),
+        input_modifiers: Cell::new(Modifiers::default()),
+        last_click: RefCell::new(None),
+        click_count: Cell::new(1),
         gpu,
         frame,
         popup,
@@ -490,6 +530,10 @@ pub(super) fn backend(web: &WebView) -> Result<Rc<Page>, String> {
                     .replace(host.add_dev_tools_message_observer(Some(&mut observer)));
                 host.was_hidden((page.visible.get() == 0) as i32);
                 host.invalidate(PaintElementType::VIEW);
+            }
+            let pending_site_data = std::mem::take(&mut *page.pending_site_data.borrow_mut());
+            for (url, reply) in pending_site_data {
+                start_clear_site_data(&page, &browser, &url, reply);
             }
             let pending = std::mem::take(&mut *page.pending.borrow_mut());
             for command in pending {
@@ -618,31 +662,29 @@ fn input(page: &Page, event: &InputEvent) {
     match event.clone() {
         InputEvent::PointerDown { x, y, button } | InputEvent::PointerUp { x, y, button } => {
             let mouse_up = matches!(event, InputEvent::PointerUp { .. });
-            let button = match button {
-                PointerButton::Primary => MouseButtonType::LEFT,
-                PointerButton::Secondary => MouseButtonType::RIGHT,
-                PointerButton::Middle => MouseButtonType::MIDDLE,
+            let (button_type, button_id) = match button {
+                PointerButton::Primary => (MouseButtonType::LEFT, 1),
+                PointerButton::Secondary => (MouseButtonType::RIGHT, 2),
+                PointerButton::Middle => (MouseButtonType::MIDDLE, 3),
                 PointerButton::Other(_) => return,
             };
+            let click_count = if mouse_up {
+                page.click_count.get()
+            } else {
+                let count = next_click_count(page, x as i32, y as i32, button_id);
+                page.click_count.set(count);
+                count
+            };
             host.send_mouse_click_event(
-                Some(&MouseEvent {
-                    x: x as i32,
-                    y: y as i32,
-                    modifiers: 0,
-                }),
-                button,
+                Some(&mouse_event(page, x, y)),
+                button_type,
                 mouse_up as i32,
-                1,
+                click_count as i32,
             );
         }
-        InputEvent::PointerMove { x, y } => host.send_mouse_move_event(
-            Some(&MouseEvent {
-                x: x as i32,
-                y: y as i32,
-                modifiers: 0,
-            }),
-            0,
-        ),
+        InputEvent::PointerMove { x, y } => {
+            host.send_mouse_move_event(Some(&mouse_event(page, x, y)), 0)
+        }
         InputEvent::PointerLeave => host.send_mouse_move_event(Some(&MouseEvent::default()), 1),
         InputEvent::Scroll {
             x,
@@ -650,11 +692,7 @@ fn input(page: &Page, event: &InputEvent) {
             delta_x,
             delta_y,
         } => host.send_mouse_wheel_event(
-            Some(&MouseEvent {
-                x: x as i32,
-                y: y as i32,
-                modifiers: 0,
-            }),
+            Some(&mouse_event(page, x, y)),
             delta_x as i32,
             delta_y as i32,
         ),
@@ -662,23 +700,40 @@ fn input(page: &Page, event: &InputEvent) {
             host.set_focus(1);
         }
         InputEvent::Blur => {
+            page.input_modifiers.set(Modifiers::default());
             host.set_focus(0);
         }
-        InputEvent::Text(text) | InputEvent::ImeCommit(text) => {
-            // KeyEvent uses UTF-16 code units; each committed scalar is sent
-            // separately, preserving supplementary characters as surrogate pairs.
-            for unit in text.encode_utf16() {
-                let event = KeyEvent {
-                    type_: KeyEventType::CHAR,
-                    windows_key_code: unit as i32,
-                    character: unit,
-                    unmodified_character: unit,
-                    ..Default::default()
-                };
-                host.send_key_event(Some(&event));
-            }
+        InputEvent::Text(text) => send_text(&host, &text),
+        InputEvent::ImePreedit { text, cursor } => {
+            let source = text;
+            let text: CefString = source.as_str().into();
+            let total = source.encode_utf16().count() as u32;
+            let selection = cursor
+                .map(|(start, end)| {
+                    let start = utf16_offset(&source, start);
+                    let end = utf16_offset(&source, end);
+                    Range {
+                        from: start.min(end),
+                        to: start.max(end),
+                    }
+                })
+                .unwrap_or(Range {
+                    from: total,
+                    to: total,
+                });
+            host.ime_set_composition(Some(&text), None, None, Some(&selection));
+        }
+        InputEvent::ImeCommit(text) => {
+            // OSR's platform IME adapters can deliver a committed string even
+            // when Chromium did not retain a composition node (for example,
+            // dead-key and emoji-picker commits on macOS). Cancel any visual
+            // preedit, then deliver the already-committed Unicode through the
+            // same CHAR path as ordinary text input.
+            host.ime_cancel_composition();
+            send_text(&host, &text);
         }
         InputEvent::KeyDown { key, modifiers, .. } => {
+            page.input_modifiers.set(modifiers);
             if let Some(code) = cef_key_code(&key) {
                 host.send_key_event(Some(&KeyEvent {
                     type_: KeyEventType::RAWKEYDOWN,
@@ -689,6 +744,7 @@ fn input(page: &Page, event: &InputEvent) {
             }
         }
         InputEvent::KeyUp { key, modifiers } => {
+            page.input_modifiers.set(modifiers);
             if let Some(code) = cef_key_code(&key) {
                 host.send_key_event(Some(&KeyEvent {
                     type_: KeyEventType::KEYUP,
@@ -700,6 +756,65 @@ fn input(page: &Page, event: &InputEvent) {
         }
         _ => {}
     }
+}
+
+fn send_text(host: &BrowserHost, text: &str) {
+    for event in text_key_events(text) {
+        host.send_key_event(Some(&event));
+    }
+}
+
+fn text_key_events(text: &str) -> impl Iterator<Item = KeyEvent> + '_ {
+    // KeyEvent uses UTF-16 code units; supplementary characters are a pair.
+    text.encode_utf16().map(|unit| KeyEvent {
+        type_: KeyEventType::CHAR,
+        windows_key_code: unit as i32,
+        character: unit,
+        unmodified_character: unit,
+        ..Default::default()
+    })
+}
+
+fn mouse_event(page: &Page, x: f32, y: f32) -> MouseEvent {
+    MouseEvent {
+        x: x as i32,
+        y: y as i32,
+        modifiers: cef_modifiers(page.input_modifiers.get()),
+    }
+}
+
+fn next_click_count(page: &Page, x: i32, y: i32, button: u8) -> u32 {
+    let mut last = page.last_click.borrow_mut();
+    click_count(&mut last, Instant::now(), x, y, button)
+}
+
+fn click_count(last: &mut Option<LastClick>, now: Instant, x: i32, y: i32, button: u8) -> u32 {
+    let count = last
+        .filter(|last| {
+            now.duration_since(last.at).as_millis() <= 500
+                && (x - last.x).abs() <= 4
+                && (y - last.y).abs() <= 4
+                && button == last.button
+        })
+        .map(|last| last.count.saturating_add(1).min(3))
+        .unwrap_or(1);
+    *last = Some(LastClick {
+        at: now,
+        x,
+        y,
+        button,
+        count,
+    });
+    count
+}
+
+fn utf16_offset(text: &str, byte_offset: usize) -> u32 {
+    let byte_offset = byte_offset.min(text.len());
+    let mut boundary = byte_offset;
+    while !text.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    text[..boundary].encode_utf16().count() as u32
 }
 
 fn cef_key_code(key: &Key) -> Option<i32> {
@@ -824,7 +939,13 @@ mod evaluation_tests {
 mod tests {
     use std::{cell::RefCell, rc::Rc};
 
-    use super::{cef_key_code, cef_modifiers, close_after_releasing_slot};
+    use std::time::{Duration, Instant};
+
+    use super::{
+        cef_key_code, cef_modifiers, click_count, close_after_releasing_slot, text_key_events,
+        utf16_offset,
+    };
+    use cef::KeyEventType;
     use zgx::input::{Key, Modifiers};
 
     #[test]
@@ -846,6 +967,47 @@ mod tests {
             meta: true,
         });
         assert_eq!(flags, 2 | 4 | 8 | 128);
+    }
+
+    #[test]
+    fn ime_cursor_byte_offsets_become_utf16_ranges() {
+        assert_eq!(utf16_offset("hello", 3), 3);
+        assert_eq!(utf16_offset("a🦀b", 5), 3);
+        assert_eq!(utf16_offset("a🦀b", 2), 1);
+        assert_eq!(utf16_offset("a🦀b", 99), 4);
+    }
+
+    #[test]
+    fn committed_ime_text_uses_utf16_char_events() {
+        let events: Vec<_> = text_key_events("a🦀").collect();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].character, b'a' as u16);
+        assert_eq!(events[1].character, 0xd83e);
+        assert_eq!(events[2].character, 0xdd80);
+        assert!(events.iter().all(|event| event.type_ == KeyEventType::CHAR));
+    }
+
+    #[test]
+    fn mouse_click_count_tracks_double_and_triple_clicks() {
+        let mut previous = None;
+        let now = Instant::now();
+        assert_eq!(click_count(&mut previous, now, 10, 10, 1), 1);
+        assert_eq!(
+            click_count(&mut previous, now + Duration::from_millis(120), 11, 10, 1),
+            2
+        );
+        assert_eq!(
+            click_count(&mut previous, now + Duration::from_millis(220), 11, 10, 1),
+            3
+        );
+        assert_eq!(
+            click_count(&mut previous, now + Duration::from_millis(300), 11, 10, 2),
+            1
+        );
+        assert_eq!(
+            click_count(&mut previous, now + Duration::from_millis(900), 11, 10, 2),
+            1
+        );
     }
 
     #[test]

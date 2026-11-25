@@ -271,15 +271,22 @@ fn initialize_inner() -> Result<Runtime, String> {
 }
 
 fn use_mock_keychain() -> bool {
+    mock_keychain_requested(|name| std::env::var_os(name).is_some())
+}
+
+fn mock_keychain_requested(mut present: impl FnMut(&str) -> bool) -> bool {
     [
         "ZGX_CEF_TEST_FIXTURE",
         "ZGX_CEF_PROFILE_FIXTURE",
         "ZGX_CEF_EVAL_RESULT",
         "ZGX_CEF_EVENT_RESULT",
         "ZGX_CEF_DOWNLOAD_RESULT",
+        "ZGX_CEF_INPUT_RESULT",
+        "ZGX_CEF_SITE_DATA_RESULT",
+        "ZGX_CEF_LATE_LOAD_RESULT",
     ]
     .iter()
-    .any(|name| std::env::var_os(name).is_some())
+    .any(|name| present(name))
 }
 
 /// Initialize CEF once on the UI thread. The caller must run
@@ -487,8 +494,25 @@ pub(super) fn shutdown() -> Result<(), String> {
 mod tests {
     use super::{
         browser_closed, browser_created, browser_creation_failed, browser_creation_started,
-        has_browsers,
+        has_browsers, mock_keychain_requested,
     };
+
+    #[test]
+    fn every_automated_fixture_uses_the_mock_keychain() {
+        for fixture in [
+            "ZGX_CEF_TEST_FIXTURE",
+            "ZGX_CEF_PROFILE_FIXTURE",
+            "ZGX_CEF_EVAL_RESULT",
+            "ZGX_CEF_EVENT_RESULT",
+            "ZGX_CEF_DOWNLOAD_RESULT",
+            "ZGX_CEF_INPUT_RESULT",
+            "ZGX_CEF_SITE_DATA_RESULT",
+            "ZGX_CEF_LATE_LOAD_RESULT",
+        ] {
+            assert!(mock_keychain_requested(|name| name == fixture), "{fixture}");
+        }
+        assert!(!mock_keychain_requested(|_| false));
+    }
 
     #[test]
     fn tracks_pending_creations_and_actual_browser_ids() {
