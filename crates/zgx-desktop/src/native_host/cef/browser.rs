@@ -727,6 +727,8 @@ pub(super) fn prepare_popup(
     let handle_slot = Rc::new(RefCell::new(None::<crate::WindowHandle>));
     let created_page = Rc::downgrade(&page);
     let closed_page = Rc::downgrade(&page);
+    let popup_opened = web.clone();
+    let popup_closed = web.clone();
     let closed_handle = handle_slot.clone();
     let created_pending = settled.clone();
     let created_map = pending_popups.clone();
@@ -769,6 +771,11 @@ pub(super) fn prepare_popup(
                 return;
             }
             page.lifecycle.set(BrowserLifecycle::Ready);
+            client::emit_native_activity(
+                &popup_opened,
+                format!("popup:{}", browser.identifier()),
+                true,
+            );
             if let Some(host) = browser.host() {
                 let mut observer = CEFScriptObserver::new(
                     page.evaluations.clone(),
@@ -782,6 +789,7 @@ pub(super) fn prepare_popup(
             }
         }),
         before_close: Rc::new(move |identifier| {
+            client::emit_native_activity(&popup_closed, format!("popup:{identifier}"), false);
             runtime::browser_closed(identifier);
             if let Some(page) = closed_page.upgrade() {
                 page.lifecycle.set(BrowserLifecycle::Closed);

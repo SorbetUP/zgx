@@ -152,13 +152,17 @@ wrap_audio_handler! {
 }
 
 fn emit_native_audio_activity(web: &zgx::web_view::WeakWebView, active: bool) {
+    emit_native_activity(web, "native-audio".into(), active);
+}
+
+pub(super) fn emit_native_activity(web: &zgx::web_view::WeakWebView, reason: String, active: bool) {
     let web = web.clone();
     zgx::native_view::post(move || {
         if let Some(web) = web.upgrade() {
             web.emit(zgx::web_view::WebViewEvent::Message {
                 body: serde_json::json!({
                     "polyscale": "native-activity",
-                    "reason": "native-audio",
+                    "reason": reason,
                     "active": active,
                 })
                 .to_string(),
