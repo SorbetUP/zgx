@@ -443,10 +443,65 @@ wrap_permission_handler! {
     }
 }
 
+wrap_dialog_handler! {
+    pub(super) struct CEFDialogHandler { web: zgx::web_view::WeakWebView }
+    impl DialogHandler {
+        fn on_file_dialog(
+            &self,
+            _browser: Option<&mut Browser>,
+            mode: FileDialogMode,
+            _title: Option<&CefString>,
+            _default_file_path: Option<&CefString>,
+            _accept_filters: Option<&mut CefStringList>,
+            _accept_extensions: Option<&mut CefStringList>,
+            _accept_descriptions: Option<&mut CefStringList>,
+            callback: Option<&mut FileDialogCallback>,
+        ) -> i32 {
+            let Some(callback) = callback else { return 1 };
+            let callback = callback.clone();
+            let Some((multiple, folder)) = file_dialog_selection(mode) else {
+                callback.cancel();
+                return 1;
+            };
+            let Some(web) = self.web.upgrade() else {
+                callback.cancel();
+                return 1;
+            };
+            web.choose_files(multiple, folder, move |selection| match selection {
+                Some(files) if !files.is_empty() => {
+                    let mut paths = CefStringList::new();
+                    for file in files {
+                        if !paths.append(&file.to_string_lossy()) {
+                            callback.cancel();
+                            return;
+                        }
+                    }
+                    callback.cont(Some(&mut paths));
+                }
+                _ => callback.cancel(),
+            });
+            1
+        }
+    }
+}
+
+fn file_dialog_selection(mode: FileDialogMode) -> Option<(bool, bool)> {
+    if mode == FileDialogMode::OPEN {
+        Some((false, false))
+    } else if mode == FileDialogMode::OPEN_MULTIPLE {
+        Some((true, false))
+    } else if mode == FileDialogMode::OPEN_FOLDER {
+        Some((false, true))
+    } else {
+        None
+    }
+}
+
 #[derive(Clone)]
 struct CEFPolicyHandlers {
     find: FindHandler,
     permission: PermissionHandler,
+    dialog: DialogHandler,
 }
 
 wrap_client! {
@@ -459,6 +514,7 @@ pub(super) struct CEFClient { render: RenderHandler, life: LifeSpanHandler, load
         fn display_handler(&self) -> Option<DisplayHandler> { Some(self.display.clone()) }
         fn find_handler(&self) -> Option<FindHandler> { Some(self.policy.find.clone()) }
         fn permission_handler(&self) -> Option<PermissionHandler> { Some(self.policy.permission.clone()) }
+        fn dialog_handler(&self) -> Option<DialogHandler> { Some(self.policy.dialog.clone()) }
         fn on_process_message_received(
             &self,
             _browser: Option<&mut Browser>,
@@ -520,13 +576,18 @@ pub(super) fn client(
     let download = CEFDownloadHandler::new(web.clone(), Rc::new(RefCell::new(HashMap::new())));
     let find = CEFFindHandler::new(find_replies);
     let permission = CEFPermissionHandler::new();
+    let dialog = CEFDialogHandler::new(web.clone());
     CEFClient::new(
         render,
         life,
         load,
         download,
         display,
-        CEFPolicyHandlers { find, permission },
+        CEFPolicyHandlers {
+            find,
+            permission,
+            dialog,
+        },
         web,
     )
 }
@@ -570,7 +631,8 @@ pub(super) fn origin_from_url(url: &str) -> Option<String> {
 mod tests {
     use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
-    use super::{DownloadUpdate, update_download_status};
+    use super::{DownloadUpdate, file_dialog_selection, update_download_status};
+    use cef::FileDialogMode;
     use zgx::web_view::DownloadStatus;
 
     #[test]
@@ -669,5 +731,22 @@ mod tests {
             Some("null".into())
         );
         assert_eq!(super::origin_from_url("https:///missing-host"), None);
+    }
+
+    #[test]
+    fn file_picker_modes_are_mapped_without_implicit_save_dialogs() {
+        assert_eq!(
+            file_dialog_selection(FileDialogMode::OPEN),
+            Some((false, false))
+        );
+        assert_eq!(
+            file_dialog_selection(FileDialogMode::OPEN_MULTIPLE),
+            Some((true, false))
+        );
+        assert_eq!(
+            file_dialog_selection(FileDialogMode::OPEN_FOLDER),
+            Some((false, true))
+        );
+        assert_eq!(file_dialog_selection(FileDialogMode::SAVE), None);
     }
 }
