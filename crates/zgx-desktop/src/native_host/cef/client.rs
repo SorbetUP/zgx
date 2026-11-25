@@ -408,15 +408,55 @@ wrap_find_handler! {
     }
 }
 
+wrap_permission_handler! {
+    pub(super) struct CEFPermissionHandler {}
+    impl PermissionHandler {
+        fn on_request_media_access_permission(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            _requesting_origin: Option<&CefString>,
+            _requested_permissions: u32,
+            callback: Option<&mut MediaAccessCallback>,
+        ) -> i32 {
+            if let Some(callback) = callback {
+                callback.cancel();
+            }
+            1
+        }
+
+        fn on_show_permission_prompt(
+            &self,
+            _browser: Option<&mut Browser>,
+            _prompt_id: u64,
+            _requesting_origin: Option<&CefString>,
+            _requested_permissions: u32,
+            callback: Option<&mut PermissionPromptCallback>,
+        ) -> i32 {
+            if let Some(callback) = callback {
+                callback.cont(PermissionRequestResult::DENY);
+            }
+            1
+        }
+    }
+}
+
+#[derive(Clone)]
+struct CEFPolicyHandlers {
+    find: FindHandler,
+    permission: PermissionHandler,
+}
+
 wrap_client! {
-pub(super) struct CEFClient { render: RenderHandler, life: LifeSpanHandler, load: LoadHandler, download: DownloadHandler, display: DisplayHandler, find: FindHandler, web: zgx::web_view::WeakWebView }
+pub(super) struct CEFClient { render: RenderHandler, life: LifeSpanHandler, load: LoadHandler, download: DownloadHandler, display: DisplayHandler, policy: CEFPolicyHandlers, web: zgx::web_view::WeakWebView }
     impl Client {
         fn render_handler(&self) -> Option<RenderHandler> { Some(self.render.clone()) }
         fn life_span_handler(&self) -> Option<LifeSpanHandler> { Some(self.life.clone()) }
         fn load_handler(&self) -> Option<LoadHandler> { Some(self.load.clone()) }
         fn download_handler(&self) -> Option<DownloadHandler> { Some(self.download.clone()) }
         fn display_handler(&self) -> Option<DisplayHandler> { Some(self.display.clone()) }
-        fn find_handler(&self) -> Option<FindHandler> { Some(self.find.clone()) }
+        fn find_handler(&self) -> Option<FindHandler> { Some(self.policy.find.clone()) }
+        fn permission_handler(&self) -> Option<PermissionHandler> { Some(self.policy.permission.clone()) }
         fn on_process_message_received(
             &self,
             _browser: Option<&mut Browser>,
@@ -476,7 +516,16 @@ pub(super) fn client(
     let display = CEFDisplayHandler::new(web.clone());
     let download = CEFDownloadHandler::new(web.clone(), Rc::new(RefCell::new(HashMap::new())));
     let find = CEFFindHandler::new(find_replies);
-    CEFClient::new(render, life, load, download, display, find, web)
+    let permission = CEFPermissionHandler::new();
+    CEFClient::new(
+        render,
+        life,
+        load,
+        download,
+        display,
+        CEFPolicyHandlers { find, permission },
+        web,
+    )
 }
 
 pub(super) fn origin_from_url(url: &str) -> Option<String> {
