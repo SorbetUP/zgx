@@ -290,7 +290,10 @@ wrap_life_span_handler! {
 }
 
 wrap_render_handler! {
-    pub(super) struct CEFRenderHandler { state: RenderState }
+    pub(super) struct CEFRenderHandler {
+        state: RenderState,
+        drag_start: Rc<dyn Fn(&DragData, i32, i32) -> bool>,
+    }
     impl RenderHandler {
         fn view_rect(&self, _browser: Option<&mut Browser>, rect: Option<&mut Rect>) {
             if let Some(rect) = rect {
@@ -376,6 +379,18 @@ wrap_render_handler! {
             frame.revision = frame.revision.wrapping_add(1);
             drop(frame);
             (self.state.invalidate)();
+        }
+
+        fn start_dragging(
+            &self,
+            _browser: Option<&mut Browser>,
+            drag_data: Option<&mut DragData>,
+            _allowed_ops: DragOperationsMask,
+            x: i32,
+            y: i32,
+        ) -> i32 {
+            let Some(drag_data) = drag_data else { return 0 };
+            (self.drag_start)(drag_data, x, y) as i32
         }
     }
 }
@@ -802,6 +817,7 @@ pub(super) fn client(
     dialogs: crate::FileDialogs,
     tasks: crate::TaskSpawner,
     windows: crate::WindowFactory,
+    drag_start: Rc<dyn Fn(&DragData, i32, i32) -> bool>,
 ) -> Client {
     let state = RenderState {
         frame,
@@ -810,7 +826,7 @@ pub(super) fn client(
         scale,
         invalidate,
     };
-    let render = CEFRenderHandler::new(state);
+    let render = CEFRenderHandler::new(state, drag_start);
     let find_replies = callbacks.find_replies.clone();
     let navigation_started = callbacks.navigation_started.clone();
     let life = CEFLifeSpanHandler::new(

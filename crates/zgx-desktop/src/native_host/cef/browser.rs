@@ -48,6 +48,10 @@ pub(super) struct Page {
     mouse_buttons: Cell<u32>,
     drag_target_data: RefCell<Option<DragData>>,
     drag_target_files: RefCell<HashSet<std::path::PathBuf>>,
+    drag_source_pending: RefCell<Option<PageDrag>>,
+    drag_export: RefCell<Option<Vec<zgx::input::DragItem>>>,
+    drag_source_active: Cell<bool>,
+    pressed: Cell<Option<(f32, f32)>>,
     last_click: RefCell<Option<LastClick>>,
     click_count: Cell<u32>,
     gpu: zgx::gpu_view::GpuView,
@@ -55,6 +59,14 @@ pub(super) struct Page {
     popup: SharedPopup,
     size: Arc<Mutex<(i32, i32)>>,
     scale: Arc<Mutex<f32>>,
+}
+
+struct PageDrag {
+    text: String,
+    html: Option<String>,
+    items: Vec<zgx::input::DragItem>,
+    x: i32,
+    y: i32,
 }
 
 #[derive(Clone, Copy)]
@@ -541,6 +553,10 @@ pub(super) fn backend(
         mouse_buttons: Cell::new(0),
         drag_target_data: RefCell::new(None),
         drag_target_files: RefCell::new(HashSet::new()),
+        drag_source_pending: RefCell::new(None),
+        drag_export: RefCell::new(None),
+        drag_source_active: Cell::new(false),
+        pressed: Cell::new(None),
         last_click: RefCell::new(None),
         click_count: Cell::new(1),
         gpu,
@@ -629,6 +645,16 @@ pub(super) fn backend(
         }),
     };
     let invalidator = page.gpu.clone();
+    let drag_start_page = Rc::downgrade(&page);
+    let drag_start = Rc::new(move |data: &DragData, x: i32, y: i32| -> bool {
+        if let Some(page) = drag_start_page.upgrade()
+            && let Some(drag) = page_drag(data, x, y)
+        {
+            page.drag_source_pending.replace(Some(drag));
+            return true;
+        }
+        false
+    });
     let client = client::client(
         page.frame.clone(),
         page.popup.clone(),
@@ -642,6 +668,7 @@ pub(super) fn backend(
         dialogs,
         tasks,
         windows,
+        drag_start,
     );
     let info = WindowInfo {
         windowless_rendering_enabled: 1,
@@ -722,6 +749,10 @@ pub(super) fn prepare_popup(
         mouse_buttons: Cell::new(0),
         drag_target_data: RefCell::new(None),
         drag_target_files: RefCell::new(HashSet::new()),
+        drag_source_pending: RefCell::new(None),
+        drag_export: RefCell::new(None),
+        drag_source_active: Cell::new(false),
+        pressed: Cell::new(None),
         last_click: RefCell::new(None),
         click_count: Cell::new(1),
         gpu,
@@ -808,6 +839,16 @@ pub(super) fn prepare_popup(
         }),
     };
     let invalidator = page.gpu.clone();
+    let drag_start_page = Rc::downgrade(&page);
+    let drag_start = Rc::new(move |data: &DragData, x: i32, y: i32| -> bool {
+        if let Some(page) = drag_start_page.upgrade()
+            && let Some(drag) = page_drag(data, x, y)
+        {
+            page.drag_source_pending.replace(Some(drag));
+            return true;
+        }
+        false
+    });
     let client = client::client(
         page.frame.clone(),
         page.popup.clone(),
@@ -821,6 +862,7 @@ pub(super) fn prepare_popup(
         dialogs,
         tasks,
         windows.clone(),
+        drag_start,
     );
     let content = view(page.clone());
     let window = windows.open(
@@ -933,6 +975,11 @@ fn input(page: &Page, event: &mut zgx::input::EventContext) {
     };
     match input_event.clone() {
         InputEvent::Drag(drag) => match drag.phase {
+            DragPhase::Start => {
+                if let Some(items) = page.drag_export.borrow_mut().take() {
+                    event.set_drag_export(items);
+                }
+            }
             DragPhase::Over => {
                 let Some(text) = drag.payload.downcast_ref::<DraggedText>() else {
                     return;
@@ -973,6 +1020,24 @@ fn input(page: &Page, event: &mut zgx::input::EventContext) {
                     host.drag_target_drag_leave();
                 }
                 page.drag_target_files.borrow_mut().clear();
+                if drag.phase == DragPhase::End && page.drag_source_active.replace(false) {
+                    let scale = page
+                        .scale
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        .max(0.01);
+                    let operation = if drag.accepted {
+                        cef::sys::cef_drag_operations_mask_t::DRAG_OPERATION_COPY
+                    } else {
+                        cef::sys::cef_drag_operations_mask_t::DRAG_OPERATION_NONE
+                    };
+                    host.drag_source_ended_at(
+                        (drag.x * scale) as i32,
+                        (drag.y * scale) as i32,
+                        operation.into(),
+                    );
+                    host.drag_source_system_drag_ended();
+                }
             }
             _ => {}
         },
@@ -1097,6 +1162,9 @@ fn input(page: &Page, event: &mut zgx::input::EventContext) {
         }
         InputEvent::PointerDown { x, y, button } | InputEvent::PointerUp { x, y, button } => {
             let mouse_up = matches!(input_event, InputEvent::PointerUp { .. });
+            if button == PointerButton::Primary {
+                page.pressed.set((!mouse_up).then_some((x, y)));
+            }
             let (button_type, button_id, cef_flag) = match button {
                 PointerButton::Primary => (
                     MouseButtonType::LEFT,
@@ -1133,7 +1201,25 @@ fn input(page: &Page, event: &mut zgx::input::EventContext) {
             );
         }
         InputEvent::PointerMove { x, y } => {
-            host.send_mouse_move_event(Some(&mouse_event(page, x, y)), 0)
+            host.send_mouse_move_event(Some(&mouse_event(page, x, y)), 0);
+            if let Some(drag) = page.drag_source_pending.borrow_mut().take() {
+                let scale = page
+                    .scale
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .max(0.01);
+                let origin = page
+                    .pressed
+                    .take()
+                    .unwrap_or((drag.x as f32 / scale, drag.y as f32 / scale));
+                page.drag_export.replace(Some(drag.items));
+                page.drag_source_active.set(true);
+                event.start_drag_from(
+                    DraggedText::with_html(drag.text, drag.html),
+                    origin.0,
+                    origin.1,
+                );
+            }
         }
         InputEvent::PointerLeave => host.send_mouse_move_event(Some(&MouseEvent::default()), 1),
         InputEvent::Scroll {
@@ -1230,6 +1316,45 @@ fn add_file_to_drag_data(data: &DragData, path: &std::path::Path) -> bool {
     let display_name: CefString = file_name.to_string_lossy().as_ref().into();
     data.add_file(Some(&path_string), Some(&display_name));
     true
+}
+
+fn page_drag(data: &DragData, x: i32, y: i32) -> Option<PageDrag> {
+    let url = CefString::from(&data.link_url()).to_string();
+    let fragment_text = CefString::from(&data.fragment_text()).to_string();
+    let fragment_html = CefString::from(&data.fragment_html()).to_string();
+    page_drag_fields(url, fragment_text, fragment_html, x, y)
+}
+
+fn page_drag_fields(
+    url: String,
+    fragment_text: String,
+    fragment_html: String,
+    x: i32,
+    y: i32,
+) -> Option<PageDrag> {
+    const MAX_FIELD_BYTES: usize = 1_048_576;
+    let text = if fragment_text.is_empty() {
+        url.clone()
+    } else {
+        fragment_text
+    };
+    if text.is_empty() || text.len() > MAX_FIELD_BYTES || url.len() > MAX_FIELD_BYTES {
+        return None;
+    }
+    let html = (!fragment_html.is_empty() && fragment_html.len() <= MAX_FIELD_BYTES)
+        .then_some(fragment_html);
+    let mut items = Vec::with_capacity(2);
+    if !url.is_empty() {
+        items.push(zgx::input::DragItem::Url(url));
+    }
+    items.push(zgx::input::DragItem::Text(text.clone()));
+    Some(PageDrag {
+        text,
+        html,
+        items,
+        x,
+        y,
+    })
 }
 
 fn send_text(host: &BrowserHost, text: &str) {
@@ -1474,8 +1599,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        cef_key_code, cef_modifiers, click_count, close_after_releasing_slot, text_key_events,
-        utf16_offset,
+        cef_key_code, cef_modifiers, click_count, close_after_releasing_slot, page_drag_fields,
+        text_key_events, utf16_offset,
     };
     use cef::KeyEventType;
     use zgx::input::{Key, Modifiers};
@@ -1499,6 +1624,39 @@ mod tests {
             meta: true,
         });
         assert_eq!(flags, 2 | 4 | 8 | 128);
+    }
+
+    #[test]
+    fn webpage_drag_keeps_text_html_and_link_for_other_webapps() {
+        let drag = page_drag_fields(
+            "https://example.test/document".into(),
+            "Selected text".into(),
+            "<b>Selected text</b>".into(),
+            20,
+            30,
+        )
+        .expect("valid web drag payload");
+
+        assert_eq!(drag.text, "Selected text");
+        assert_eq!(drag.html.as_deref(), Some("<b>Selected text</b>"));
+        assert_eq!(drag.items.len(), 2);
+        assert!(matches!(
+            &drag.items[0],
+            zgx::input::DragItem::Url(url) if url == "https://example.test/document"
+        ));
+        assert!(matches!(
+            &drag.items[1],
+            zgx::input::DragItem::Text(text) if text == "Selected text"
+        ));
+        assert_eq!((drag.x, drag.y), (20, 30));
+    }
+
+    #[test]
+    fn webpage_drag_rejects_empty_and_oversized_payloads() {
+        assert!(page_drag_fields(String::new(), String::new(), String::new(), 0, 0).is_none());
+        assert!(
+            page_drag_fields(String::new(), "x".repeat(1_048_577), String::new(), 0, 0,).is_none()
+        );
     }
 
     #[test]
