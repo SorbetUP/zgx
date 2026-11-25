@@ -10,7 +10,7 @@ use zgx::{
     compose::{View, component, div, gpu_view, text},
     input::{InputEvent, Key, Modifiers, PointerButton},
     style::Styled,
-    web_view::{WebProfile, WebView, WebViewBackend, WebViewCommand},
+    web_view::{FindOptions, FindResult, WebProfile, WebView, WebViewBackend, WebViewCommand},
 };
 
 use super::{
@@ -35,6 +35,7 @@ pub(super) struct Page {
     pending: RefCell<Vec<WebViewCommand>>,
     evaluations: Rc<RefCell<HashMap<i32, EvaluationReply>>>,
     site_data: Rc<RefCell<HashMap<i32, SiteDataReply>>>,
+    find_replies: client::FindReplies,
     next_evaluation: Cell<i32>,
     devtools_registration: RefCell<Option<Registration>>,
     lifecycle: Cell<BrowserLifecycle>,
@@ -168,6 +169,33 @@ impl WebViewBackend for CefWebView {
         self
     }
 
+    fn find(&self, text: &str, options: &FindOptions, reply: Box<dyn FnOnce(FindResult)>) {
+        let Some(browser) = self.0.browser.borrow().as_ref().cloned() else {
+            reply(FindResult::default());
+            return;
+        };
+        self.0.find_replies.borrow_mut().push_back(reply);
+        let query: CefString = text.into();
+        if let Some(host) = browser.host() {
+            host.find(
+                Some(&query),
+                (!options.backwards) as i32,
+                options.case_sensitive as i32,
+                0,
+            );
+        } else if let Some(reply) = self.0.find_replies.borrow_mut().pop_back() {
+            reply(FindResult::default());
+        }
+    }
+
+    fn clear_find(&self) {
+        if let Some(browser) = self.0.browser.borrow().as_ref()
+            && let Some(host) = browser.host()
+        {
+            host.stop_finding(0);
+        }
+    }
+
     fn clear_site_data(&self, url: &str, done: Box<dyn FnOnce(Result<usize, String>)>) {
         let Some(browser) = self.0.browser.borrow().as_ref().cloned() else {
             done(Err("CEF browser is not available".into()));
@@ -244,7 +272,12 @@ fn fail_pending(page: &Page, reason: &str) {
     let commands = std::mem::take(&mut *page.pending.borrow_mut());
     let evaluations = std::mem::take(&mut *page.evaluations.borrow_mut());
     let site_data = std::mem::take(&mut *page.site_data.borrow_mut());
-    if commands.is_empty() && evaluations.is_empty() && site_data.is_empty() {
+    let find_replies = std::mem::take(&mut *page.find_replies.borrow_mut());
+    if commands.is_empty()
+        && evaluations.is_empty()
+        && site_data.is_empty()
+        && find_replies.is_empty()
+    {
         return;
     }
     let reason = reason.to_owned();
@@ -262,6 +295,9 @@ fn fail_pending(page: &Page, reason: &str) {
         }
         for (_, reply) in site_data {
             reply(Err(reason.clone()));
+        }
+        for reply in find_replies {
+            reply(FindResult::default());
         }
     });
 }
@@ -406,6 +442,7 @@ pub(super) fn backend(web: &WebView) -> Result<Rc<Page>, String> {
         pending: RefCell::new(Vec::new()),
         evaluations: Rc::new(RefCell::new(HashMap::new())),
         site_data: Rc::new(RefCell::new(HashMap::new())),
+        find_replies: Rc::new(RefCell::new(std::collections::VecDeque::new())),
         next_evaluation: Cell::new(0),
         devtools_registration: RefCell::new(None),
         lifecycle: Cell::new(BrowserLifecycle::Creating),
@@ -420,6 +457,7 @@ pub(super) fn backend(web: &WebView) -> Result<Rc<Page>, String> {
     let created_weak = weak.clone();
     let closed_weak = weak;
     let callbacks = BrowserCallbacks {
+        find_replies: page.find_replies.clone(),
         created: Rc::new(move |browser| {
             runtime::browser_created(browser.identifier());
             if runtime::register_browser(&browser).is_err() {

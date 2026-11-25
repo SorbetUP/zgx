@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     rc::Rc,
     sync::{Arc, Mutex},
 };
@@ -8,6 +8,9 @@ use std::{
 use cef::{self, *};
 
 use super::rendering::{SharedFrame, SharedPopup};
+
+pub(super) type FindReplies = Rc<RefCell<VecDeque<FindReply>>>;
+type FindReply = Box<dyn FnOnce(zgx::web_view::FindResult)>;
 
 #[derive(Clone)]
 pub(super) struct RenderState {
@@ -22,6 +25,7 @@ pub(super) struct RenderState {
 pub(super) struct BrowserCallbacks {
     pub created: Rc<dyn Fn(Browser)>,
     pub before_close: Rc<dyn Fn(i32)>,
+    pub find_replies: FindReplies,
 }
 
 wrap_download_handler! {
@@ -347,14 +351,40 @@ wrap_display_handler! {
     }
 }
 
+wrap_find_handler! {
+    pub(super) struct CEFFindHandler { replies: FindReplies }
+    impl FindHandler {
+        fn on_find_result(
+            &self,
+            _browser: Option<&mut Browser>,
+            _identifier: i32,
+            count: i32,
+            _selection_rect: Option<&Rect>,
+            _active_match_ordinal: i32,
+            final_update: i32,
+        ) {
+            if final_update == 0 {
+                return;
+            }
+            if let Some(reply) = self.replies.borrow_mut().pop_front() {
+                let mut result = zgx::web_view::FindResult::default();
+                result.found = count > 0;
+                result.matches = (!cfg!(target_os = "macos")).then_some(count.max(0) as u32);
+                zgx::native_view::post(move || reply(result));
+            }
+        }
+    }
+}
+
 wrap_client! {
-pub(super) struct CEFClient { render: RenderHandler, life: LifeSpanHandler, load: LoadHandler, download: DownloadHandler, display: DisplayHandler, web: zgx::web_view::WeakWebView }
+pub(super) struct CEFClient { render: RenderHandler, life: LifeSpanHandler, load: LoadHandler, download: DownloadHandler, display: DisplayHandler, find: FindHandler, web: zgx::web_view::WeakWebView }
     impl Client {
         fn render_handler(&self) -> Option<RenderHandler> { Some(self.render.clone()) }
         fn life_span_handler(&self) -> Option<LifeSpanHandler> { Some(self.life.clone()) }
         fn load_handler(&self) -> Option<LoadHandler> { Some(self.load.clone()) }
         fn download_handler(&self) -> Option<DownloadHandler> { Some(self.download.clone()) }
         fn display_handler(&self) -> Option<DisplayHandler> { Some(self.display.clone()) }
+        fn find_handler(&self) -> Option<FindHandler> { Some(self.find.clone()) }
         fn on_process_message_received(
             &self,
             _browser: Option<&mut Browser>,
@@ -408,11 +438,13 @@ pub(super) fn client(
         invalidate,
     };
     let render = CEFRenderHandler::new(state);
+    let find_replies = callbacks.find_replies.clone();
     let life = CEFLifeSpanHandler::new(callbacks);
     let load = CEFLoadHandler::new(web.clone());
     let display = CEFDisplayHandler::new(web.clone());
     let download = CEFDownloadHandler::new(web.clone(), Rc::new(RefCell::new(HashMap::new())));
-    CEFClient::new(render, life, load, download, display, web)
+    let find = CEFFindHandler::new(find_replies);
+    CEFClient::new(render, life, load, download, display, find, web)
 }
 
 pub(super) fn origin_from_url(url: &str) -> Option<String> {

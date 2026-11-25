@@ -12,7 +12,7 @@ use std::{
 use zgx::{
     compose::prelude::*,
     input::{InputEvent, PointerButton},
-    web_view::{WebProfile, WebView, WebViewOptions},
+    web_view::{FindOptions, WebProfile, WebView, WebViewOptions},
 };
 use zgx_desktop::{Application, WindowBounds, WindowOptions};
 
@@ -52,7 +52,7 @@ fn run_evaluation_test(
     window: zgx_desktop::WindowHandle,
     done: Arc<AtomicBool>,
 ) {
-    let remaining = Arc::new(AtomicUsize::new(8));
+    let remaining = Arc::new(AtomicUsize::new(9));
     let all_ok = Arc::new(AtomicBool::new(true));
     let cases = [
         ("1 + 2", Ok("3")),
@@ -101,6 +101,38 @@ fn run_evaluation_test(
             }
         });
     }
+    let remaining_find = remaining.clone();
+    let all_ok_find = all_ok.clone();
+    let result_path_find = result_path.clone();
+    let done_find = done.clone();
+    web.find(
+        "cef-event-url-changed",
+        FindOptions::default(),
+        move |result| {
+            let matched = result.found;
+            if let Ok(mut log) = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(result_path_find.with_extension("log"))
+            {
+                let _ = writeln!(log, "find cef-event-url-changed: {result:?}");
+            }
+            if !matched {
+                all_ok_find.store(false, Ordering::Release);
+            }
+            if remaining_find.fetch_sub(1, Ordering::AcqRel) == 1
+                && !done_find.swap(true, Ordering::AcqRel)
+            {
+                let result = if all_ok_find.load(Ordering::Acquire) {
+                    "PASS"
+                } else {
+                    "FAIL"
+                };
+                let _ = fs::write(result_path, result);
+                window.close();
+            }
+        },
+    );
 }
 
 fn start_fixture_server(
