@@ -11,7 +11,7 @@ use std::{
 };
 use zgx::{
     compose::prelude::*,
-    web_view::{WebView, WebViewOptions},
+    web_view::{WebProfile, WebView, WebViewOptions},
 };
 use zgx_desktop::{Application, WindowBounds, WindowOptions};
 
@@ -210,7 +210,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let site_data_result_path =
         std::env::var_os("ZGX_CEF_SITE_DATA_RESULT").map(std::path::PathBuf::from);
     let site_data_test = site_data_result_path.is_some();
-    let automated = download_test || event_test || eval_test || site_data_test;
+    let late_load_result_path =
+        std::env::var_os("ZGX_CEF_LATE_LOAD_RESULT").map(std::path::PathBuf::from);
+    let late_load_test = late_load_result_path.is_some();
+    let automated = download_test || event_test || eval_test || site_data_test || late_load_test;
     if let Some(result_path) = std::env::var_os("ZGX_CEF_DOWNLOAD_RESULT") {
         fs::write(result_path, format!("START:auto={automated}\n"))?;
     }
@@ -223,7 +226,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(result_path) = site_data_result_path.as_ref() {
         fs::write(result_path, "START\n")?;
     }
-    let origin = start_fixture_server(download_test, site_data_test)?;
+    let origin = start_fixture_server(download_test, site_data_test || late_load_test)?;
     if let Some(result_path) = event_result_path.as_ref() {
         let mut result = fs::OpenOptions::new().append(true).open(result_path)?;
         writeln!(result, "ORIGIN:{origin}")?;
@@ -240,7 +243,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ..Default::default()
         })
         .run(|cx| {
-            let web = WebView::new(&cx.ui.runtime, WebViewOptions::default());
+            let profile = if late_load_test {
+                WebProfile::Named("zgx-late-load-fixture".into())
+            } else {
+                WebProfile::Default
+            };
+            let web = WebView::new(
+                &cx.ui.runtime,
+                WebViewOptions {
+                    profile,
+                    ..Default::default()
+                },
+            );
+            let late_shared = late_load_test.then(|| {
+                WebView::new(
+                    &cx.ui.runtime,
+                    WebViewOptions {
+                        profile: WebProfile::Named("zgx-late-load-fixture".into()),
+                        ..Default::default()
+                    },
+                )
+            });
+            let late_isolated = late_load_test.then(|| {
+                WebView::new(
+                    &cx.ui.runtime,
+                    WebViewOptions {
+                        profile: WebProfile::Named("zgx-late-isolated-fixture".into()),
+                        ..Default::default()
+                    },
+                )
+            });
             let download_path =
                 std::env::temp_dir().join(format!("zgx-cef-download-{}.txt", std::process::id()));
             let _ = fs::remove_file(&download_path);
@@ -369,7 +401,91 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 subscription
             });
             let eval_done = Arc::new(AtomicBool::new(false));
-            if site_data_test {
+            if late_load_test {
+                let pages = [
+                    web.clone(),
+                    late_shared.clone().expect("late shared page exists"),
+                    late_isolated.clone().expect("late isolated page exists"),
+                ];
+                let result_path = late_load_result_path
+                    .clone()
+                    .expect("late-load test has a result path");
+                let window = cx.window.clone();
+                cx.tasks.spawn(async move {
+                    // Exercise three browsers created together, including two
+                    // pages sharing a named context and one isolated context.
+                    zgx::timer::sleep(std::time::Duration::from_millis(300)).await;
+                    for page in &pages {
+                        page.load_url(format!("{origin}/site-data"));
+                    }
+                    for _ in 0..120 {
+                        if pages.iter().all(|page| page.title() == "site-data") {
+                            break;
+                        }
+                        zgx::timer::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                    if let Ok(mut result) = fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&result_path)
+                    {
+                        for page in &pages {
+                            let _ = writeln!(
+                                result,
+                                "ATTACHED:{}",
+                                page.is_attached()
+                            );
+                        }
+                        for page in &pages {
+                            let _ = writeln!(result, "TITLE:{:?}", page.title());
+                        }
+                    }
+                    let remaining = Arc::new(AtomicUsize::new(pages.len()));
+                    let all_ok = Arc::new(AtomicBool::new(true));
+                    for page in pages {
+                        let remaining = remaining.clone();
+                        let all_ok = all_ok.clone();
+                        let result_path = result_path.clone();
+                        let window = window.clone();
+                        // Keep the controller alive until its asynchronous
+                        // DevTools reply arrives; this also makes early-drop
+                        // lifecycle failures visible rather than racy.
+                        let keep_alive = page.clone();
+                        page.evaluate_js("document.title", move |title| {
+                            let _keep_alive = keep_alive;
+                            let matches = title.as_deref() == Ok("\"site-data\"");
+                            if let Ok(mut result) = fs::OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open(&result_path)
+                            {
+                                let _ = writeln!(result, "EVAL:{title:?}:matches={matches}");
+                            }
+                            if !matches {
+                                all_ok.store(false, Ordering::Release);
+                            }
+                            if remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
+                                if let Ok(mut result) = fs::OpenOptions::new()
+                                    .create(true)
+                                    .append(true)
+                                    .open(result_path)
+                                {
+                                    let _ = writeln!(
+                                        result,
+                                        "STATUS:{}",
+                                        if all_ok.load(Ordering::Acquire) {
+                                            "PASS"
+                                        } else {
+                                            "FAIL"
+                                        }
+                                    );
+                                }
+                                window.close();
+                            }
+                        });
+                    }
+                });
+            } else if site_data_test {
                 let site_web = web.clone();
                 let site_origin = origin.clone();
                 let result_path = site_data_result_path
@@ -510,6 +626,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .w_full()
                     .h_full(),
                 );
+            let app = if late_load_test {
+                row()
+                    .w_full()
+                    .h_full()
+                    .child(zgx::web_view::web_view(&web).grow())
+                    .child(zgx::web_view::web_view(late_shared.as_ref().unwrap()).grow())
+                    .child(zgx::web_view::web_view(late_isolated.as_ref().unwrap()).grow())
+            } else {
+                app
+            };
             let app = if event_subscription.is_some() {
                 app.on_mount(move |handle| {
                     if let Some(subscription) = event_subscription {

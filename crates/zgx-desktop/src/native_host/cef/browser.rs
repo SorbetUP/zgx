@@ -65,11 +65,17 @@ wrap_dev_tools_message_observer! {
         ) {
             let evaluation = self.evaluations.borrow_mut().remove(&message_id);
             if let Some(reply) = evaluation {
-                reply(parse_evaluation_result(success, result));
+                let result = parse_evaluation_result(success, result);
+                // CEF can invoke this observer while its DevTools observer
+                // list is being traversed. User callbacks may close a window
+                // (and drop this registration), so deliver them at ZGX's next
+                // safe point instead of re-entering CEF here.
+                zgx::native_view::post(move || reply(result));
             } else {
                 let site_data = self.site_data.borrow_mut().remove(&message_id);
                 if let Some(reply) = site_data {
-                    reply(parse_site_data_result(success, result));
+                    let result = parse_site_data_result(success, result);
+                    zgx::native_view::post(move || reply(result));
                 }
             }
         }
@@ -235,21 +241,29 @@ fn close_after_releasing_slot<T: Clone>(slot: &RefCell<Option<T>>, close: impl F
 }
 
 fn fail_pending(page: &Page, reason: &str) {
-    for command in std::mem::take(&mut *page.pending.borrow_mut()) {
-        if let WebViewCommand::Evaluate {
-            reply: Some(reply), ..
-        } = command
-        {
-            reply(Err(reason.to_owned()));
+    let commands = std::mem::take(&mut *page.pending.borrow_mut());
+    let evaluations = std::mem::take(&mut *page.evaluations.borrow_mut());
+    let site_data = std::mem::take(&mut *page.site_data.borrow_mut());
+    if commands.is_empty() && evaluations.is_empty() && site_data.is_empty() {
+        return;
+    }
+    let reason = reason.to_owned();
+    zgx::native_view::post(move || {
+        for command in commands {
+            if let WebViewCommand::Evaluate {
+                reply: Some(reply), ..
+            } = command
+            {
+                reply(Err(reason.clone()));
+            }
         }
-    }
-    let pending = std::mem::take(&mut *page.evaluations.borrow_mut());
-    for (_, reply) in pending {
-        reply(Err(reason.to_owned()));
-    }
-    for (_, reply) in std::mem::take(&mut *page.site_data.borrow_mut()) {
-        reply(Err(reason.to_owned()));
-    }
+        for (_, reply) in evaluations {
+            reply(Err(reason.clone()));
+        }
+        for (_, reply) in site_data {
+            reply(Err(reason.clone()));
+        }
+    });
 }
 
 fn apply(page: &Page, browser: &Browser, command: WebViewCommand) {
