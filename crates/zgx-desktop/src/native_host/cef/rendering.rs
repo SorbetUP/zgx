@@ -26,6 +26,27 @@ pub(super) struct PopupFrame {
 
 pub(super) type SharedPopup = Arc<Mutex<PopupFrame>>;
 
+/// Release the CPU-side copies as soon as CEF confirms that a browser is
+/// closed. A viewport may briefly outlive its browser while ZGX tears down the
+/// scene, so dropping only the browser handle is not enough to release these
+/// potentially large allocations promptly.
+pub(super) fn release_frame_buffers(frame: &SharedFrame, popup: &SharedPopup) {
+    if let Ok(mut frame) = frame.lock() {
+        frame.width = 0;
+        frame.height = 0;
+        frame.pixels = Vec::new();
+        frame.consumed = frame.revision;
+    }
+    if let Ok(mut popup) = popup.lock() {
+        popup.frame.width = 0;
+        popup.frame.height = 0;
+        popup.frame.pixels = Vec::new();
+        popup.frame.consumed = popup.frame.revision;
+        popup.rect = (0, 0, 0, 0);
+        popup.visible = false;
+    }
+}
+
 pub(super) struct Painter {
     pub frame: SharedFrame,
     pub popup: SharedPopup,
@@ -388,6 +409,44 @@ impl Blit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn closing_browser_releases_view_and_popup_cpu_frames() {
+        let frame = Arc::new(Mutex::new(Frame {
+            width: 32,
+            height: 32,
+            pixels: vec![255; 32 * 32 * 4],
+            revision: 4,
+            consumed: 3,
+        }));
+        let popup = Arc::new(Mutex::new(PopupFrame {
+            frame: Frame {
+                width: 8,
+                height: 8,
+                pixels: vec![127; 8 * 8 * 4],
+                revision: 2,
+                consumed: 1,
+            },
+            rect: (10, 12, 8, 8),
+            visible: true,
+        }));
+
+        release_frame_buffers(&frame, &popup);
+
+        let frame = frame.lock().unwrap();
+        assert_eq!((frame.width, frame.height), (0, 0));
+        assert!(frame.pixels.is_empty());
+        assert_eq!(frame.pixels.capacity(), 0);
+        assert_eq!(frame.consumed, frame.revision);
+
+        let popup = popup.lock().unwrap();
+        assert_eq!((popup.frame.width, popup.frame.height), (0, 0));
+        assert!(popup.frame.pixels.is_empty());
+        assert_eq!(popup.frame.pixels.capacity(), 0);
+        assert_eq!(popup.rect, (0, 0, 0, 0));
+        assert!(!popup.visible);
+        assert_eq!(popup.frame.consumed, popup.frame.revision);
+    }
 
     #[test]
     fn painter_composes_cef_bgra_pixels_into_the_zgx_target() {

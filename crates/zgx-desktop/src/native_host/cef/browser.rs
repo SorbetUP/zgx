@@ -17,7 +17,7 @@ use zgx::{
 
 use super::{
     client::{self, BrowserCallbacks},
-    rendering::{Painter, SharedFrame, SharedPopup},
+    rendering::{Painter, SharedFrame, SharedPopup, release_frame_buffers},
     runtime,
 };
 
@@ -601,6 +601,8 @@ pub(super) fn backend(
     let weak = Rc::downgrade(&page);
     let created_weak = weak.clone();
     let closed_weak = weak;
+    let closed_frame = page.frame.clone();
+    let closed_popup = page.popup.clone();
     let navigation_weak = Rc::downgrade(&page);
     let creation_id = runtime::browser_creation_started();
     page.creation_id.set(Some(creation_id));
@@ -680,6 +682,7 @@ pub(super) fn backend(
         before_close: Rc::new(move |identifier| {
             super::cef_trace!(&format!("BEFORE_CLOSE_CALLBACK browser={identifier}"));
             runtime::browser_closed(identifier);
+            release_frame_buffers(&closed_frame, &closed_popup);
             if let Some(page) = closed_weak.upgrade() {
                 page.lifecycle.set(BrowserLifecycle::Closed);
                 fail_pending(&page, "CEF browser closed before the operation completed");
