@@ -1021,6 +1021,7 @@ impl Page {
 
 fn input(page: &Page, event: &mut zgx::input::EventContext) {
     let input_event = &event.event;
+    let physical_key = event.key_code().map(str::to_owned);
     let Some(browser) = page.browser.borrow().as_ref().cloned() else {
         return;
     };
@@ -1340,6 +1341,8 @@ fn input(page: &Page, event: &mut zgx::input::EventContext) {
                     type_: KeyEventType::RAWKEYDOWN,
                     modifiers: cef_modifiers(modifiers),
                     windows_key_code: code,
+                    native_key_code: cef_native_key_code(&key, physical_key.as_deref())
+                        .unwrap_or_default(),
                     ..Default::default()
                 }));
             }
@@ -1351,6 +1354,8 @@ fn input(page: &Page, event: &mut zgx::input::EventContext) {
                     type_: KeyEventType::KEYUP,
                     modifiers: cef_modifiers(modifiers),
                     windows_key_code: code,
+                    native_key_code: cef_native_key_code(&key, physical_key.as_deref())
+                        .unwrap_or_default(),
                     ..Default::default()
                 }));
             }
@@ -1558,6 +1563,163 @@ fn cef_key_code(key: &Key) -> Option<i32> {
     })
 }
 
+fn cef_native_key_code(key: &Key, physical_key: Option<&str>) -> Option<i32> {
+    #[cfg(target_os = "macos")]
+    {
+        let code = match key {
+            Key::Character(value) => {
+                physical_key.and_then(macos_physical_key_code).or_else(|| {
+                    match value.to_ascii_lowercase().as_str() {
+                        "a" => Some(0),
+                        "s" => Some(1),
+                        "d" => Some(2),
+                        "f" => Some(3),
+                        "h" => Some(4),
+                        "g" => Some(5),
+                        "z" => Some(6),
+                        "x" => Some(7),
+                        "c" => Some(8),
+                        "v" => Some(9),
+                        "b" => Some(11),
+                        "q" => Some(12),
+                        "w" => Some(13),
+                        "e" => Some(14),
+                        "r" => Some(15),
+                        "y" => Some(16),
+                        "t" => Some(17),
+                        "1" => Some(18),
+                        "2" => Some(19),
+                        "3" => Some(20),
+                        "4" => Some(21),
+                        "6" => Some(22),
+                        "5" => Some(23),
+                        "=" | "+" => Some(24),
+                        "9" => Some(25),
+                        "7" => Some(26),
+                        "-" | "_" => Some(27),
+                        "8" => Some(28),
+                        "0" => Some(29),
+                        "]" | "}" => Some(30),
+                        "o" => Some(31),
+                        "u" => Some(32),
+                        "[" | "{" => Some(33),
+                        "i" => Some(34),
+                        "p" => Some(35),
+                        "l" => Some(37),
+                        "j" => Some(38),
+                        "'" | "\"" => Some(39),
+                        "k" => Some(40),
+                        ";" | ":" => Some(41),
+                        "\\" | "|" => Some(42),
+                        "," | "<" => Some(43),
+                        "/" | "?" => Some(44),
+                        "n" => Some(45),
+                        "m" => Some(46),
+                        "." | ">" => Some(47),
+                        "`" | "~" => Some(50),
+                        _ => None,
+                    }
+                })?
+            }
+            Key::Enter => 36,
+            Key::Tab => 48,
+            Key::Space => 49,
+            Key::Backspace => 51,
+            Key::Escape => 53,
+            Key::ArrowLeft => 123,
+            Key::ArrowRight => 124,
+            Key::ArrowDown => 125,
+            Key::ArrowUp => 126,
+            Key::Home => 115,
+            Key::End => 119,
+            Key::PageUp => 116,
+            Key::PageDown => 121,
+            Key::Delete => 117,
+            Key::Function(1) => 122,
+            Key::Function(2) => 120,
+            Key::Function(3) => 99,
+            Key::Function(4) => 118,
+            Key::Function(5) => 96,
+            Key::Function(6) => 97,
+            Key::Function(7) => 98,
+            Key::Function(8) => 100,
+            Key::Function(9) => 101,
+            Key::Function(10) => 109,
+            Key::Function(11) => 103,
+            Key::Function(12) => 111,
+            Key::Function(13) => 105,
+            Key::Function(14) => 107,
+            Key::Function(15) => 113,
+            Key::Function(16) => 106,
+            Key::Function(17) => 64,
+            Key::Function(18) => 79,
+            Key::Function(19) => 80,
+            Key::Function(20) => 90,
+            _ => return None,
+        };
+        Some(code)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (key, physical_key);
+        None
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_physical_key_code(code: &str) -> Option<i32> {
+    Some(match code {
+        "KeyA" => 0,
+        "KeyS" => 1,
+        "KeyD" => 2,
+        "KeyF" => 3,
+        "KeyH" => 4,
+        "KeyG" => 5,
+        "KeyZ" => 6,
+        "KeyX" => 7,
+        "KeyC" => 8,
+        "KeyV" => 9,
+        "KeyB" => 11,
+        "KeyQ" => 12,
+        "KeyW" => 13,
+        "KeyE" => 14,
+        "KeyR" => 15,
+        "KeyY" => 16,
+        "KeyT" => 17,
+        "Digit1" => 18,
+        "Digit2" => 19,
+        "Digit3" => 20,
+        "Digit4" => 21,
+        "Digit6" => 22,
+        "Digit5" => 23,
+        "Equal" => 24,
+        "Digit9" => 25,
+        "Digit7" => 26,
+        "Minus" => 27,
+        "Digit8" => 28,
+        "Digit0" => 29,
+        "BracketRight" => 30,
+        "KeyO" => 31,
+        "KeyU" => 32,
+        "BracketLeft" => 33,
+        "KeyI" => 34,
+        "KeyP" => 35,
+        "KeyL" => 37,
+        "KeyJ" => 38,
+        "Quote" => 39,
+        "KeyK" => 40,
+        "Semicolon" => 41,
+        "Backslash" => 42,
+        "Comma" => 43,
+        "Slash" => 44,
+        "KeyN" => 45,
+        "KeyM" => 46,
+        "Period" => 47,
+        "Backquote" => 50,
+        _ => return None,
+    })
+}
+
 fn cef_modifiers(modifiers: Modifiers) -> u32 {
     let mut flags = 0;
     if modifiers.shift {
@@ -1702,8 +1864,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        cef_key_code, cef_modifiers, click_count, close_after_releasing_slot, local_to_window,
-        page_drag_fields, text_key_events, utf16_offset, window_to_local,
+        cef_key_code, cef_modifiers, cef_native_key_code, click_count, close_after_releasing_slot,
+        local_to_window, page_drag_fields, text_key_events, utf16_offset, window_to_local,
     };
     use cef::KeyEventType;
     use zgx::input::{Key, Modifiers};
@@ -1716,6 +1878,36 @@ mod tests {
         assert_eq!(cef_key_code(&Key::Enter), Some(0x0d));
         assert_eq!(cef_key_code(&Key::Function(12)), Some(0x7b));
         assert_eq!(cef_key_code(&Key::Function(25)), None);
+    }
+
+    #[test]
+    fn macos_shortcut_keys_include_native_virtual_key_codes() {
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(
+                cef_native_key_code(&Key::Character("c".into()), Some("KeyC")),
+                Some(8)
+            );
+            assert_eq!(
+                cef_native_key_code(&Key::Character("V".into()), Some("KeyV")),
+                Some(9)
+            );
+            assert_eq!(
+                cef_native_key_code(&Key::Character("é".into()), Some("KeyE")),
+                Some(14)
+            );
+            assert_eq!(cef_native_key_code(&Key::Enter, Some("Enter")), Some(36));
+            assert_eq!(
+                cef_native_key_code(&Key::ArrowLeft, Some("ArrowLeft")),
+                Some(123)
+            );
+            assert_eq!(cef_native_key_code(&Key::Character("é".into()), None), None);
+        }
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(
+            cef_native_key_code(&Key::Character("c".into()), Some("KeyC")),
+            None
+        );
     }
 
     #[test]
