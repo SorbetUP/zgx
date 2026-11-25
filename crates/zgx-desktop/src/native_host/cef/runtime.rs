@@ -284,6 +284,7 @@ fn mock_keychain_requested(mut present: impl FnMut(&str) -> bool) -> bool {
         "ZGX_CEF_INPUT_RESULT",
         "ZGX_CEF_SITE_DATA_RESULT",
         "ZGX_CEF_LATE_LOAD_RESULT",
+        "ZGX_CEF_CLOSE_RACE_RESULT",
     ]
     .iter()
     .any(|name| present(name))
@@ -508,6 +509,7 @@ mod tests {
             "ZGX_CEF_INPUT_RESULT",
             "ZGX_CEF_SITE_DATA_RESULT",
             "ZGX_CEF_LATE_LOAD_RESULT",
+            "ZGX_CEF_CLOSE_RACE_RESULT",
         ] {
             assert!(mock_keychain_requested(|name| name == fixture), "{fixture}");
         }

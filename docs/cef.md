@@ -20,6 +20,11 @@ directory. It does not need access to the developer's login keychain, so its
 launch should not require entering the keychain password. This only applies to
 the fixture executable; production Polyscale does not set the switch.
 
+To exercise closing a controller while its browser is still being created,
+set `ZGX_CEF_CLOSE_RACE_RESULT` to a result-file path before launching the
+fixture. The fixture closes the page at mount and writes `PASS` only after the
+desktop event loop finishes its normal CEF shutdown.
+
 Production CEF retains Chromium's normal macOS Safe Storage behavior for
 persistent browser data. macOS may ask once whether the signed app may access
 Chromium's encryption key; this is required for encrypted persistent storage.

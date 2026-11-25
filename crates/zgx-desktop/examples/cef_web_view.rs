@@ -250,8 +250,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let late_load_result_path =
         std::env::var_os("ZGX_CEF_LATE_LOAD_RESULT").map(std::path::PathBuf::from);
     let late_load_test = late_load_result_path.is_some();
-    let automated =
-        download_test || input_test || event_test || eval_test || site_data_test || late_load_test;
+    let close_race_result_path =
+        std::env::var_os("ZGX_CEF_CLOSE_RACE_RESULT").map(std::path::PathBuf::from);
+    let close_race_test = close_race_result_path.is_some();
+    let automated = download_test
+        || input_test
+        || event_test
+        || eval_test
+        || site_data_test
+        || late_load_test
+        || close_race_test;
     if let Some(result_path) = download_result_path.as_ref() {
         fs::write(result_path, format!("START:auto={automated}\n"))?;
     }
@@ -265,6 +273,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         fs::write(result_path, "START\n")?;
     }
     if let Some(result_path) = site_data_result_path.as_ref() {
+        fs::write(result_path, "START\n")?;
+    }
+    if let Some(result_path) = close_race_result_path.as_ref() {
         fs::write(result_path, "START\n")?;
     }
     let origin = start_fixture_server(download_test, site_data_test || late_load_test)?;
@@ -287,7 +298,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let profile = if late_load_test {
                 WebProfile::Named("zgx-late-load-fixture".into())
             } else {
-                WebProfile::Default
+                WebProfile::Ephemeral
             };
             let web = WebView::new(
                 &cx.ui.runtime,
@@ -525,6 +536,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         });
                     }
                 });
+            } else if close_race_test {
+                // The mount callback below closes this page before the CEF
+                // creation callback is allowed to return to the message pump.
             } else if site_data_test {
                 let site_web = web.clone();
                 let site_origin = origin.clone();
@@ -765,7 +779,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         download_window.close();
                     }
                 });
-            } else {
+            } else if !close_race_test {
                 let fixture = FIXTURE.to_owned();
                 web.load_html(&fixture, Some(&origin));
             }
@@ -799,7 +813,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .w_full()
                     .h_full(),
                 );
-            let app = if late_load_test {
+            let app = if close_race_test {
+                let page = web.clone();
+                let window = cx.window.clone();
+                zgx::web_view::web_view(&web)
+                    .grow()
+                    .w_full()
+                    .h_full()
+                    .on_mount(move |_| {
+                        page.close();
+                        window.close();
+                    })
+            } else if late_load_test {
                 row()
                     .w_full()
                     .h_full()
@@ -825,6 +850,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             let _view = cx.render(app);
         });
+    if let Some(result_path) = close_race_result_path {
+        fs::write(
+            result_path,
+            if run_result.is_ok() { "PASS" } else { "FAIL" },
+        )?;
+    }
     let _ = fs::remove_dir_all(fixture_data_dir);
     run_result?;
     Ok(())
