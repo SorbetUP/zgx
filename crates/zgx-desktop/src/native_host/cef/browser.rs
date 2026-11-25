@@ -487,16 +487,11 @@ fn apply(page: &Page, browser: &Browser, command: WebViewCommand) {
             }
         }
         WebViewCommand::OpenDevtools => {
-            if let Some(host) = browser.host() {
-                let info = WindowInfo {
-                    windowless_rendering_enabled: 1,
-                    ..Default::default()
-                };
-                let settings = BrowserSettings::default();
-                // DevTools requires a host window in CEF OSR; report no
-                // false success until the desktop overlay is implemented.
-                let _ = (host, info, settings);
-            }
+            // CEF OSR needs a separate host surface for the DevTools browser.
+            // ZGX has no inspector window attached to this page yet, so make
+            // the unsupported command visible instead of silently pretending
+            // that an inspector opened.
+            eprintln!("CEF DevTools are unavailable: no inspector host surface is attached");
         }
         WebViewCommand::SetZoom(zoom) => {
             if let Some(host) = browser.host() {
