@@ -68,9 +68,6 @@ pub(crate) fn schedule_work(delay_ms: i64) {
 pub(crate) fn trace_close_race(message: &str) {
     runtime::trace_close_race_impl(message);
 }
-#[cfg(not(debug_assertions))]
-#[inline(always)]
-pub(crate) fn trace_close_race(_: &str) {}
 pub(crate) fn has_browsers() -> bool {
     runtime::has_browsers()
 }

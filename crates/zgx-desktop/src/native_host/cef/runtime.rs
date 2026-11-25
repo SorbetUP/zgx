@@ -768,7 +768,7 @@ pub(super) fn register_browser(browser: &Browser) -> Result<(), String> {
 /// `CloseBrowser` while `do_message_loop_work` is still creating the browser;
 /// keep the real browser tracked, then close it on the next ZGX event-loop
 /// turn, after the active CEF pump has returned.
-pub(super) fn defer_browser_close(browser: Browser, reason: &str) {
+pub(super) fn defer_browser_close(browser: Browser, _reason: &str) {
     let identifier = browser.identifier();
     let queued = RUNTIME.with(|runtime| {
         let mut runtime = runtime.borrow_mut();
@@ -782,8 +782,9 @@ pub(super) fn defer_browser_close(browser: Browser, reason: &str) {
         runtime.deferred_browser_closes.push_back(browser);
         true
     });
+    #[cfg(debug_assertions)]
     super::cef_trace!(&format!(
-        "CLOSE_REQUEST_DEFERRED reason={reason} browser={identifier} queued={queued}"
+        "CLOSE_REQUEST_DEFERRED reason={_reason} browser={identifier} queued={queued}"
     ));
     if queued {
         schedule_work(0);
@@ -806,11 +807,14 @@ pub(super) fn close_deferred_browsers() {
             .unwrap_or_default()
     });
     for browser in pending {
+        #[cfg(debug_assertions)]
         let identifier = browser.identifier();
+        #[cfg(debug_assertions)]
         super::cef_trace!(&format!("CLOSE_REQUEST_DISPATCHED browser={identifier}"));
         if let Some(host) = browser.host() {
             host.close_browser(1);
         } else {
+            #[cfg(debug_assertions)]
             super::cef_trace!(&format!("CLOSE_REQUEST_NO_HOST browser={identifier}"));
         }
     }
@@ -834,15 +838,18 @@ pub(super) fn begin_shutdown() {
         runtime.shutting_down = true;
         runtime.browsers.values().cloned().collect::<Vec<_>>()
     });
+    #[cfg(debug_assertions)]
     let (pending, browsers) = {
         let tracker = browsers()
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         (tracker.pending_creations.len(), tracker.open_ids.len())
     };
+    #[cfg(debug_assertions)]
     super::cef_trace!(&format!("SHUTDOWN_BEGIN pending={pending} open={browsers}"));
     for browser in open {
         if let Some(host) = browser.host() {
+            #[cfg(debug_assertions)]
             super::cef_trace!(&format!(
                 "SHUTDOWN_CLOSE_REQUEST browser={}",
                 browser.identifier()
