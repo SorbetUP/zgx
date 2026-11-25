@@ -13,6 +13,8 @@ use super::{
     runtime,
 };
 
+pub(super) type HtmlDocuments = Arc<Mutex<HashMap<String, Arc<Vec<u8>>>>>;
+
 pub(super) type FindReplies = Rc<RefCell<VecDeque<FindReply>>>;
 type FindReply = Box<dyn FnOnce(zgx::web_view::FindResult)>;
 
@@ -808,8 +810,181 @@ struct CEFPolicyHandlers {
     dialog: DialogHandler,
 }
 
+pub(super) fn normalize_document_url(url: &str) -> Option<String> {
+    let (scheme, rest) = url.split_once("://")?;
+    if scheme.is_empty()
+        || !scheme
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
+    {
+        return None;
+    }
+    let scheme = scheme.to_ascii_lowercase();
+    let without_fragment = rest.split('#').next()?;
+    if scheme == "file" {
+        return Some(format!("file://{without_fragment}"));
+    }
+    let path_start = without_fragment.find(['/', '?']);
+    let (authority, path) = match path_start {
+        Some(index) => (
+            &without_fragment[..index],
+            if without_fragment.as_bytes()[index] == b'?' {
+                format!("/{}", &without_fragment[index..])
+            } else {
+                without_fragment[index..].to_owned()
+            },
+        ),
+        None => (without_fragment, "/".to_owned()),
+    };
+    if authority.is_empty() || authority.bytes().any(|byte| byte.is_ascii_whitespace()) {
+        return None;
+    }
+    let (userinfo, host_port) = authority
+        .rsplit_once('@')
+        .map(|(userinfo, host)| (Some(userinfo), host))
+        .unwrap_or((None, authority));
+    let host_port = host_port.to_ascii_lowercase();
+    let default_port = match scheme.as_str() {
+        "http" => Some(":80"),
+        "https" => Some(":443"),
+        _ => None,
+    };
+    let host_port = default_port
+        .filter(|port| host_port.ends_with(port))
+        .map(|port| host_port[..host_port.len() - port.len()].to_owned())
+        .unwrap_or(host_port);
+    let authority = userinfo
+        .map(|userinfo| format!("{userinfo}@{host_port}"))
+        .unwrap_or(host_port);
+    Some(format!("{scheme}://{authority}{path}"))
+}
+
+fn next_document_chunk<'a>(body: &'a [u8], offset: &mut usize, limit: usize) -> &'a [u8] {
+    let start = (*offset).min(body.len());
+    let end = start.saturating_add(limit).min(body.len());
+    *offset = end;
+    &body[start..end]
+}
+
+wrap_request_handler! {
+    struct CEFRequestHandler { html_documents: HtmlDocuments }
+    impl RequestHandler {
+        fn resource_request_handler(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            request: Option<&mut Request>,
+            _is_navigation: i32,
+            _is_download: i32,
+            _request_initiator: Option<&CefString>,
+            _disable_default_handling: Option<&mut i32>,
+        ) -> Option<ResourceRequestHandler> {
+            let url = request.map(|request| CefString::from(&request.url()).to_string())?;
+            let url = normalize_document_url(&url)?;
+            if !self
+                .html_documents
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains_key(&url)
+            {
+                return None;
+            }
+            Some(CEFHTMLResourceRequestHandler::new(self.html_documents.clone()))
+        }
+    }
+}
+
+wrap_resource_request_handler! {
+    struct CEFHTMLResourceRequestHandler { html_documents: HtmlDocuments }
+    impl ResourceRequestHandler {
+        fn resource_handler(
+            &self,
+            _browser: Option<&mut Browser>,
+            frame: Option<&mut Frame>,
+            request: Option<&mut Request>,
+        ) -> Option<ResourceHandler> {
+            if !frame.is_some_and(|frame| frame.is_main() != 0) {
+                return None;
+            }
+            let url = request.map(|request| CefString::from(&request.url()).to_string())?;
+            let url = normalize_document_url(&url)?;
+            let body = self
+                .html_documents
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&url)
+                .cloned()?;
+            Some(CEFHTMLDocumentHandler::new(body, Arc::new(Mutex::new(0))))
+        }
+    }
+}
+
+wrap_resource_handler! {
+    struct CEFHTMLDocumentHandler { body: Arc<Vec<u8>>, offset: Arc<Mutex<usize>> }
+    impl ResourceHandler {
+        fn open(
+            &self,
+            _request: Option<&mut Request>,
+            handle_request: Option<&mut i32>,
+            _callback: Option<&mut Callback>,
+        ) -> i32 {
+            if let Some(handle_request) = handle_request {
+                *handle_request = 1;
+            }
+            1
+        }
+
+        fn response_headers(
+            &self,
+            response: Option<&mut Response>,
+            response_length: Option<&mut i64>,
+            _redirect_url: Option<&mut CefString>,
+        ) {
+            if let Some(response) = response {
+                response.set_status(200);
+                response.set_status_text(Some(&"OK".into()));
+                response.set_mime_type(Some(&"text/html".into()));
+                response.set_charset(Some(&"UTF-8".into()));
+                response.set_header_by_name(
+                    Some(&"Cache-Control".into()),
+                    Some(&"no-store".into()),
+                    1,
+                );
+            }
+            if let Some(response_length) = response_length {
+                *response_length = self.body.len() as i64;
+            }
+        }
+
+        fn read(
+            &self,
+            data_out: *mut u8,
+            bytes_to_read: i32,
+            bytes_read: Option<&mut i32>,
+            _callback: Option<&mut ResourceReadCallback>,
+        ) -> i32 {
+            if bytes_to_read <= 0 || data_out.is_null() {
+                return 0;
+            }
+            let Some(bytes_read) = bytes_read else { return 0 };
+            let mut offset = self.offset.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let chunk = next_document_chunk(&self.body, &mut offset, bytes_to_read as usize);
+            if chunk.is_empty() {
+                *bytes_read = 0;
+                return 0;
+            }
+            // CEF provides `data_out` with capacity for `bytes_to_read` bytes.
+            unsafe {
+                std::ptr::copy_nonoverlapping(chunk.as_ptr(), data_out, chunk.len());
+            }
+            *bytes_read = chunk.len() as i32;
+            1
+        }
+    }
+}
+
 wrap_client! {
-pub(super) struct CEFClient { render: RenderHandler, life: LifeSpanHandler, load: LoadHandler, download: DownloadHandler, display: DisplayHandler, audio: AudioHandler, policy: CEFPolicyHandlers, web: zgx::web_view::WeakWebView }
+pub(super) struct CEFClient { render: RenderHandler, life: LifeSpanHandler, load: LoadHandler, download: DownloadHandler, display: DisplayHandler, audio: AudioHandler, policy: CEFPolicyHandlers, request: RequestHandler, web: zgx::web_view::WeakWebView }
     impl Client {
         fn render_handler(&self) -> Option<RenderHandler> { Some(self.render.clone()) }
         fn life_span_handler(&self) -> Option<LifeSpanHandler> { Some(self.life.clone()) }
@@ -820,6 +995,7 @@ pub(super) struct CEFClient { render: RenderHandler, life: LifeSpanHandler, load
         fn find_handler(&self) -> Option<FindHandler> { Some(self.policy.find.clone()) }
         fn permission_handler(&self) -> Option<PermissionHandler> { Some(self.policy.permission.clone()) }
         fn dialog_handler(&self) -> Option<DialogHandler> { Some(self.policy.dialog.clone()) }
+        fn request_handler(&self) -> Option<RequestHandler> { Some(self.request.clone()) }
         fn on_process_message_received(
             &self,
             _browser: Option<&mut Browser>,
@@ -870,6 +1046,7 @@ pub(super) fn client(
     tasks: crate::TaskSpawner,
     windows: crate::WindowFactory,
     drag_start: Rc<dyn Fn(&DragData, i32, i32) -> bool>,
+    html_documents: HtmlDocuments,
 ) -> Client {
     let state = RenderState {
         frame,
@@ -913,6 +1090,7 @@ pub(super) fn client(
             permission,
             dialog,
         },
+        CEFRequestHandler::new(html_documents),
         web,
     )
 }
@@ -962,10 +1140,40 @@ mod tests {
     use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
     use super::{
-        DownloadUpdate, file_dialog_selection, is_user_cancelled_load, update_download_status,
+        DownloadUpdate, file_dialog_selection, is_user_cancelled_load, next_document_chunk,
+        normalize_document_url, update_download_status,
     };
     use cef::FileDialogMode;
     use zgx::web_view::DownloadStatus;
+
+    #[test]
+    fn html_document_reader_serves_bounded_chunks_and_finishes_at_eof() {
+        let body = b"abcdef";
+        let mut offset = 0;
+        assert_eq!(next_document_chunk(body, &mut offset, 2), b"ab");
+        assert_eq!(next_document_chunk(body, &mut offset, 3), b"cde");
+        assert_eq!(next_document_chunk(body, &mut offset, 8), b"f");
+        assert!(next_document_chunk(body, &mut offset, 8).is_empty());
+        assert_eq!(offset, body.len());
+    }
+
+    #[test]
+    fn html_document_url_keeps_the_base_origin_and_removes_only_fragment() {
+        assert_eq!(
+            normalize_document_url("HTTPS://Example.COM:443/app/page?mode=1#section"),
+            Some("https://example.com/app/page?mode=1".into())
+        );
+        assert_eq!(
+            normalize_document_url("http://127.0.0.1:43120"),
+            Some("http://127.0.0.1:43120/".into())
+        );
+        assert_eq!(
+            normalize_document_url("file:///tmp/example/page.html#section"),
+            Some("file:///tmp/example/page.html".into())
+        );
+        assert_eq!(normalize_document_url("data:text/html,hello"), None);
+        assert_eq!(normalize_document_url("https:///missing-host"), None);
+    }
 
     #[test]
     fn download_progress_and_completion_reach_the_registered_handler_once() {

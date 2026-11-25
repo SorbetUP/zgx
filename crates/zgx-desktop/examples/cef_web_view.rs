@@ -275,6 +275,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let event_test = event_result_path.is_some();
     let eval_result_path = std::env::var_os("ZGX_CEF_EVAL_RESULT").map(std::path::PathBuf::from);
     let eval_test = eval_result_path.is_some();
+    let html_base_result_path =
+        std::env::var_os("ZGX_CEF_HTML_BASE_RESULT").map(std::path::PathBuf::from);
+    let html_base_test = html_base_result_path.is_some();
     let site_data_result_path =
         std::env::var_os("ZGX_CEF_SITE_DATA_RESULT").map(std::path::PathBuf::from);
     let site_data_test = site_data_result_path.is_some();
@@ -293,6 +296,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         || input_test
         || event_test
         || eval_test
+        || html_base_test
         || site_data_test
         || late_load_test
         || close_race_test
@@ -308,6 +312,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         fs::write(result_path, "START\n")?;
     }
     if let Some(result_path) = eval_result_path.as_ref() {
+        fs::write(result_path, "START\n")?;
+    }
+    if let Some(result_path) = html_base_result_path.as_ref() {
         fs::write(result_path, "START\n")?;
     }
     if let Some(result_path) = site_data_result_path.as_ref() {
@@ -864,6 +871,54 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         window.close();
                     }
                 });
+            } else if html_base_test {
+                let expected_origin = origin.clone();
+                let result_path = html_base_result_path
+                    .clone()
+                    .expect("HTML base test has a result path");
+                let window = cx.window.clone();
+                let page = web.clone();
+                let timeout_path = result_path.clone();
+                let timeout_window = window.clone();
+                web.load_html(
+                    "<!doctype html><meta charset=utf-8><title>HTML base origin</title><p id=fixture>served by CEF</p>",
+                    Some(&origin),
+                );
+                cx.tasks.spawn(async move {
+                    let mut ready = false;
+                    for _ in 0..200 {
+                        if page.title() == "HTML base origin"
+                            && !page.state().with_untracked(|state| state.loading)
+                        {
+                            ready = true;
+                            break;
+                        }
+                        zgx::timer::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                    if !ready {
+                        let _ = fs::write(&timeout_path, "FAIL:base-document-not-served");
+                        timeout_window.close();
+                        return;
+                    }
+                    let eval_result_path = result_path.clone();
+                    let eval_window = window.clone();
+                    page.evaluate_js("location.origin", move |result| {
+                        let expected = serde_json::to_string(&expected_origin).unwrap();
+                        let passed = result.as_deref() == Ok(expected.as_str());
+                        let status = if passed {
+                            "PASS".to_owned()
+                        } else {
+                            format!("FAIL:origin:{result:?}:expected:{expected}")
+                        };
+                        let _ = fs::write(eval_result_path, status);
+                        eval_window.close();
+                    });
+                    zgx::timer::sleep(std::time::Duration::from_secs(10)).await;
+                    if fs::read_to_string(&result_path).is_ok_and(|status| status == "START\n") {
+                        let _ = fs::write(result_path, "TIMEOUT:origin-evaluation");
+                        window.close();
+                    }
+                });
             } else if input_test {
                 web.load_url(origin);
                 let input_page = web.clone();
@@ -1051,7 +1106,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .child(zgx::web_view::web_view(&web).grow())
                     .child(zgx::web_view::web_view(late_shared.as_ref().unwrap()).grow())
                     .child(zgx::web_view::web_view(late_isolated.as_ref().unwrap()).grow())
-            } else if download_test || input_test || popup_test {
+            } else if download_test || input_test || popup_test || html_base_test {
                 zgx::web_view::web_view(&web)
                     .grow()
                     .w_full()

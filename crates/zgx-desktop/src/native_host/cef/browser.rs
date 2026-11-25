@@ -35,6 +35,7 @@ pub(super) struct Page {
     web: zgx::web_view::WeakWebView,
     permissions: runtime::PermissionStoreHandle,
     browser: Rc<RefCell<Option<Browser>>>,
+    html_documents: client::HtmlDocuments,
     pending: RefCell<Vec<WebViewCommand>>,
     evaluations: Rc<RefCell<HashMap<i32, (u64, EvaluationReply)>>>,
     navigation_generation: Rc<Cell<u64>>,
@@ -406,23 +407,38 @@ fn start_clear_site_data(page: &Page, browser: &Browser, url: &str, done: SiteDa
 fn apply(page: &Page, browser: &Browser, command: WebViewCommand) {
     match command {
         WebViewCommand::LoadUrl(url) => {
+            page.html_documents
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clear();
             let frame = browser.main_frame();
             if let Some(frame) = frame {
                 frame.load_url(Some(&url.as_str().into()));
             }
         }
         WebViewCommand::LoadHtml { html, base_url } => {
-            // A data URL keeps this first backend independent of a local HTTP
-            // server; relative links use the optional base through a <base>.
-            let document = if let Some(base) = base_url {
-                format!("<base href=\"{}\">{}", escape_attr(&base), html)
-            } else {
-                html
-            };
-            let url = format!("data:text/html;charset=utf-8,{}", percent_encode(&document));
             let frame = browser.main_frame();
-            if let Some(frame) = frame {
-                frame.load_url(Some(&url.as_str().into()));
+            if let Some(base) = base_url
+                && let Some(document_url) = client::normalize_document_url(&base)
+            {
+                let mut documents = page
+                    .html_documents
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                documents.clear();
+                documents.insert(document_url, Arc::new(html.into_bytes()));
+                if let Some(frame) = frame {
+                    frame.load_url(Some(&base.as_str().into()));
+                }
+            } else {
+                page.html_documents
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clear();
+                let url = format!("data:text/html;charset=utf-8,{}", percent_encode(&html));
+                if let Some(frame) = frame {
+                    frame.load_url(Some(&url.as_str().into()));
+                }
             }
         }
         WebViewCommand::Reload => browser.reload(),
@@ -537,6 +553,7 @@ pub(super) fn backend(
         web: web.downgrade(),
         permissions: permissions.clone(),
         browser: browser.clone(),
+        html_documents: Arc::new(Mutex::new(HashMap::new())),
         pending: RefCell::new(Vec::new()),
         evaluations: Rc::new(RefCell::new(HashMap::new())),
         navigation_generation: Rc::new(Cell::new(0)),
@@ -669,6 +686,7 @@ pub(super) fn backend(
         tasks,
         windows,
         drag_start,
+        page.html_documents.clone(),
     );
     let info = WindowInfo {
         windowless_rendering_enabled: 1,
@@ -735,6 +753,7 @@ pub(super) fn prepare_popup(
         web: web.clone(),
         permissions: permissions.clone(),
         browser: browser.clone(),
+        html_documents: Arc::new(Mutex::new(HashMap::new())),
         pending: RefCell::new(Vec::new()),
         evaluations: Rc::new(RefCell::new(HashMap::new())),
         navigation_generation: Rc::new(Cell::new(0)),
@@ -865,6 +884,7 @@ pub(super) fn prepare_popup(
         tasks,
         windows.clone(),
         drag_start,
+        page.html_documents.clone(),
     );
     let content = view(page.clone());
     let window = windows.open(
@@ -1737,12 +1757,6 @@ fn cef_modifiers(modifiers: Modifiers) -> u32 {
     flags
 }
 
-fn escape_attr(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('"', "&quot;")
-        .replace('<', "&lt;")
-}
 fn percent_encode(value: &str) -> String {
     let mut out = String::new();
     for byte in value.bytes() {
