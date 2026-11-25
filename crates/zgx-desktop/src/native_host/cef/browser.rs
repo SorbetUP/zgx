@@ -323,6 +323,15 @@ fn fail_pending(page: &Page, reason: &str) {
     });
 }
 
+fn cancel_pending_evaluations(
+    evaluations: &Rc<RefCell<HashMap<i32, (u64, EvaluationReply)>>>,
+) -> Vec<EvaluationReply> {
+    std::mem::take(&mut *evaluations.borrow_mut())
+        .into_values()
+        .map(|(_, reply)| reply)
+        .collect()
+}
+
 fn start_clear_site_data(page: &Page, browser: &Browser, url: &str, done: SiteDataReply) {
     let Some(host) = browser.host() else {
         done(Err("CEF browser host is not available".into()));
@@ -518,11 +527,28 @@ pub(super) fn backend(web: &WebView) -> Result<Rc<Page>, String> {
     let weak = Rc::downgrade(&page);
     let created_weak = weak.clone();
     let closed_weak = weak;
+    let navigation_weak = Rc::downgrade(&page);
     let callbacks = BrowserCallbacks {
         find_replies: page.find_replies.clone(),
         web: web.downgrade(),
         new_windows: web.options().new_windows,
-        navigation_generation: page.navigation_generation.clone(),
+        navigation_started: Rc::new(move || {
+            let Some(page) = navigation_weak.upgrade() else {
+                return;
+            };
+            page.navigation_generation
+                .set(page.navigation_generation.get().wrapping_add(1));
+            let replies = cancel_pending_evaluations(&page.evaluations);
+            if !replies.is_empty() {
+                zgx::native_view::post(move || {
+                    for reply in replies {
+                        reply(Err(
+                            "JavaScript evaluation was superseded by a navigation".into()
+                        ));
+                    }
+                });
+            }
+        }),
         created: Rc::new(move |browser| {
             runtime::browser_created(browser.identifier());
             if runtime::register_browser(&browser).is_err() {
@@ -911,7 +937,11 @@ fn percent_encode(value: &str) -> String {
 
 #[cfg(test)]
 mod evaluation_tests {
-    use super::{parse_evaluation_for_generation, parse_evaluation_result, parse_site_data_result};
+    use super::{
+        EvaluationReply, cancel_pending_evaluations, parse_evaluation_for_generation,
+        parse_evaluation_result, parse_site_data_result,
+    };
+    use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
     #[test]
     fn devtools_values_are_returned_as_json() {
@@ -972,6 +1002,30 @@ mod evaluation_tests {
             ),
             Ok("42".into())
         );
+    }
+
+    #[test]
+    fn navigation_cancels_all_pending_evaluations_once() {
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let mut evaluations: HashMap<i32, (u64, EvaluationReply)> = HashMap::new();
+        for id in [7, 8] {
+            let seen = seen.clone();
+            evaluations.insert(
+                id,
+                (2, Box::new(move |result| seen.borrow_mut().push(result))),
+            );
+        }
+        let evaluations = Rc::new(RefCell::new(evaluations));
+        let replies = cancel_pending_evaluations(&evaluations);
+        assert!(evaluations.borrow().is_empty());
+        assert_eq!(replies.len(), 2);
+        for reply in replies {
+            reply(Err(
+                "JavaScript evaluation was superseded by a navigation".into()
+            ));
+        }
+        assert_eq!(seen.borrow().len(), 2);
+        assert!(seen.borrow().iter().all(|result| result.is_err()));
     }
 
     #[test]

@@ -1,5 +1,5 @@
 use std::{
-    cell::{Cell, RefCell},
+    cell::RefCell,
     collections::{HashMap, VecDeque},
     rc::Rc,
     sync::{Arc, Mutex},
@@ -28,7 +28,7 @@ pub(super) struct BrowserCallbacks {
     pub find_replies: FindReplies,
     pub web: zgx::web_view::WeakWebView,
     pub new_windows: bool,
-    pub navigation_generation: Rc<Cell<u64>>,
+    pub navigation_started: Rc<dyn Fn()>,
 }
 
 wrap_download_handler! {
@@ -292,11 +292,11 @@ wrap_render_handler! {
 }
 
 wrap_load_handler! {
-    pub(super) struct CEFLoadHandler { web: zgx::web_view::WeakWebView, navigation_generation: Rc<Cell<u64>> }
+    pub(super) struct CEFLoadHandler { web: zgx::web_view::WeakWebView, navigation_started: Rc<dyn Fn()> }
     impl LoadHandler {
         fn on_load_start(&self, _browser: Option<&mut Browser>, frame: Option<&mut cef::Frame>, _transition: TransitionType) {
             let Some(frame) = frame.filter(|frame| frame.is_main() != 0) else { return };
-            self.navigation_generation.set(self.navigation_generation.get().wrapping_add(1));
+            (self.navigation_started)();
             let url = CefString::from(&frame.url()).to_string();
             let web = self.web.clone();
             zgx::native_view::post(move || {
@@ -569,9 +569,9 @@ pub(super) fn client(
     };
     let render = CEFRenderHandler::new(state);
     let find_replies = callbacks.find_replies.clone();
-    let navigation_generation = callbacks.navigation_generation.clone();
+    let navigation_started = callbacks.navigation_started.clone();
     let life = CEFLifeSpanHandler::new(callbacks);
-    let load = CEFLoadHandler::new(web.clone(), navigation_generation);
+    let load = CEFLoadHandler::new(web.clone(), navigation_started);
     let display = CEFDisplayHandler::new(web.clone());
     let download = CEFDownloadHandler::new(web.clone(), Rc::new(RefCell::new(HashMap::new())));
     let find = CEFFindHandler::new(find_replies);
