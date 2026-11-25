@@ -484,7 +484,7 @@ pub fn run_hosting(
         play_through(&host, cx);
         configure(&host);
         let _ = host.reload();
-        cx.tasks.spawn(host.watch(Duration::from_millis(250)));
+        run_in_debug_build(|| cx.tasks.spawn(host.watch(Duration::from_millis(250))));
         let menus_follow = serve_commands(&host, cx);
         // The script's windows (`ui.window`): each open while its state is.
         let windows_follow = follow_windows(&host, cx);
@@ -505,6 +505,15 @@ pub fn run_hosting(
         });
     })?;
     Ok(())
+}
+
+/// Keep file watching and automatic script reloads out of shipping builds.
+/// The initial `host.reload()` above still loads the app once in Release.
+#[inline]
+fn run_in_debug_build(start: impl FnOnce()) {
+    if cfg!(debug_assertions) {
+        start();
+    }
 }
 
 /// `host`'s scripts play through the application's engine
@@ -745,6 +754,14 @@ pub fn follow_windows(host: &ScriptHost, cx: &zgx_desktop::WindowContext) -> zgx
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn script_file_watcher_matches_the_build_profile() {
+        let mut started = false;
+        run_in_debug_build(|| started = true);
+        assert_eq!(started, cfg!(debug_assertions));
+    }
+
     #[test]
     fn a_zgx_json_configures_the_window_and_rejects_what_it_does_not_know() {
         let dir = std::env::temp_dir().join(format!("zgx-run-config-{}", std::process::id()));
