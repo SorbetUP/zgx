@@ -46,6 +46,9 @@ pub(crate) fn execute_process_with_windows_context(
 pub(crate) fn set_scheduler(schedule: std::sync::Arc<dyn Fn(i64)>) {
     runtime::set_scheduler(schedule);
 }
+pub(crate) fn schedule_work(delay_ms: i64) {
+    runtime::schedule_work(delay_ms);
+}
 pub(crate) fn has_browsers() -> bool {
     runtime::has_browsers()
 }

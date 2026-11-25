@@ -183,7 +183,7 @@ impl Default for WindowOptions {
 enum Event {
     Quit,
     #[cfg(feature = "cef")]
-    CefMessagePump(std::time::Instant),
+    CefMessagePump(u64, std::time::Instant),
     /// An event, with the token of the launch that sent it (Linux).
     Application(crate::ApplicationEvent, Option<String>),
     MenuAction(u64, crate::MenuAction),
@@ -1173,16 +1173,21 @@ impl Application {
         #[cfg(feature = "cef")]
         let cef_deadline = Rc::new(Cell::new(None));
         #[cfg(feature = "cef")]
+        let cef_pump_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        #[cfg(feature = "cef")]
         let cef_quit_requested = Rc::new(Cell::new(false));
         #[cfg(feature = "cef")]
         {
             let pump_proxy = proxy.clone();
+            let generation = cef_pump_generation.clone();
             crate::native_host::cef::set_scheduler(Arc::new(move |delay_ms| {
-                let delay = std::time::Duration::from_millis(delay_ms.max(0) as u64);
+                let delay = cef_pump_delay(delay_ms);
                 let deadline = std::time::Instant::now() + delay;
-                // CEF may call this from any thread. Only send an event here;
-                // its deadline is merged on ZGX's UI thread below.
-                let _ = pump_proxy.send_event(Event::CefMessagePump(deadline));
+                // Each CEF request replaces the previous scheduled pump. The
+                // generation makes already queued timer events harmless when
+                // a newer request supersedes them before dispatch.
+                let sequence = generation.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
+                let _ = pump_proxy.send_event(Event::CefMessagePump(sequence, deadline));
             }));
         }
         let native_events = if let Some(id) = &self.application_id {
@@ -1288,6 +1293,8 @@ impl Application {
             timers,
             #[cfg(feature = "cef")]
             cef_deadline,
+            #[cfg(feature = "cef")]
+            cef_pump_generation,
             #[cfg(feature = "cef")]
             cef_quit_requested,
         };
@@ -7567,7 +7574,9 @@ struct WindowManager {
     error: Option<String>,
     timers: zgx::timer::Hosted,
     #[cfg(feature = "cef")]
-    cef_deadline: Rc<Cell<Option<std::time::Instant>>>,
+    cef_deadline: Rc<Cell<Option<(u64, std::time::Instant)>>>,
+    #[cfg(feature = "cef")]
+    cef_pump_generation: Arc<std::sync::atomic::AtomicU64>,
     #[cfg(feature = "cef")]
     cef_quit_requested: Rc<Cell<bool>>,
 }
@@ -8392,6 +8401,28 @@ impl WindowManager {
             host.suspend();
         }
     }
+    #[cfg(feature = "cef")]
+    fn cef_pump_request(&mut self, sequence: u64, deadline: std::time::Instant) {
+        use std::sync::atomic::Ordering;
+
+        let mut pending = self.cef_deadline.get();
+        let action = apply_cef_pump_request(
+            &mut pending,
+            sequence,
+            self.cef_pump_generation.load(Ordering::Acquire),
+            deadline,
+            std::time::Instant::now(),
+        );
+        self.cef_deadline.set(pending);
+        if !matches!(action, CefPumpAction::PumpNow) {
+            return;
+        }
+        // CEF's callback is opportunistic; it may not request another call.
+        // Set a bounded fallback before pumping so any callback made during
+        // the iteration can replace it without being overwritten afterward.
+        crate::native_host::cef::schedule_work(33);
+        crate::native_host::cef::pump();
+    }
     fn user_event_turn(&mut self, event_loop: &ActiveEventLoop, event: Event) {
         match event {
             Event::Quit => {
@@ -8408,24 +8439,8 @@ impl WindowManager {
                 event_loop.exit();
             }
             #[cfg(feature = "cef")]
-            Event::CefMessagePump(deadline) => {
-                let now = std::time::Instant::now();
-                if deadline <= now {
-                    if self
-                        .cef_deadline
-                        .get()
-                        .is_some_and(|pending| pending <= now)
-                    {
-                        self.cef_deadline.set(None);
-                    }
-                    crate::native_host::cef::pump();
-                } else if self
-                    .cef_deadline
-                    .get()
-                    .is_none_or(|pending| deadline < pending)
-                {
-                    self.cef_deadline.set(Some(deadline));
-                }
+            Event::CefMessagePump(sequence, deadline) => {
+                self.cef_pump_request(sequence, deadline);
             }
             #[cfg(feature = "audio")]
             Event::AudioVoicesEnded => crate::audio::voices_ended(),
@@ -8845,13 +8860,10 @@ impl WindowManager {
     }
     fn about_to_wait_turn(&mut self, event_loop: &ActiveEventLoop) {
         #[cfg(feature = "cef")]
-        if self
-            .cef_deadline
-            .get()
-            .is_some_and(|deadline| deadline <= std::time::Instant::now())
+        if let Some((sequence, deadline)) = self.cef_deadline.get()
+            && deadline <= std::time::Instant::now()
         {
-            self.cef_deadline.set(None);
-            crate::native_host::cef::pump();
+            self.cef_pump_request(sequence, deadline);
         }
         #[cfg(feature = "cef")]
         if self.cef_quit_requested.get() && !crate::native_host::cef::has_browsers() {
@@ -8899,7 +8911,7 @@ impl WindowManager {
             let deadline = earliest_deadline(self.timers.deadline(), {
                 #[cfg(feature = "cef")]
                 {
-                    self.cef_deadline.get()
+                    self.cef_deadline.get().map(|(_, deadline)| deadline)
                 }
                 #[cfg(not(feature = "cef"))]
                 {
@@ -9058,7 +9070,7 @@ impl WindowManager {
             .chain({
                 #[cfg(feature = "cef")]
                 {
-                    self.cef_deadline.get()
+                    self.cef_deadline.get().map(|(_, deadline)| deadline)
                 }
                 #[cfg(not(feature = "cef"))]
                 {
@@ -9088,6 +9100,45 @@ fn earliest_deadline(
     second: Option<std::time::Instant>,
 ) -> Option<std::time::Instant> {
     first.into_iter().chain(second).min()
+}
+
+#[cfg(feature = "cef")]
+const CEF_MAX_PUMP_INTERVAL_MS: i64 = 33;
+
+#[cfg(feature = "cef")]
+fn cef_pump_delay(delay_ms: i64) -> std::time::Duration {
+    std::time::Duration::from_millis(delay_ms.clamp(0, CEF_MAX_PUMP_INTERVAL_MS) as u64)
+}
+
+#[cfg(feature = "cef")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CefPumpAction {
+    Stale,
+    Scheduled,
+    PumpNow,
+}
+
+#[cfg(feature = "cef")]
+fn apply_cef_pump_request(
+    pending: &mut Option<(u64, std::time::Instant)>,
+    sequence: u64,
+    latest_sequence: u64,
+    deadline: std::time::Instant,
+    now: std::time::Instant,
+) -> CefPumpAction {
+    if sequence != latest_sequence {
+        if pending.is_some_and(|(active, _)| active == sequence) {
+            *pending = None;
+        }
+        return CefPumpAction::Stale;
+    }
+    if deadline > now {
+        *pending = Some((sequence, deadline));
+        CefPumpAction::Scheduled
+    } else {
+        *pending = None;
+        CefPumpAction::PumpNow
+    }
 }
 
 /// The event loop's turns, each contained (`WindowManager::contain`).
@@ -9968,6 +10019,45 @@ fn copy_or_cut_editor(
 #[cfg(test)]
 mod tests {
     use zgx::scene::Rect;
+
+    #[cfg(feature = "cef")]
+    #[test]
+    fn a_new_cef_pump_request_replaces_the_old_deadline() {
+        use super::{CefPumpAction, apply_cef_pump_request, cef_pump_delay};
+        use std::time::{Duration, Instant};
+
+        let now = Instant::now();
+        let mut pending = None;
+        let first = now + cef_pump_delay(250);
+        assert_eq!(
+            apply_cef_pump_request(&mut pending, 1, 1, first, now),
+            CefPumpAction::Scheduled
+        );
+        assert_eq!(pending, Some((1, first)));
+
+        let replacement_at = now + Duration::from_millis(5);
+        let replacement = replacement_at + cef_pump_delay(80);
+        assert_eq!(
+            apply_cef_pump_request(&mut pending, 2, 2, replacement, replacement_at),
+            CefPumpAction::Scheduled
+        );
+        assert!(replacement > first);
+        assert_eq!(pending, Some((2, replacement)));
+
+        let immediate_at = now + Duration::from_millis(10);
+        assert_eq!(
+            apply_cef_pump_request(&mut pending, 3, 3, immediate_at, immediate_at),
+            CefPumpAction::PumpNow
+        );
+        assert_eq!(pending, None, "zero delay cancels the old wait");
+        assert_eq!(
+            apply_cef_pump_request(&mut pending, 2, 3, replacement, immediate_at),
+            CefPumpAction::Stale
+        );
+        assert_eq!(pending, None, "an obsolete event cannot restore its timer");
+        assert_eq!(cef_pump_delay(250), Duration::from_millis(33));
+        assert_eq!(cef_pump_delay(0), Duration::ZERO);
+    }
 
     #[test]
     fn inactive_event_loop_waits_for_the_earliest_timer_or_cef_deadline() {

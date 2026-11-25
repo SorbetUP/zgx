@@ -25,6 +25,8 @@ fn browsers() -> &'static Mutex<BrowserTracker> {
 thread_local! {
     static RUNTIME: RefCell<Option<Runtime>> = const { RefCell::new(None) };
     static SCHEDULER: RefCell<Option<PumpScheduler>> = const { RefCell::new(None) };
+    static PUMPING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static PUMP_DEFERRED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static PROCESSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     #[cfg(target_os = "windows")]
     static WINDOWS_MAIN_ARGS: RefCell<Option<cef::MainArgs>> = const { RefCell::new(None) };
@@ -498,11 +500,39 @@ fn profile_component(profile: &str) -> Result<String, String> {
 }
 
 pub(super) fn pump() {
+    if !PUMPING.with(enter_pump) {
+        // CEF may enter a nested native message loop while work is running.
+        // Record the request; do not schedule into the nested loop, which
+        // could otherwise spin before the active call returns.
+        PUMP_DEFERRED.with(defer_pump);
+        return;
+    }
     RUNTIME.with(|runtime| {
         if runtime.borrow().is_some() {
             cef::do_message_loop_work();
         }
     });
+    PUMPING.with(|pumping| pumping.set(false));
+    if PUMP_DEFERRED.with(take_deferred_pump) {
+        schedule_work(0);
+    }
+}
+
+fn enter_pump(pumping: &std::cell::Cell<bool>) -> bool {
+    if pumping.get() {
+        false
+    } else {
+        pumping.set(true);
+        true
+    }
+}
+
+fn defer_pump(deferred: &std::cell::Cell<bool>) {
+    deferred.set(true);
+}
+
+fn take_deferred_pump(deferred: &std::cell::Cell<bool>) -> bool {
+    deferred.replace(false)
 }
 
 pub(super) fn browser_creation_started() -> u64 {
@@ -655,6 +685,25 @@ mod tests {
         browser_creation_started, has_browsers, mock_keychain_allowed, mock_keychain_requested,
     };
     use std::{collections::HashMap, fs, path::Path, time::SystemTime};
+
+    #[test]
+    fn a_reentrant_cef_pump_is_deferred_until_the_active_call_returns() {
+        let pumping = std::cell::Cell::new(false);
+        let deferred = std::cell::Cell::new(false);
+        let calls = std::cell::Cell::new(0);
+        assert!(super::enter_pump(&pumping));
+        calls.set(calls.get() + 1);
+        if super::enter_pump(&pumping) {
+            calls.set(calls.get() + 1);
+        } else {
+            super::defer_pump(&deferred);
+        }
+        assert_eq!(calls.get(), 1, "a nested event cannot call CEF immediately");
+        assert!(super::take_deferred_pump(&deferred));
+        assert!(!super::take_deferred_pump(&deferred));
+        pumping.set(false);
+        assert!(super::enter_pump(&pumping));
+    }
 
     #[test]
     fn every_automated_fixture_uses_the_mock_keychain() {
