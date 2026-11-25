@@ -24,6 +24,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None,
         info,
     )?;
+    // CEF's framework and helper bundles carry nested signatures. Replacing
+    // the executable while iterating can leave a stale ad-hoc signature; sign
+    // the completed fixture as one bundle so macOS does not kill it with
+    // CODESIGNING/Invalid Page before a smoke test starts.
+    let sign = std::process::Command::new("codesign")
+        .args(["--force", "--deep", "--sign", "-"])
+        .arg(&app)
+        .status()?;
+    if !sign.success() {
+        return Err("codesign could not ad-hoc sign the CEF fixture bundle".into());
+    }
+    let verify = std::process::Command::new("codesign")
+        .args(["--verify", "--deep", "--strict"])
+        .arg(&app)
+        .status()?;
+    if !verify.success() {
+        return Err("codesign could not verify the CEF fixture bundle".into());
+    }
     println!("CEF fixture bundled at {}", app.display());
     Ok(())
 }

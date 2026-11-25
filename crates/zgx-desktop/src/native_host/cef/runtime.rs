@@ -4,6 +4,8 @@ use cef::{self, args::Args, *};
 use std::collections::HashSet;
 use std::sync::{Mutex, OnceLock};
 
+pub(super) type PumpScheduler = Arc<dyn Fn(i64)>;
+
 #[derive(Default)]
 struct BrowserTracker {
     pending_creations: usize,
@@ -18,7 +20,7 @@ fn browsers() -> &'static Mutex<BrowserTracker> {
 
 thread_local! {
     static RUNTIME: RefCell<Option<Runtime>> = const { RefCell::new(None) };
-    static SCHEDULER: RefCell<Option<Arc<dyn Fn(i64)>>> = const { RefCell::new(None) };
+    static SCHEDULER: RefCell<Option<PumpScheduler>> = const { RefCell::new(None) };
     static PROCESSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     #[cfg(target_os = "windows")]
     static WINDOWS_MAIN_ARGS: RefCell<Option<cef::MainArgs>> = const { RefCell::new(None) };
@@ -42,21 +44,22 @@ wrap_browser_process_handler! {
 }
 
 wrap_app! {
-    struct CEFApplication { handler: BrowserProcessHandler, mock_keychain: bool }
+    struct CEFApplication { handler: BrowserProcessHandler, renderer: RenderProcessHandler, mock_keychain: bool }
     impl App {
         fn browser_process_handler(&self) -> Option<BrowserProcessHandler> { Some(self.handler.clone()) }
+        fn render_process_handler(&self) -> Option<RenderProcessHandler> { Some(self.renderer.clone()) }
         fn on_before_command_line_processing(
             &self,
             process_type: Option<&CefString>,
             command_line: Option<&mut CommandLine>,
         ) {
             #[cfg(target_os = "macos")]
-            if self.mock_keychain
-                && process_type.is_none_or(|process_type| process_type.to_string().is_empty())
-                && let Some(command_line) = command_line
             {
-                let switch: CefString = "use-mock-keychain".into();
-                command_line.append_switch(Some(&switch));
+                let _ = process_type;
+                if self.mock_keychain && let Some(command_line) = command_line {
+                    let switch: CefString = "use-mock-keychain".into();
+                    command_line.append_switch(Some(&switch));
+                }
             }
             #[cfg(not(target_os = "macos"))]
             let _ = (process_type, command_line);
@@ -64,7 +67,7 @@ wrap_app! {
     }
 }
 
-pub(super) fn set_scheduler(schedule: Arc<dyn Fn(i64)>) {
+pub(super) fn set_scheduler(schedule: PumpScheduler) {
     SCHEDULER.with(|slot| *slot.borrow_mut() = Some(schedule));
 }
 
@@ -121,8 +124,48 @@ fn execute_process_with_args(args: Args, sandbox_info: *mut u8) -> Result<Option
         Ok::<(), String>(())
     })?;
     let _ = cef::api_hash(cef::sys::CEF_API_VERSION_LAST, 0);
-    let code = cef::execute_process(Some(args.as_main_args()), None::<&mut App>, sandbox_info);
+    let handler = PumpHandler::new(Arc::new(|_| {}));
+    let renderer = super::bridge::render_process_handler();
+    let mut app = CEFApplication::new(handler, renderer, use_mock_keychain());
+    let code = cef::execute_process(Some(args.as_main_args()), Some(&mut app), sandbox_info);
     PROCESSED.with(|done| done.set(true));
+    Ok((code >= 0).then_some(code))
+}
+
+/// Run the bundled helper executable with the same renderer-process
+/// integration as the browser process. CEF requires the App to be supplied to
+/// `execute_process` in renderers; passing `None` silently disables the V8
+/// message bridge.
+pub(super) fn execute_helper_process() -> Result<Option<i32>, String> {
+    let args = Args::new();
+    #[cfg(target_os = "macos")]
+    let _sandbox = {
+        let mut sandbox = cef::sandbox::Sandbox::new();
+        sandbox.initialize(args.as_main_args());
+        sandbox
+    };
+    #[cfg(target_os = "macos")]
+    LIBRARY.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_none() {
+            let exe = std::env::current_exe().map_err(|error| error.to_string())?;
+            let loader = cef::library_loader::LibraryLoader::new(&exe, true);
+            if !loader.load() {
+                return Err("CEF framework failed to load in helper".to_owned());
+            }
+            *slot = Some(loader);
+        }
+        Ok::<(), String>(())
+    })?;
+    let _ = cef::api_hash(cef::sys::CEF_API_VERSION_LAST, 0);
+    let handler = PumpHandler::new(Arc::new(|_| {}));
+    let renderer = super::bridge::render_process_handler();
+    let mut app = CEFApplication::new(handler, renderer, use_mock_keychain());
+    let code = cef::execute_process(
+        Some(args.as_main_args()),
+        Some(&mut app),
+        std::ptr::null_mut(),
+    );
     Ok((code >= 0).then_some(code))
 }
 
@@ -202,11 +245,11 @@ fn initialize_inner() -> Result<Runtime, String> {
         .with(|slot| slot.borrow().clone())
         .ok_or("CEF message pump was not connected to the ZGX event loop")?;
     let handler = PumpHandler::new(schedule);
-    let mock_keychain = std::env::var_os("ZGX_CEF_EVAL_RESULT").is_some()
-        || std::env::var_os("ZGX_CEF_EVENT_RESULT").is_some()
-        || std::env::var_os("ZGX_CEF_DOWNLOAD_RESULT").is_some()
-        || std::env::var_os("ZGX_CEF_PROFILE_FIXTURE").is_some();
-    let mut app = CEFApplication::new(handler, mock_keychain);
+    let mut app = CEFApplication::new(
+        handler,
+        super::bridge::render_process_handler(),
+        use_mock_keychain(),
+    );
     #[cfg(target_os = "windows")]
     let sandbox_info = WINDOWS_SANDBOX_INFO.with(std::cell::Cell::get);
     #[cfg(not(target_os = "windows"))]
@@ -225,6 +268,18 @@ fn initialize_inner() -> Result<Runtime, String> {
         browsers: HashMap::new(),
         shutting_down: false,
     })
+}
+
+fn use_mock_keychain() -> bool {
+    [
+        "ZGX_CEF_TEST_FIXTURE",
+        "ZGX_CEF_PROFILE_FIXTURE",
+        "ZGX_CEF_EVAL_RESULT",
+        "ZGX_CEF_EVENT_RESULT",
+        "ZGX_CEF_DOWNLOAD_RESULT",
+    ]
+    .iter()
+    .any(|name| std::env::var_os(name).is_some())
 }
 
 /// Initialize CEF once on the UI thread. The caller must run

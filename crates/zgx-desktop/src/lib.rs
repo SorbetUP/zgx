@@ -181,6 +181,12 @@ mod native_host;
 pub fn execute_cef_process() -> Result<Option<i32>, String> {
     native_host::cef::execute_process()
 }
+/// Run the bundled CEF helper with ZGX's renderer handlers installed.
+#[cfg(feature = "cef")]
+#[doc(hidden)]
+pub fn execute_cef_helper_process() -> Result<Option<i32>, String> {
+    native_host::cef::execute_helper_process()
+}
 /// Handle a CEF Windows bootstrap launch, preserving its mandatory sandbox
 /// context for both subprocess dispatch and CEF initialization.
 #[cfg(all(feature = "cef", target_os = "windows"))]

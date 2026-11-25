@@ -34,6 +34,7 @@ pub(super) struct Page {
     browser: Rc<RefCell<Option<Browser>>>,
     pending: RefCell<Vec<WebViewCommand>>,
     evaluations: Rc<RefCell<HashMap<i32, EvaluationReply>>>,
+    site_data: Rc<RefCell<HashMap<i32, SiteDataReply>>>,
     next_evaluation: Cell<i32>,
     devtools_registration: RefCell<Option<Registration>>,
     lifecycle: Cell<BrowserLifecycle>,
@@ -46,10 +47,12 @@ pub(super) struct Page {
 }
 
 type EvaluationReply = Box<dyn FnOnce(Result<String, String>)>;
+type SiteDataReply = Box<dyn FnOnce(Result<usize, String>)>;
 
 wrap_dev_tools_message_observer! {
     struct CEFScriptObserver {
         evaluations: Rc<RefCell<HashMap<i32, EvaluationReply>>>,
+        site_data: Rc<RefCell<HashMap<i32, SiteDataReply>>>,
     }
 
     impl DevToolsMessageObserver {
@@ -60,10 +63,21 @@ wrap_dev_tools_message_observer! {
             success: i32,
             result: Option<&[u8]>,
         ) {
-            let Some(reply) = self.evaluations.borrow_mut().remove(&message_id) else {
-                return;
-            };
-            reply(parse_evaluation_result(success, result));
+            let evaluation = self.evaluations.borrow_mut().remove(&message_id);
+            if let Some(reply) = evaluation {
+                reply(parse_evaluation_result(success, result));
+            } else {
+                let site_data = self.site_data.borrow_mut().remove(&message_id);
+                if let Some(reply) = site_data {
+                    reply(parse_site_data_result(success, result));
+                }
+            }
+        }
+
+        fn on_dev_tools_agent_attached(&self, _browser: Option<&mut Browser>) {
+        }
+
+        fn on_dev_tools_agent_detached(&self, _browser: Option<&mut Browser>) {
         }
     }
 }
@@ -78,17 +92,17 @@ fn parse_evaluation_result(success: i32, result: Option<&[u8]>) -> Result<String
     let bytes = result.ok_or_else(|| "Chromium returned an empty JavaScript result".to_owned())?;
     let response: serde_json::Value = serde_json::from_slice(bytes)
         .map_err(|error| format!("Chromium returned invalid evaluation JSON: {error}"))?;
-    let payload = response.get("result").unwrap_or(&response);
+    let payload = if response.get("exceptionDetails").is_some() {
+        &response
+    } else {
+        response.get("result").unwrap_or(&response)
+    };
     if let Some(exception) = payload.get("exceptionDetails") {
         let message = exception
-            .get("text")
+            .get("exception")
+            .and_then(|value| value.get("description"))
             .and_then(serde_json::Value::as_str)
-            .or_else(|| {
-                exception
-                    .get("exception")
-                    .and_then(|value| value.get("description"))
-                    .and_then(serde_json::Value::as_str)
-            })
+            .or_else(|| exception.get("text").and_then(serde_json::Value::as_str))
             .unwrap_or("JavaScript evaluation threw an exception");
         return Err(message.to_owned());
     }
@@ -101,6 +115,26 @@ fn parse_evaluation_result(success: i32, result: Option<&[u8]>) -> Result<String
         .ok_or_else(|| "JavaScript result was not serializable by value".to_owned())?;
     serde_json::to_string(value)
         .map_err(|error| format!("cannot encode JavaScript result: {error}"))
+}
+
+fn parse_site_data_result(success: i32, result: Option<&[u8]>) -> Result<usize, String> {
+    if success == 0 {
+        return Err(result
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+            .unwrap_or("Chromium rejected site-data removal")
+            .to_owned());
+    }
+    let bytes = result.ok_or_else(|| "Chromium returned no site-data result".to_owned())?;
+    let response: serde_json::Value = serde_json::from_slice(bytes)
+        .map_err(|error| format!("Chromium returned invalid site-data JSON: {error}"))?;
+    if let Some(error) = response.get("error") {
+        return Err(error.to_string());
+    }
+    if !response.is_object() {
+        return Err("Chromium returned an invalid site-data result".into());
+    }
+    // CDP confirms the origin was cleared but does not report a record count.
+    Ok(1)
 }
 
 impl WebViewBackend for CefWebView {
@@ -127,6 +161,53 @@ impl WebViewBackend for CefWebView {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
+
+    fn clear_site_data(&self, url: &str, done: Box<dyn FnOnce(Result<usize, String>)>) {
+        let Some(browser) = self.0.browser.borrow().as_ref().cloned() else {
+            done(Err("CEF browser is not available".into()));
+            return;
+        };
+        let Some(host) = browser.host() else {
+            done(Err("CEF browser host is not available".into()));
+            return;
+        };
+        let Some(origin) = super::client::origin_from_url(url)
+            .filter(|origin| origin.starts_with("http://") || origin.starts_with("https://"))
+        else {
+            done(Err(
+                "CEF site-data removal requires an HTTP or HTTPS origin".into(),
+            ));
+            return;
+        };
+        if self.0.devtools_registration.borrow().is_none() {
+            done(Err("CEF site-data observer is unavailable".into()));
+            return;
+        }
+        let mut id = self.0.next_evaluation.get().wrapping_add(1).max(1);
+        while self.0.evaluations.borrow().contains_key(&id)
+            || self.0.site_data.borrow().contains_key(&id)
+        {
+            id = id.wrapping_add(1).max(1);
+        }
+        self.0.next_evaluation.set(id);
+        let Some(mut params) = dictionary_value_create() else {
+            done(Err("CEF could not allocate site-data parameters".into()));
+            return;
+        };
+        let origin_key: CefString = "origin".into();
+        let origin_value: CefString = origin.as_str().into();
+        let types_key: CefString = "storageTypes".into();
+        let types_value: CefString = "all".into();
+        let _ = params.set_string(Some(&origin_key), Some(&origin_value));
+        let _ = params.set_string(Some(&types_key), Some(&types_value));
+        self.0.site_data.borrow_mut().insert(id, done);
+        let method: CefString = "Storage.clearDataForOrigin".into();
+        if host.execute_dev_tools_method(id, Some(&method), Some(&mut params)) == 0
+            && let Some(done) = self.0.site_data.borrow_mut().remove(&id)
+        {
+            done(Err("CEF rejected Storage.clearDataForOrigin".into()));
+        }
+    }
 }
 
 impl Drop for CefWebView {
@@ -136,11 +217,20 @@ impl Drop for CefWebView {
             &self.0,
             "CEF browser controller was dropped during creation",
         );
-        if let Some(browser) = self.0.browser.borrow().as_ref()
-            && let Some(host) = browser.host()
-        {
-            host.close_browser(1);
-        }
+        // `close_browser` can synchronously enter on_before_close. Never hold
+        // the RefCell borrow across that CEF call: on_before_close clears it.
+        close_after_releasing_slot(&self.0.browser, |browser| {
+            if let Some(host) = browser.host() {
+                host.close_browser(1);
+            }
+        });
+    }
+}
+
+fn close_after_releasing_slot<T: Clone>(slot: &RefCell<Option<T>>, close: impl FnOnce(T)) {
+    let browser = slot.borrow().as_ref().cloned();
+    if let Some(browser) = browser {
+        close(browser);
     }
 }
 
@@ -155,6 +245,9 @@ fn fail_pending(page: &Page, reason: &str) {
     }
     let pending = std::mem::take(&mut *page.evaluations.borrow_mut());
     for (_, reply) in pending {
+        reply(Err(reason.to_owned()));
+    }
+    for (_, reply) in std::mem::take(&mut *page.site_data.borrow_mut()) {
         reply(Err(reason.to_owned()));
     }
 }
@@ -230,10 +323,11 @@ fn apply(page: &Page, browser: &Browser, command: WebViewCommand) {
                 let _ = params.set_bool(Some(&await_key), 1);
                 page.evaluations.borrow_mut().insert(id, reply);
                 let method: CefString = "Runtime.evaluate".into();
-                if host.execute_dev_tools_method(id, Some(&method), Some(&mut params)) == 0 {
-                    if let Some(reply) = page.evaluations.borrow_mut().remove(&id) {
-                        reply(Err("CEF rejected Runtime.evaluate".into()));
-                    }
+                let accepted = host.execute_dev_tools_method(id, Some(&method), Some(&mut params));
+                if accepted == 0
+                    && let Some(reply) = page.evaluations.borrow_mut().remove(&id)
+                {
+                    reply(Err("CEF rejected Runtime.evaluate".into()));
                 }
             } else if let Some(frame) = browser.main_frame() {
                 let script: CefString = script.as_str().into();
@@ -297,6 +391,7 @@ pub(super) fn backend(web: &WebView) -> Result<Rc<Page>, String> {
         browser: browser.clone(),
         pending: RefCell::new(Vec::new()),
         evaluations: Rc::new(RefCell::new(HashMap::new())),
+        site_data: Rc::new(RefCell::new(HashMap::new())),
         next_evaluation: Cell::new(0),
         devtools_registration: RefCell::new(None),
         lifecycle: Cell::new(BrowserLifecycle::Creating),
@@ -311,7 +406,7 @@ pub(super) fn backend(web: &WebView) -> Result<Rc<Page>, String> {
     let created_weak = weak.clone();
     let closed_weak = weak;
     let callbacks = BrowserCallbacks {
-        created: Arc::new(move |browser| {
+        created: Rc::new(move |browser| {
             runtime::browser_created(browser.identifier());
             if runtime::register_browser(&browser).is_err() {
                 if let Some(host) = browser.host() {
@@ -335,7 +430,8 @@ pub(super) fn backend(web: &WebView) -> Result<Rc<Page>, String> {
             }
             page.lifecycle.set(BrowserLifecycle::Ready);
             if let Some(host) = browser.host() {
-                let mut observer = CEFScriptObserver::new(page.evaluations.clone());
+                let mut observer =
+                    CEFScriptObserver::new(page.evaluations.clone(), page.site_data.clone());
                 page.devtools_registration
                     .replace(host.add_dev_tools_message_observer(Some(&mut observer)));
                 host.was_hidden((page.visible.get() == 0) as i32);
@@ -348,7 +444,7 @@ pub(super) fn backend(web: &WebView) -> Result<Rc<Page>, String> {
             runtime::schedule_work(0);
             let _ = page.web.upgrade();
         }),
-        before_close: Arc::new(move |identifier| {
+        before_close: Rc::new(move |identifier| {
             runtime::browser_closed(identifier);
             if let Some(page) = closed_weak.upgrade() {
                 page.lifecycle.set(BrowserLifecycle::Closed);
@@ -363,7 +459,7 @@ pub(super) fn backend(web: &WebView) -> Result<Rc<Page>, String> {
         page.popup.clone(),
         page.size.clone(),
         page.scale.clone(),
-        Arc::new(move || invalidator.invalidate()),
+        Rc::new(move || invalidator.invalidate()),
         callbacks,
         web.downgrade(),
     );
@@ -379,13 +475,14 @@ pub(super) fn backend(web: &WebView) -> Result<Rc<Page>, String> {
     };
     let url: CefString = "about:blank".into();
     let mut context = context;
+    let mut extra_info = super::bridge::extra_info(web.options());
     runtime::browser_creation_started();
     let accepted = browser_host_create_browser(
         Some(&info),
         Some(&mut client.clone()),
         Some(&url),
         Some(&settings),
-        None,
+        extra_info.as_mut(),
         Some(&mut context),
     );
     if accepted == 0 {
@@ -409,13 +506,12 @@ pub(super) fn view(page: Rc<Page>) -> View {
             .on_event(move |event| input(&event_page, &event.event))
             .accessible_label("Web page")
             .on_mount(move |handle| {
-                if mount_page.visible.replace(mount_page.visible.get() + 1) == 0 {
-                    if let Some(browser) = mount_page.browser.borrow().as_ref() {
-                        if let Some(host) = browser.host() {
-                            host.was_hidden(0);
-                            host.invalidate(PaintElementType::VIEW);
-                        }
-                    }
+                if mount_page.visible.replace(mount_page.visible.get() + 1) == 0
+                    && let Some(browser) = mount_page.browser.borrow().as_ref()
+                    && let Some(host) = browser.host()
+                {
+                    host.was_hidden(0);
+                    host.invalidate(PaintElementType::VIEW);
                 }
                 handle.retain(Visible(mount_page.clone()));
             })
@@ -447,12 +543,12 @@ pub(super) fn page_view(web: &WebView) -> View {
 struct Visible(Rc<Page>);
 impl Drop for Visible {
     fn drop(&mut self) {
-        if self.0.visible.get() > 0 && self.0.visible.get() == 1 {
-            if let Some(browser) = self.0.browser.borrow().as_ref() {
-                if let Some(host) = browser.host() {
-                    host.was_hidden(1);
-                }
-            }
+        if self.0.visible.get() > 0
+            && self.0.visible.get() == 1
+            && let Some(browser) = self.0.browser.borrow().as_ref()
+            && let Some(host) = browser.host()
+        {
+            host.was_hidden(1);
         }
         self.0.visible.set(self.0.visible.get().saturating_sub(1));
     }
@@ -620,7 +716,7 @@ fn percent_encode(value: &str) -> String {
 
 #[cfg(test)]
 mod evaluation_tests {
-    use super::parse_evaluation_result;
+    use super::{parse_evaluation_result, parse_site_data_result};
 
     #[test]
     fn devtools_values_are_returned_as_json() {
@@ -653,12 +749,28 @@ mod evaluation_tests {
                 .unwrap_err()
                 .contains("fixture")
         );
+        let cef_response = r#"{"result":{"type":"object","subtype":"error","description":"Error: fixture"},"exceptionDetails":{"text":"Uncaught","exception":{"description":"Error: fixture"}}}"#;
+        assert!(
+            parse_evaluation_result(1, Some(cef_response.as_bytes()))
+                .unwrap_err()
+                .contains("fixture")
+        );
+    }
+
+    #[test]
+    fn targeted_site_data_result_requires_a_confirmed_cdp_success() {
+        assert_eq!(parse_site_data_result(1, Some(br#"{}"#)), Ok(1));
+        assert!(parse_site_data_result(0, None).is_err());
+        assert!(parse_site_data_result(1, Some(br#"{"error":{"code":-1}}"#)).is_err());
+        assert!(parse_site_data_result(1, Some(b"not-json")).is_err());
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{cef_key_code, cef_modifiers};
+    use std::{cell::RefCell, rc::Rc};
+
+    use super::{cef_key_code, cef_modifiers, close_after_releasing_slot};
     use zgx::input::{Key, Modifiers};
 
     #[test]
@@ -680,5 +792,14 @@ mod tests {
             meta: true,
         });
         assert_eq!(flags, 2 | 4 | 8 | 128);
+    }
+
+    #[test]
+    fn synchronous_close_callback_can_clear_the_browser_slot() {
+        let slot = RefCell::new(Some(Rc::new(())));
+        close_after_releasing_slot(&slot, |_| {
+            slot.borrow_mut().take();
+        });
+        assert!(slot.borrow().is_none());
     }
 }

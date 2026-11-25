@@ -1,3 +1,4 @@
+mod bridge;
 mod browser;
 mod client;
 mod rendering;
@@ -20,6 +21,9 @@ pub(crate) fn begin_shutdown() {
 }
 pub(crate) fn execute_process() -> Result<Option<i32>, String> {
     runtime::execute_process()
+}
+pub(crate) fn execute_helper_process() -> Result<Option<i32>, String> {
+    runtime::execute_helper_process()
 }
 #[cfg(target_os = "windows")]
 pub(crate) fn execute_process_with_windows_context(

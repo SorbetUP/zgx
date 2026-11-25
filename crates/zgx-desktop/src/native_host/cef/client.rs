@@ -15,13 +15,13 @@ pub(super) struct RenderState {
     pub popup: SharedPopup,
     pub size: Arc<Mutex<(i32, i32)>>,
     pub scale: Arc<Mutex<f32>>,
-    pub invalidate: Arc<dyn Fn()>,
+    pub invalidate: Rc<dyn Fn()>,
 }
 
 #[derive(Clone)]
 pub(super) struct BrowserCallbacks {
-    pub created: Arc<dyn Fn(Browser)>,
-    pub before_close: Arc<dyn Fn(i32)>,
+    pub created: Rc<dyn Fn(Browser)>,
+    pub before_close: Rc<dyn Fn(i32)>,
 }
 
 wrap_download_handler! {
@@ -348,13 +348,46 @@ wrap_display_handler! {
 }
 
 wrap_client! {
-pub(super) struct CEFClient { render: RenderHandler, life: LifeSpanHandler, load: LoadHandler, download: DownloadHandler, display: DisplayHandler }
+pub(super) struct CEFClient { render: RenderHandler, life: LifeSpanHandler, load: LoadHandler, download: DownloadHandler, display: DisplayHandler, web: zgx::web_view::WeakWebView }
     impl Client {
         fn render_handler(&self) -> Option<RenderHandler> { Some(self.render.clone()) }
         fn life_span_handler(&self) -> Option<LifeSpanHandler> { Some(self.life.clone()) }
         fn load_handler(&self) -> Option<LoadHandler> { Some(self.load.clone()) }
         fn download_handler(&self) -> Option<DownloadHandler> { Some(self.download.clone()) }
         fn display_handler(&self) -> Option<DisplayHandler> { Some(self.display.clone()) }
+        fn on_process_message_received(
+            &self,
+            _browser: Option<&mut Browser>,
+            frame: Option<&mut Frame>,
+            source_process: ProcessId,
+            message: Option<&mut ProcessMessage>,
+        ) -> i32 {
+            if source_process != ProcessId::RENDERER {
+                return 0;
+            }
+            let (Some(frame), Some(message)) = (frame, message) else { return 0 };
+            if CefString::from(&message.name()).to_string() != super::bridge::message_name() {
+                return 0;
+            }
+            let Some(arguments) = message.argument_list() else { return 1 };
+            if arguments.size() != 1 {
+                return 1;
+            }
+            let body = CefString::from(&arguments.string(0)).to_string();
+            if body.len() > 1_048_576 || serde_json::from_str::<serde_json::Value>(&body).is_err() {
+                return 1;
+            }
+            let url = CefString::from(&frame.url()).to_string();
+            let Some(origin) = origin_from_url(&url) else { return 1 };
+            let main_frame = frame.is_main() != 0;
+            let web = self.web.clone();
+            zgx::native_view::post(move || {
+                if let Some(web) = web.upgrade() {
+                    web.emit(zgx::web_view::WebViewEvent::Message { body, origin, main_frame });
+                }
+            });
+            1
+        }
     }
 }
 
@@ -363,7 +396,7 @@ pub(super) fn client(
     popup: SharedPopup,
     size: Arc<Mutex<(i32, i32)>>,
     scale: Arc<Mutex<f32>>,
-    invalidate: Arc<dyn Fn()>,
+    invalidate: Rc<dyn Fn()>,
     callbacks: BrowserCallbacks,
     web: zgx::web_view::WeakWebView,
 ) -> Client {
@@ -378,8 +411,43 @@ pub(super) fn client(
     let life = CEFLifeSpanHandler::new(callbacks);
     let load = CEFLoadHandler::new(web.clone());
     let display = CEFDisplayHandler::new(web.clone());
-    let download = CEFDownloadHandler::new(web, Rc::new(RefCell::new(HashMap::new())));
-    CEFClient::new(render, life, load, download, display)
+    let download = CEFDownloadHandler::new(web.clone(), Rc::new(RefCell::new(HashMap::new())));
+    CEFClient::new(render, life, load, download, display, web)
+}
+
+pub(super) fn origin_from_url(url: &str) -> Option<String> {
+    if url.starts_with("data:") || url.starts_with("about:blank") || url.starts_with("about:srcdoc")
+    {
+        return Some("null".into());
+    }
+    let (scheme, remainder) = url.split_once("://")?;
+    if scheme.is_empty()
+        || !scheme
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
+    {
+        return None;
+    }
+    let authority = remainder
+        .split(['/', '?', '#'])
+        .next()?
+        .rsplit('@')
+        .next()?;
+    if authority.is_empty() {
+        return None;
+    }
+    let scheme = scheme.to_ascii_lowercase();
+    let authority = authority.to_ascii_lowercase();
+    let default_port = match scheme.as_str() {
+        "http" => Some(":80"),
+        "https" => Some(":443"),
+        _ => None,
+    };
+    let authority = default_port
+        .filter(|port| authority.ends_with(port))
+        .map(|port| authority[..authority.len() - port.len()].to_owned())
+        .unwrap_or(authority);
+    Some(format!("{scheme}://{authority}"))
 }
 
 #[cfg(test)]
@@ -460,5 +528,30 @@ mod tests {
             ]
         );
         assert!(statuses.is_empty());
+    }
+
+    #[test]
+    fn frame_origin_is_derived_from_native_frame_url() {
+        assert_eq!(
+            super::origin_from_url("HTTPS://Example.COM:443/path?q=1"),
+            Some("https://example.com".into())
+        );
+        assert_eq!(
+            super::origin_from_url("http://127.0.0.1:4312/message"),
+            Some("http://127.0.0.1:4312".into())
+        );
+        assert_eq!(
+            super::origin_from_url("myapp://settings/profile"),
+            Some("myapp://settings".into())
+        );
+        assert_eq!(
+            super::origin_from_url("data:text/html,fixture"),
+            Some("null".into())
+        );
+        assert_eq!(
+            super::origin_from_url("data:text/plain,hello"),
+            Some("null".into())
+        );
+        assert_eq!(super::origin_from_url("https:///missing-host"), None);
     }
 }

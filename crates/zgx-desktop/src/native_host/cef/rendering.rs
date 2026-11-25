@@ -91,12 +91,11 @@ impl Viewport for Painter {
                 true
             }
         };
-        if changed {
-            if let Some(browser) = self.browser.borrow().as_ref()
-                && let Some(host) = browser.host()
-            {
-                host.was_resized();
-            }
+        if changed
+            && let Some(browser) = self.browser.borrow().as_ref()
+            && let Some(host) = browser.host()
+        {
+            host.was_resized();
         }
         let blit = match &mut self.gpu {
             Some(blit) if blit.format == frame.format => blit,

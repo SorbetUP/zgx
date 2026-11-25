@@ -41,6 +41,8 @@ const EVENT_FIXTURE: &str = r#"<!doctype html>
 const EVENT_CHANGED_FIXTURE: &str = r#"<!doctype html>
 <meta charset="utf-8"><title>CEF event changed</title>
 <p>cef-event-url-changed</p>
+<iframe srcdoc="<script>window.webkit.messageHandlers.zgx.postMessage({source:'iframe',value:7})</script>"></iframe>
+<script>window.webkit.messageHandlers.zgx.postMessage({source:"cef-fixture",value:42})</script>
 "#;
 
 fn run_evaluation_test(
@@ -100,20 +102,35 @@ fn run_evaluation_test(
     }
 }
 
-fn start_fixture_server(download_test: bool) -> Result<String, Box<dyn std::error::Error>> {
+fn start_fixture_server(
+    download_test: bool,
+    site_data_test: bool,
+) -> Result<String, Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
     let address = listener.local_addr()?;
     let origin = format!("http://{address}");
     let result_path = std::env::var_os("ZGX_CEF_DOWNLOAD_RESULT").map(std::path::PathBuf::from);
+    let site_data_result_path =
+        std::env::var_os("ZGX_CEF_SITE_DATA_RESULT").map(std::path::PathBuf::from);
     thread::spawn(move || {
         for stream in listener.incoming().flatten() {
             let result_path = result_path.clone();
+            let site_data_result_path = site_data_result_path.clone();
             thread::spawn(move || {
                 let mut stream = stream;
                 let mut request = [0; 2048];
                 let count = stream.read(&mut request).unwrap_or(0);
                 let request = String::from_utf8_lossy(&request[..count]);
                 let path = request.split_whitespace().nth(1).unwrap_or("/");
+                if let Some(result_path) = site_data_result_path.as_ref() {
+                    if let Ok(mut result) = fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(result_path)
+                    {
+                        let _ = writeln!(result, "HTTP:{path}");
+                    }
+                }
                 if let Some(result_path) = result_path.as_ref() {
                     if let Ok(mut result) = fs::OpenOptions::new()
                         .create(true)
@@ -123,17 +140,46 @@ fn start_fixture_server(download_test: bool) -> Result<String, Box<dyn std::erro
                         let _ = writeln!(result, "HTTP:{path} download={download_test}");
                     }
                 }
-                let (status, content_type, headers, body) =
-                    if download_test && (path == "/download" || path == "/") {
-                        (
-                            "200 OK",
-                            "text/plain",
-                            "Content-Disposition: attachment; filename=\"cef-fixture.txt\"\r\n",
-                            DOWNLOAD_PAYLOAD,
-                        )
-                    } else {
-                        ("200 OK", "text/html; charset=utf-8", "", FIXTURE.as_bytes())
-                    };
+                let (status, content_type, headers, body) = if site_data_test
+                    && path == "/site-data"
+                {
+                    (
+                        "200 OK",
+                        "text/html; charset=utf-8",
+                        "Set-Cookie: fixture_cookie=connected; HttpOnly; SameSite=Lax\r\n",
+                        b"<!doctype html><meta charset=utf-8><title>site-data</title><script>localStorage.setItem('polyscale-site-data','present')</script>".as_slice(),
+                    )
+                } else if site_data_test && path == "/cookie-check" {
+                    let has_cookie = request.lines().any(|line| {
+                        line.to_ascii_lowercase().starts_with("cookie:")
+                            && line.contains("fixture_cookie=connected")
+                    });
+                    let body: &'static [u8] = if has_cookie { b"present" } else { b"absent" };
+                    ("200 OK", "text/plain", "", body)
+                } else if path == "/event-changed" {
+                    (
+                        "200 OK",
+                        "text/html; charset=utf-8",
+                        "",
+                        EVENT_CHANGED_FIXTURE.as_bytes(),
+                    )
+                } else if path == "/event" {
+                    (
+                        "200 OK",
+                        "text/html; charset=utf-8",
+                        "",
+                        EVENT_FIXTURE.as_bytes(),
+                    )
+                } else if download_test && (path == "/download" || path == "/") {
+                    (
+                        "200 OK",
+                        "text/plain",
+                        "Content-Disposition: attachment; filename=\"cef-fixture.txt\"\r\n",
+                        DOWNLOAD_PAYLOAD,
+                    )
+                } else {
+                    ("200 OK", "text/html; charset=utf-8", "", FIXTURE.as_bytes())
+                };
                 let response = format!(
                     "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n",
                     body.len()
@@ -147,12 +193,24 @@ fn start_fixture_server(download_test: bool) -> Result<String, Box<dyn std::erro
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // This executable is a development fixture, not a distributed app. Keep
+    // its Chromium test profile away from the user's Keychain so repeated
+    // launches do not prompt for "Chromium Safe Storage" access.
+    let fixture_data_dir =
+        std::env::temp_dir().join(format!("zgx-cef-fixture-{}", std::process::id()));
+    unsafe {
+        std::env::set_var("ZGX_CEF_TEST_FIXTURE", "1");
+        std::env::set_var("POLYSCALE_CEF_DATA_DIR", &fixture_data_dir);
+    }
     let download_test = std::env::var_os("ZGX_CEF_DOWNLOAD_RESULT").is_some();
     let event_result_path = std::env::var_os("ZGX_CEF_EVENT_RESULT").map(std::path::PathBuf::from);
     let event_test = event_result_path.is_some();
     let eval_result_path = std::env::var_os("ZGX_CEF_EVAL_RESULT").map(std::path::PathBuf::from);
     let eval_test = eval_result_path.is_some();
-    let automated = download_test || event_test || eval_test;
+    let site_data_result_path =
+        std::env::var_os("ZGX_CEF_SITE_DATA_RESULT").map(std::path::PathBuf::from);
+    let site_data_test = site_data_result_path.is_some();
+    let automated = download_test || event_test || eval_test || site_data_test;
     if let Some(result_path) = std::env::var_os("ZGX_CEF_DOWNLOAD_RESULT") {
         fs::write(result_path, format!("START:auto={automated}\n"))?;
     }
@@ -162,16 +220,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(result_path) = eval_result_path.as_ref() {
         fs::write(result_path, "START\n")?;
     }
-    let origin = start_fixture_server(download_test)?;
+    if let Some(result_path) = site_data_result_path.as_ref() {
+        fs::write(result_path, "START\n")?;
+    }
+    let origin = start_fixture_server(download_test, site_data_test)?;
     if let Some(result_path) = event_result_path.as_ref() {
         let mut result = fs::OpenOptions::new().append(true).open(result_path)?;
         writeln!(result, "ORIGIN:{origin}")?;
     }
-    Application::new()
+    let run_result = Application::new()
         .window(WindowOptions {
             title: "CEF OSR fixture".into(),
             width: 900.,
             height: 650.,
+            // Keep automated fixtures out of view while retaining an active
+            // native window. Some platforms pause timers on hidden windows.
             visible: true,
             bounds: automated.then(|| WindowBounds::new(900, 650).at(-10_000, -10_000)),
             ..Default::default()
@@ -217,21 +280,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 });
             });
             let event_subscription = event_result_path.map(|result_path| {
-                let observed = Arc::new(Mutex::new((false, false)));
+                let observed = Arc::new(Mutex::new((false, false, false)));
                 let event_state = observed.clone();
+                let event_done = Arc::new(AtomicBool::new(false));
+                let completed = event_done.clone();
                 let log_path = result_path.clone();
+                let callback_result_path = result_path.clone();
                 let window = cx.window.clone();
-                web.on_event(move |event| {
+                let expected_origin = "null".to_owned();
+                let subscription = web.on_event(move |event| {
                     let label = match event {
                         zgx::web_view::WebViewEvent::TitleChanged { title }
                             if title == "CEF event changed" =>
                         {
                             "TITLE"
                         }
-                        zgx::web_view::WebViewEvent::UrlChanged { url }
-                            if url.contains("cef-event-url-changed") =>
+                        zgx::web_view::WebViewEvent::Message {
+                            body,
+                            origin,
+                            main_frame,
+                        } if origin == &expected_origin
+                            && *main_frame
+                            && body == r#"{"source":"cef-fixture","value":42}"# =>
                         {
-                            "URL"
+                            "MESSAGE"
+                        }
+                        zgx::web_view::WebViewEvent::Message {
+                            body,
+                            origin,
+                            main_frame,
+                        } if origin == &expected_origin
+                            && !*main_frame
+                            && body == r#"{"source":"iframe","value":7}"# =>
+                        {
+                            "IFRAME"
                         }
                         _ => "OTHER",
                     };
@@ -247,21 +329,125 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         {
                             observed.0 = true
                         }
-                        zgx::web_view::WebViewEvent::UrlChanged { url }
-                            if url.contains("cef-event-url-changed") =>
+                        zgx::web_view::WebViewEvent::Message {
+                            body,
+                            origin,
+                            main_frame,
+                        } if origin == &expected_origin
+                            && *main_frame
+                            && body == r#"{"source":"cef-fixture","value":42}"# =>
                         {
                             observed.1 = true
                         }
+                        zgx::web_view::WebViewEvent::Message {
+                            body,
+                            origin,
+                            main_frame,
+                        } if origin == &expected_origin
+                            && !*main_frame
+                            && body == r#"{"source":"iframe","value":7}"# =>
+                        {
+                            observed.2 = true
+                        }
                         _ => {}
                     }
-                    if observed.0 && observed.1 {
-                        let _ = fs::write(&result_path, "PASS");
+                    if observed.0 && observed.1 && observed.2 {
+                        event_done.store(true, Ordering::Release);
+                        let _ = fs::write(&callback_result_path, "PASS");
                         window.close();
                     }
-                })
+                });
+                let timeout_window = cx.window.clone();
+                let timeout_path = result_path;
+                cx.tasks.spawn(async move {
+                    zgx::timer::sleep(std::time::Duration::from_secs(12)).await;
+                    if !completed.load(Ordering::Acquire) {
+                        let _ = fs::write(timeout_path, "TIMEOUT");
+                        timeout_window.close();
+                    }
+                });
+                subscription
             });
             let eval_done = Arc::new(AtomicBool::new(false));
-            if event_test {
+            if site_data_test {
+                let site_web = web.clone();
+                let site_origin = origin.clone();
+                let result_path = site_data_result_path
+                    .clone()
+                    .expect("site-data test has a result path");
+                let window = cx.window.clone();
+                let site_test_done = Arc::new(AtomicBool::new(false));
+                let timeout_done = site_test_done.clone();
+                let timeout_path = result_path.clone();
+                let timeout_window = window.clone();
+                let callback_done = site_test_done.clone();
+                cx.tasks.spawn(async move {
+                    zgx::timer::sleep(std::time::Duration::from_secs(15)).await;
+                    if !timeout_done.swap(true, Ordering::AcqRel) {
+                        let _ = fs::write(timeout_path, "TIMEOUT:site-data-callback");
+                        timeout_window.close();
+                    }
+                });
+                if let Ok(mut result) = fs::OpenOptions::new().append(true).open(&result_path) {
+                    let _ = writeln!(result, "LOAD:{origin}/site-data");
+                }
+                cx.tasks.spawn(async move {
+                    zgx::timer::sleep(std::time::Duration::from_secs(1)).await;
+                    let clear_web = site_web.clone();
+                    let before_path = result_path.clone();
+                    let before_window = window.clone();
+                    site_web.evaluate_js(
+                        "(async()=>({local:localStorage.getItem('polyscale-site-data'),cookie:await fetch('/cookie-check').then(r=>r.text())}))()",
+                        move |before| {
+                            let _ = fs::OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open(&before_path)
+                                .and_then(|mut file| writeln!(file, "BEFORE:{before:?}"));
+                            if before.as_deref() != Ok(r#"{"cookie":"present","local":"present"}"#) {
+                                let _ = fs::write(&before_path, format!("FAIL:before:{before:?}"));
+                                callback_done.store(true, Ordering::Release);
+                                before_window.close();
+                                return;
+                            }
+                            let verify_web = clear_web.clone();
+                            let verify_path = result_path.clone();
+                            let verify_window = window.clone();
+                            let clear_done = callback_done.clone();
+                            clear_web.clear_site_data(&site_origin, move |cleared| {
+                                let _ = fs::OpenOptions::new()
+                                    .create(true)
+                                    .append(true)
+                                    .open(&verify_path)
+                                    .and_then(|mut file| writeln!(file, "CLEAR:{cleared:?}"));
+                                if let Err(error) = cleared {
+                                    let _ = fs::write(verify_path, format!("FAIL:clear:{error}"));
+                                    clear_done.store(true, Ordering::Release);
+                                    verify_window.close();
+                                    return;
+                                }
+                                verify_web.evaluate_js(
+                                    "(async()=>({local:localStorage.getItem('polyscale-site-data'),cookie:await fetch('/cookie-check').then(r=>r.text())}))()",
+                                    move |after| {
+                                        let _ = fs::OpenOptions::new()
+                                            .create(true)
+                                            .append(true)
+                                            .open(&verify_path)
+                                            .and_then(|mut file| writeln!(file, "AFTER:{after:?}"));
+                                        let success = after.as_deref()
+                                            == Ok(r#"{"cookie":"absent","local":null}"#);
+                                        let status = if success { "PASS" } else { "FAIL" };
+                                        let _ = fs::write(verify_path, format!("{status}:{after:?}"));
+                                        clear_done.store(true, Ordering::Release);
+                                        verify_window.close();
+                                    },
+                                );
+                            });
+                        },
+                    );
+                });
+                web.load_url(format!("{origin}/site-data"));
+            } else if event_test {
                 web.load_html(EVENT_FIXTURE, None);
                 let web = web.clone();
                 cx.tasks.spawn(async move {
@@ -334,5 +520,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 app
             };
             let _view = cx.render(app);
-        })
+        });
+    let _ = fs::remove_dir_all(fixture_data_dir);
+    run_result?;
+    Ok(())
 }
