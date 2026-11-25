@@ -8862,17 +8862,17 @@ impl WindowManager {
         // Wake tasks whose sleeps are due before the hosts poll them.
         self.timers.fire();
         if !self.active {
-            event_loop.set_control_flow(match self.timers.deadline() {
-                Some(deadline) => ControlFlow::WaitUntil(deadline),
-                None => {
-                    #[cfg(feature = "cef")]
-                    if let Some(deadline) = self.cef_deadline.get() {
-                        event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
-                        return;
-                    }
-                    ControlFlow::Wait
+            let deadline = earliest_deadline(self.timers.deadline(), {
+                #[cfg(feature = "cef")]
+                {
+                    self.cef_deadline.get()
+                }
+                #[cfg(not(feature = "cef"))]
+                {
+                    None
                 }
             });
+            event_loop.set_control_flow(deadline.map_or(ControlFlow::Wait, ControlFlow::WaitUntil));
             return;
         }
         if let Err(e) = self.create_pending(event_loop) {
@@ -9047,6 +9047,13 @@ impl WindowManager {
             ControlFlow::Wait
         });
     }
+}
+
+fn earliest_deadline(
+    first: Option<std::time::Instant>,
+    second: Option<std::time::Instant>,
+) -> Option<std::time::Instant> {
+    first.into_iter().chain(second).min()
 }
 
 /// The event loop's turns, each contained (`WindowManager::contain`).
@@ -9927,6 +9934,27 @@ fn copy_or_cut_editor(
 #[cfg(test)]
 mod tests {
     use zgx::scene::Rect;
+
+    #[test]
+    fn inactive_event_loop_waits_for_the_earliest_timer_or_cef_deadline() {
+        use super::earliest_deadline;
+        use std::time::{Duration, Instant};
+
+        let now = Instant::now();
+        let app_timer = now + Duration::from_secs(2);
+        let cef_pump = now + Duration::from_secs(1);
+        assert_eq!(
+            earliest_deadline(Some(app_timer), Some(cef_pump)),
+            Some(cef_pump)
+        );
+        assert_eq!(
+            earliest_deadline(Some(cef_pump), Some(app_timer)),
+            Some(cef_pump)
+        );
+        assert_eq!(earliest_deadline(None, Some(cef_pump)), Some(cef_pump));
+        assert_eq!(earliest_deadline(Some(app_timer), None), Some(app_timer));
+        assert_eq!(earliest_deadline(None, None), None);
+    }
 
     /// A frame answers input that acted within `INPUT_LIVE` of it, and not
     /// after; no input, none.
