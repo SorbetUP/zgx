@@ -1,5 +1,5 @@
 use std::{
-    cell::{Cell, RefCell},
+    cell::RefCell,
     collections::{HashMap, VecDeque},
     io::Write,
     rc::Rc,
@@ -310,7 +310,7 @@ wrap_life_span_handler! {
                 }
             });
             let (Some(window_info), Some(client)) = (window_info, client) else { return 1 };
-            let settled = Rc::new(Cell::new(false));
+            let creation_id = runtime::browser_creation_started();
             let Some(prepared) = super::browser::prepare_popup(
                 self.callbacks.web.clone(),
                 self.profile.clone(),
@@ -319,16 +319,16 @@ wrap_life_span_handler! {
                 self.tasks.clone(),
                 self.windows.clone(),
                 popup_id,
+                creation_id,
                 url.clone(),
-                settled.clone(),
                 self.pending_popups.clone(),
             ) else {
+                runtime::browser_creation_failed(creation_id);
                 return 1;
             };
-            runtime::browser_creation_started();
             self.pending_popups.borrow_mut().insert(
                 popup_id,
-                PopupPending { settled, window: prepared.window },
+                PopupPending { creation_id, window: prepared.window },
             );
             *window_info = prepared.window_info;
             *client = Some(prepared.client);
@@ -337,9 +337,7 @@ wrap_life_span_handler! {
 
         fn on_before_popup_aborted(&self, _browser: Option<&mut Browser>, popup_id: i32) {
             if let Some(pending) = self.pending_popups.borrow_mut().remove(&popup_id) {
-                if !pending.settled.replace(true) {
-                    runtime::browser_creation_failed();
-                }
+                runtime::browser_creation_failed(pending.creation_id);
                 pending.window.close();
             }
         }
@@ -1174,7 +1172,7 @@ pub(super) fn client(
 }
 
 pub(super) struct PopupPending {
-    pub(super) settled: Rc<Cell<bool>>,
+    pub(super) creation_id: u64,
     pub(super) window: crate::WindowHandle,
 }
 

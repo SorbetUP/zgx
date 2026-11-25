@@ -33,6 +33,9 @@ enum BrowserLifecycle {
 
 pub(super) struct Page {
     web: zgx::web_view::WeakWebView,
+    /// The exact asynchronous CEF creation request owned by this page. It is
+    /// cleared when the browser callback arrives or the page is dropped.
+    creation_id: Cell<Option<u64>>,
     permissions: runtime::PermissionStoreHandle,
     browser: Rc<RefCell<Option<Browser>>>,
     html_documents: client::HtmlDocuments,
@@ -283,6 +286,9 @@ impl WebViewBackend for CefWebView {
 impl Drop for CefWebView {
     fn drop(&mut self) {
         self.0.lifecycle.set(BrowserLifecycle::Closing);
+        if let Some(creation_id) = self.0.creation_id.take() {
+            runtime::browser_creation_cancelled(creation_id);
+        }
         fail_pending(
             &self.0,
             "CEF browser controller was dropped during creation",
@@ -553,6 +559,7 @@ pub(super) fn backend(
     ));
     let page = Rc::new(Page {
         web: web.downgrade(),
+        creation_id: Cell::new(None),
         permissions: permissions.clone(),
         browser: browser.clone(),
         html_documents: Arc::new(Mutex::new(HashMap::new())),
@@ -588,6 +595,8 @@ pub(super) fn backend(
     let created_weak = weak.clone();
     let closed_weak = weak;
     let navigation_weak = Rc::downgrade(&page);
+    let creation_id = runtime::browser_creation_started();
+    page.creation_id.set(Some(creation_id));
     let callbacks = BrowserCallbacks {
         find_replies: page.find_replies.clone(),
         web: web.downgrade(),
@@ -610,7 +619,17 @@ pub(super) fn backend(
             }
         }),
         created: Rc::new(move |browser| {
-            runtime::browser_created(browser.identifier());
+            if let Some(page) = created_weak.upgrade()
+                && page.creation_id.get() == Some(creation_id)
+            {
+                page.creation_id.set(None);
+            }
+            if !runtime::browser_created(creation_id, browser.identifier()) {
+                if let Some(host) = browser.host() {
+                    host.close_browser(1);
+                }
+                return;
+            }
             if runtime::register_browser(&browser).is_err() {
                 if let Some(host) = browser.host() {
                     host.close_browser(1);
@@ -703,7 +722,6 @@ pub(super) fn backend(
     let url: CefString = "about:blank".into();
     let mut context = context;
     let mut extra_info = super::bridge::extra_info(web.options());
-    runtime::browser_creation_started();
     let accepted = browser_host_create_browser(
         Some(&info),
         Some(&mut client.clone()),
@@ -713,7 +731,8 @@ pub(super) fn backend(
         Some(&mut context),
     );
     if accepted == 0 {
-        runtime::browser_creation_failed();
+        runtime::browser_creation_failed(creation_id);
+        page.creation_id.set(None);
         return Err("CEF rejected asynchronous windowless browser creation".into());
     }
     runtime::schedule_work(0);
@@ -735,8 +754,8 @@ pub(super) fn prepare_popup(
     tasks: crate::TaskSpawner,
     windows: crate::WindowFactory,
     popup_id: i32,
+    creation_id: u64,
     popup_url: String,
-    settled: Rc<Cell<bool>>,
     pending_popups: Rc<RefCell<HashMap<i32, client::PopupPending>>>,
 ) -> Option<PreparedPopup> {
     runtime::ensure_accepting_browsers().ok()?;
@@ -754,6 +773,7 @@ pub(super) fn prepare_popup(
     ));
     let page = Rc::new(Page {
         web: web.clone(),
+        creation_id: Cell::new(Some(creation_id)),
         permissions: permissions.clone(),
         browser: browser.clone(),
         html_documents: Arc::new(Mutex::new(HashMap::new())),
@@ -791,7 +811,6 @@ pub(super) fn prepare_popup(
     let popup_opened = web.clone();
     let popup_closed = web.clone();
     let closed_handle = handle_slot.clone();
-    let created_pending = settled.clone();
     let created_map = pending_popups.clone();
     let diagnostic_url = popup_url;
     let callbacks = BrowserCallbacks {
@@ -816,8 +835,16 @@ pub(super) fn prepare_popup(
                 "CEF_POPUP_CREATED:{}:target={diagnostic_url}:current={current_url}",
                 browser.identifier()
             ));
-            if !created_pending.replace(true) {
-                runtime::browser_created(browser.identifier());
+            if let Some(page) = created_page.upgrade()
+                && page.creation_id.get() == Some(creation_id)
+            {
+                page.creation_id.set(None);
+            }
+            if !runtime::browser_created(creation_id, browser.identifier()) {
+                if let Some(host) = browser.host() {
+                    host.close_browser(1);
+                }
+                return;
             }
             if runtime::register_browser(&browser).is_err() {
                 if let Some(host) = browser.host() {
@@ -913,6 +940,9 @@ pub(super) fn prepare_popup(
             let closing_page = page.clone();
             cx.on_closed(move || {
                 closing_page.lifecycle.set(BrowserLifecycle::Closing);
+                if let Some(creation_id) = closing_page.creation_id.take() {
+                    runtime::browser_creation_cancelled(creation_id);
+                }
                 if let Some(browser) = closing_page.browser.borrow().as_ref()
                     && let Some(host) = browser.host()
                 {

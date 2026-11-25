@@ -8,7 +8,11 @@ pub(super) type PumpScheduler = Arc<dyn Fn(i64)>;
 
 #[derive(Default)]
 struct BrowserTracker {
-    pending_creations: usize,
+    next_creation_id: u64,
+    // The bool is true after the owning page was canceled. Keep canceled,
+    // accepted creations in this set until CEF confirms creation or failure:
+    // shutdown must not race a late `on_after_created` callback.
+    pending_creations: HashMap<u64, bool>,
     open_ids: HashSet<i32>,
 }
 
@@ -501,35 +505,59 @@ pub(super) fn pump() {
     });
 }
 
-pub(super) fn browser_creation_started() {
-    browsers()
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner())
-        .pending_creations += 1;
-}
-
-pub(super) fn browser_creation_failed() {
+pub(super) fn browser_creation_started() -> u64 {
     let mut tracker = browsers()
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
-    tracker.pending_creations = tracker
-        .pending_creations
-        .checked_sub(1)
-        .expect("CEF creation failure without a pending browser creation");
+    tracker.next_creation_id = tracker
+        .next_creation_id
+        .checked_add(1)
+        .expect("CEF browser creation ID exhausted");
+    let id = tracker.next_creation_id;
+    assert!(
+        tracker.pending_creations.insert(id, false).is_none(),
+        "CEF browser creation ID was reused"
+    );
+    id
 }
 
-pub(super) fn browser_created(identifier: i32) {
+pub(super) fn browser_creation_failed(creation_id: u64) -> bool {
     let mut tracker = browsers()
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
-    tracker.pending_creations = tracker
-        .pending_creations
-        .checked_sub(1)
-        .expect("CEF created a browser without a pending creation");
+    tracker.pending_creations.remove(&creation_id).is_some()
+}
+
+/// Marks an accepted asynchronous creation as unwanted without releasing it
+/// from the shutdown barrier. CEF may still complete the request; its callback
+/// must then close the browser and keep it tracked until `on_before_close`.
+pub(super) fn browser_creation_cancelled(creation_id: u64) -> bool {
+    let mut tracker = browsers()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let Some(cancelled) = tracker.pending_creations.get_mut(&creation_id) else {
+        return false;
+    };
+    if *cancelled {
+        return false;
+    }
+    *cancelled = true;
+    true
+}
+
+/// Records every browser CEF actually creates, even if its creation token was
+/// already canceled. The return value tells the caller whether this browser
+/// still belongs to a live creation request; late browsers must be closed.
+pub(super) fn browser_created(creation_id: u64, identifier: i32) -> bool {
+    let mut tracker = browsers()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let creation_was_pending = tracker.pending_creations.remove(&creation_id) == Some(false);
     assert!(
         tracker.open_ids.insert(identifier),
         "CEF reused a browser ID while the previous browser was still open"
     );
+    creation_was_pending
 }
 
 pub(super) fn register_browser(browser: &Browser) -> Result<(), String> {
@@ -597,7 +625,7 @@ pub(super) fn has_browsers() -> bool {
     let tracker = browsers()
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
-    tracker.pending_creations > 0 || !tracker.open_ids.is_empty()
+    !tracker.pending_creations.is_empty() || !tracker.open_ids.is_empty()
 }
 
 pub(super) fn ensure_accepting_browsers() -> Result<(), String> {
@@ -623,8 +651,8 @@ pub(super) fn shutdown() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        browser_closed, browser_created, browser_creation_failed, browser_creation_started,
-        has_browsers, mock_keychain_allowed, mock_keychain_requested,
+        browser_closed, browser_created, browser_creation_cancelled, browser_creation_failed,
+        browser_creation_started, has_browsers, mock_keychain_allowed, mock_keychain_requested,
     };
     use std::{collections::HashMap, fs, path::Path, time::SystemTime};
 
@@ -752,13 +780,13 @@ mod tests {
     #[test]
     fn tracks_pending_creations_and_actual_browser_ids() {
         assert!(!has_browsers());
-        browser_creation_started();
+        let creation = browser_creation_started();
         assert!(
             has_browsers(),
             "an accepted creation must keep shutdown alive"
         );
 
-        browser_created(9_314_159);
+        assert!(browser_created(creation, 9_314_159));
         assert!(has_browsers(), "the actual CEF ID must stay tracked");
         assert!(
             super::shutdown().is_err(),
@@ -767,11 +795,38 @@ mod tests {
         browser_closed(9_314_159);
         assert!(!has_browsers(), "only on_before_close releases the browser");
 
-        browser_creation_started();
-        browser_creation_failed();
+        let failed = browser_creation_started();
+        assert!(browser_creation_failed(failed));
+        assert!(
+            !browser_creation_failed(failed),
+            "failure is accounted once"
+        );
         assert!(
             !has_browsers(),
             "rejected creation must release its pending slot"
         );
+        let creation = browser_creation_started();
+        assert!(browser_creation_cancelled(creation));
+        assert!(
+            has_browsers(),
+            "canceled accepted creation still awaits CEF"
+        );
+        assert!(!browser_creation_cancelled(creation));
+        assert!(
+            super::shutdown().is_err(),
+            "CEF cannot shut down while a canceled request can still callback"
+        );
+
+        assert!(
+            !browser_created(creation, 9_314_160),
+            "a late browser must be identified as belonging to a canceled creation"
+        );
+        assert!(
+            has_browsers(),
+            "even a late browser must prevent CEF shutdown until it closes"
+        );
+        assert!(!browser_creation_cancelled(creation));
+        browser_closed(9_314_160);
+        assert!(!has_browsers());
     }
 }
