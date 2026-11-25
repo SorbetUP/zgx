@@ -1176,6 +1176,8 @@ impl Application {
         let cef_pump_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
         #[cfg(feature = "cef")]
         let cef_quit_requested = Rc::new(Cell::new(false));
+        #[cfg(all(feature = "cef", debug_assertions))]
+        let cef_quit_wait_logged = Rc::new(Cell::new(false));
         #[cfg(feature = "cef")]
         {
             let pump_proxy = proxy.clone();
@@ -1187,6 +1189,9 @@ impl Application {
                 // generation makes already queued timer events harmless when
                 // a newer request supersedes them before dispatch.
                 let sequence = generation.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
+                crate::native_host::cef::cef_trace!(&format!(
+                    "PUMP_SCHEDULE sequence={sequence} delay_ms={delay_ms}"
+                ));
                 let _ = pump_proxy.send_event(Event::CefMessagePump(sequence, deadline));
             }));
         }
@@ -1297,6 +1302,8 @@ impl Application {
             cef_pump_generation,
             #[cfg(feature = "cef")]
             cef_quit_requested,
+            #[cfg(all(feature = "cef", debug_assertions))]
+            cef_quit_wait_logged,
         };
         let run_result = event_loop.run_app(&mut host);
         #[cfg(feature = "cef")]
@@ -7587,6 +7594,8 @@ struct WindowManager {
     cef_pump_generation: Arc<std::sync::atomic::AtomicU64>,
     #[cfg(feature = "cef")]
     cef_quit_requested: Rc<Cell<bool>>,
+    #[cfg(all(feature = "cef", debug_assertions))]
+    cef_quit_wait_logged: Rc<Cell<bool>>,
 }
 impl WindowManager {
     /// A window event, handled now.
@@ -8429,11 +8438,15 @@ impl WindowManager {
         // Set a bounded fallback before pumping so any callback made during
         // the iteration can replace it without being overwritten afterward.
         crate::native_host::cef::schedule_work(33);
+        crate::native_host::cef::close_deferred_browsers();
         crate::native_host::cef::pump();
+        crate::native_host::cef::cef_trace!("CEF_PUMP_RETURN");
     }
     fn user_event_turn(&mut self, event_loop: &ActiveEventLoop, event: Event) {
         match event {
             Event::Quit => {
+                #[cfg(feature = "cef")]
+                crate::native_host::cef::cef_trace!("EVENT_QUIT");
                 #[cfg(feature = "cef")]
                 {
                     if !self.cef_quit_requested.replace(true) {
@@ -8448,6 +8461,7 @@ impl WindowManager {
             }
             #[cfg(feature = "cef")]
             Event::CefMessagePump(sequence, deadline) => {
+                crate::native_host::cef::cef_trace!(&format!("EVENT_CEF_PUMP sequence={sequence}"));
                 self.cef_pump_request(sequence, deadline);
             }
             #[cfg(feature = "audio")]
@@ -8900,6 +8914,12 @@ impl WindowManager {
             }
             #[cfg(feature = "cef")]
             if crate::native_host::cef::has_browsers() {
+                #[cfg(debug_assertions)]
+                if !self.cef_quit_wait_logged.replace(true) {
+                    crate::native_host::cef::cef_trace!(
+                        "EVENT_LOOP_WAITING_FOR_CEF_AFTER_LAST_WINDOW",
+                    );
+                }
                 return;
             }
             event_loop.exit();
@@ -9150,8 +9170,16 @@ fn apply_cef_pump_request(
 }
 
 /// The event loop's turns, each contained (`WindowManager::contain`).
+#[cfg(all(feature = "cef", debug_assertions))]
+static CEF_RESUMED_TRACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(all(feature = "cef", debug_assertions))]
+static CEF_WAIT_TRACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 impl ApplicationHandler<Event> for WindowManager {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        #[cfg(all(feature = "cef", debug_assertions))]
+        if !CEF_RESUMED_TRACE.swap(true, Ordering::AcqRel) {
+            crate::native_host::cef::cef_trace!("EVENT_LOOP_RESUMED");
+        }
         self.contain(event_loop, None, |this| this.resumed_turn(event_loop));
     }
     fn suspended(&mut self, event_loop: &ActiveEventLoop) {
@@ -9231,6 +9259,10 @@ impl ApplicationHandler<Event> for WindowManager {
         }
     }
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        #[cfg(all(feature = "cef", debug_assertions))]
+        if !CEF_WAIT_TRACE.swap(true, Ordering::AcqRel) {
+            crate::native_host::cef::cef_trace!("EVENT_LOOP_ABOUT_TO_WAIT");
+        }
         #[cfg(any(target_os = "linux", target_os = "windows"))]
         self.flush_move(event_loop);
         self.contain(event_loop, None, |this| this.about_to_wait_turn(event_loop));

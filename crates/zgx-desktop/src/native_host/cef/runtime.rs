@@ -1,8 +1,16 @@
-use std::{cell::RefCell, collections::HashMap, path::PathBuf, rc::Rc, sync::Arc};
+#[cfg(debug_assertions)]
+use std::io::Write;
+use std::{
+    cell::RefCell,
+    collections::{HashMap, VecDeque},
+    path::PathBuf,
+    rc::Rc,
+    sync::Arc,
+};
 
 use cef::{self, args::Args, *};
 use std::collections::HashSet;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock, atomic::AtomicBool};
 
 pub(super) type PumpScheduler = Arc<dyn Fn(i64)>;
 
@@ -17,6 +25,89 @@ struct BrowserTracker {
 }
 
 static BROWSERS: OnceLock<Mutex<BrowserTracker>> = OnceLock::new();
+#[cfg(debug_assertions)]
+static CLOSE_RACE_DIAGNOSTIC_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(debug_assertions)]
+pub(super) fn trace_close_race_impl(message: &str) {
+    let Some(path) = std::env::var_os("ZGX_CEF_CLOSE_RACE_RESULT").map(PathBuf::from) else {
+        return;
+    };
+    let executable = std::env::current_exe().ok().and_then(|path| {
+        path.file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+    });
+    let data_dir = std::env::var_os("POLYSCALE_CEF_DATA_DIR").map(PathBuf::from);
+    if !close_race_trace_allowed(
+        executable.as_deref(),
+        data_dir.as_deref(),
+        path.parent(),
+        &std::env::temp_dir(),
+        std::env::var_os("ZGX_CEF_CLOSE_RACE_RESULT").is_some(),
+    ) {
+        return;
+    }
+    let _guard = CLOSE_RACE_DIAGNOSTIC_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let diagnostic = path.with_extension("diagnostic");
+    if std::fs::metadata(&diagnostic).is_ok_and(|metadata| metadata.len() >= 32 * 1024) {
+        return;
+    }
+    let message: String = message.chars().take(240).collect();
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(diagnostic)
+        .and_then(|mut file| writeln!(file, "{message}"));
+}
+
+#[cfg(debug_assertions)]
+pub(super) fn close_race_fixture_enabled() -> bool {
+    let Some(path) = std::env::var_os("ZGX_CEF_CLOSE_RACE_RESULT").map(PathBuf::from) else {
+        return false;
+    };
+    let executable = std::env::current_exe().ok().and_then(|path| {
+        path.file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+    });
+    let data_dir = std::env::var_os("POLYSCALE_CEF_DATA_DIR").map(PathBuf::from);
+    close_race_trace_allowed(
+        executable.as_deref(),
+        data_dir.as_deref(),
+        path.parent(),
+        &std::env::temp_dir(),
+        true,
+    )
+}
+
+#[cfg(not(debug_assertions))]
+#[inline(always)]
+pub(super) fn close_race_fixture_enabled() -> bool {
+    false
+}
+
+#[cfg(debug_assertions)]
+fn close_race_trace_allowed(
+    executable: Option<&str>,
+    data_dir: Option<&std::path::Path>,
+    diagnostic_parent: Option<&std::path::Path>,
+    temp_dir: &std::path::Path,
+    fixture_flag: bool,
+) -> bool {
+    if !fixture_flag
+        || executable != Some("cef_web_view")
+        || !mock_keychain_allowed(executable, data_dir, temp_dir, true)
+    {
+        return false;
+    }
+    let (Some(parent), Ok(temp_dir)) = (diagnostic_parent, temp_dir.canonicalize()) else {
+        return false;
+    };
+    parent
+        .canonicalize()
+        .is_ok_and(|parent| parent.starts_with(temp_dir))
+}
 
 fn browsers() -> &'static Mutex<BrowserTracker> {
     BROWSERS.get_or_init(|| Mutex::new(BrowserTracker::default()))
@@ -27,6 +118,8 @@ thread_local! {
     static SCHEDULER: RefCell<Option<PumpScheduler>> = const { RefCell::new(None) };
     static PUMPING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static PUMP_DEFERRED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    #[cfg(debug_assertions)]
+    static PUMP_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static PROCESSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     #[cfg(target_os = "windows")]
     static WINDOWS_MAIN_ARGS: RefCell<Option<cef::MainArgs>> = const { RefCell::new(None) };
@@ -35,11 +128,13 @@ thread_local! {
     #[cfg(target_os = "macos")]
     static LIBRARY: RefCell<Option<cef::library_loader::LibraryLoader>> = const { RefCell::new(None) };
 }
+static SHUTDOWN_COMPLETE: AtomicBool = AtomicBool::new(false);
 
 struct Runtime {
     contexts: HashMap<String, RequestContext>,
     permissions: HashMap<String, PermissionStoreHandle>,
     browsers: HashMap<i32, Browser>,
+    deferred_browser_closes: VecDeque<Browser>,
     shutting_down: bool,
 }
 
@@ -100,7 +195,13 @@ fn permission_key(origin: &str, permission: &str) -> String {
 wrap_browser_process_handler! {
     struct PumpHandler { schedule: Arc<dyn Fn(i64)> }
     impl BrowserProcessHandler {
-    fn on_schedule_message_pump_work(&self, delay_ms: i64) { (self.schedule)(delay_ms); }
+    fn on_schedule_message_pump_work(&self, delay_ms: i64) {
+        schedule_while_running(
+            SHUTDOWN_COMPLETE.load(std::sync::atomic::Ordering::Acquire),
+            Some(&self.schedule),
+            delay_ms,
+        );
+    }
     }
 }
 
@@ -129,15 +230,34 @@ wrap_app! {
 }
 
 pub(super) fn set_scheduler(schedule: PumpScheduler) {
-    SCHEDULER.with(|slot| *slot.borrow_mut() = Some(schedule));
+    if !SHUTDOWN_COMPLETE.load(std::sync::atomic::Ordering::Acquire) {
+        SCHEDULER.with(|slot| *slot.borrow_mut() = Some(schedule));
+    }
 }
 
 pub(super) fn schedule_work(delay_ms: i64) {
     SCHEDULER.with(|slot| {
-        if let Some(schedule) = slot.borrow().as_ref() {
-            schedule(delay_ms);
-        }
+        schedule_while_running(
+            SHUTDOWN_COMPLETE.load(std::sync::atomic::Ordering::Acquire),
+            slot.borrow().as_ref(),
+            delay_ms,
+        );
     });
+}
+
+fn schedule_while_running(
+    shutdown_complete: bool,
+    scheduler: Option<&PumpScheduler>,
+    delay_ms: i64,
+) -> bool {
+    if shutdown_complete {
+        return false;
+    }
+    let Some(scheduler) = scheduler else {
+        return false;
+    };
+    scheduler(delay_ms);
+    true
 }
 
 /// Must run before ZGX or application data are initialized. A non-negative
@@ -328,6 +448,7 @@ fn initialize_inner() -> Result<Runtime, String> {
         contexts: HashMap::new(),
         permissions: HashMap::new(),
         browsers: HashMap::new(),
+        deferred_browser_closes: VecDeque::new(),
         shutting_down: false,
     })
 }
@@ -500,7 +621,18 @@ fn profile_component(profile: &str) -> Result<String, String> {
 }
 
 pub(super) fn pump() {
+    #[cfg(debug_assertions)]
+    let pump_number = PUMP_CALLS.with(|count| {
+        let next = count.get().saturating_add(1);
+        count.set(next);
+        next
+    });
+    #[cfg(debug_assertions)]
+    if pump_number <= 32 {
+        super::cef_trace!(&format!("PUMP begin n={pump_number}"));
+    }
     if !PUMPING.with(enter_pump) {
+        super::cef_trace!("PUMP reentrant deferred");
         // CEF may enter a nested native message loop while work is running.
         // Record the request; do not schedule into the nested loop, which
         // could otherwise spin before the active call returns.
@@ -514,6 +646,7 @@ pub(super) fn pump() {
     });
     PUMPING.with(|pumping| pumping.set(false));
     if PUMP_DEFERRED.with(take_deferred_pump) {
+        super::cef_trace!("PUMP deferred request scheduled after return");
         schedule_work(0);
     }
 }
@@ -548,6 +681,7 @@ pub(super) fn browser_creation_started() -> u64 {
         tracker.pending_creations.insert(id, false).is_none(),
         "CEF browser creation ID was reused"
     );
+    super::cef_trace!(&format!("CREATE_START id={id}"));
     id
 }
 
@@ -555,7 +689,11 @@ pub(super) fn browser_creation_failed(creation_id: u64) -> bool {
     let mut tracker = browsers()
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
-    tracker.pending_creations.remove(&creation_id).is_some()
+    let removed = tracker.pending_creations.remove(&creation_id).is_some();
+    super::cef_trace!(&format!(
+        "CREATE_REJECTED id={creation_id} tracked={removed}"
+    ));
+    removed
 }
 
 /// Marks an accepted asynchronous creation as unwanted without releasing it
@@ -569,9 +707,11 @@ pub(super) fn browser_creation_cancelled(creation_id: u64) -> bool {
         return false;
     };
     if *cancelled {
+        super::cef_trace!(&format!("CREATE_CANCEL_DUPLICATE id={creation_id}"));
         return false;
     }
     *cancelled = true;
+    super::cef_trace!(&format!("CREATE_CANCEL id={creation_id}"));
     true
 }
 
@@ -583,6 +723,9 @@ pub(super) fn browser_created(creation_id: u64, identifier: i32) -> bool {
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
     let creation_was_pending = tracker.pending_creations.remove(&creation_id) == Some(false);
+    super::cef_trace!(&format!(
+        "ON_AFTER_CREATED id={creation_id} browser={identifier} active={creation_was_pending}"
+    ));
     assert!(
         tracker.open_ids.insert(identifier),
         "CEF reused a browser ID while the previous browser was still open"
@@ -599,6 +742,12 @@ pub(super) fn register_browser(browser: &Browser) -> Result<(), String> {
             failure = Some("CEF browser arrived after runtime shutdown".to_owned());
             return;
         };
+        if runtime.browsers.contains_key(&identifier) {
+            failure = Some(format!(
+                "CEF reused browser identifier {identifier} while it is still tracked"
+            ));
+            return;
+        }
         if runtime.shutting_down {
             failure = Some("CEF is shutting down".to_owned());
             return;
@@ -606,6 +755,59 @@ pub(super) fn register_browser(browser: &Browser) -> Result<(), String> {
         runtime.browsers.insert(identifier, browser.clone());
     });
     failure.map_or(Ok(()), Err)
+}
+
+/// Queue a browser close requested from `on_after_created` or another CEF
+/// callback. CEF 156 on macOS can re-enter browser teardown from
+/// `CloseBrowser` while `do_message_loop_work` is still creating the browser;
+/// keep the real browser tracked, then close it on the next ZGX event-loop
+/// turn, after the active CEF pump has returned.
+pub(super) fn defer_browser_close(browser: Browser, reason: &str) {
+    let identifier = browser.identifier();
+    let queued = RUNTIME.with(|runtime| {
+        let mut runtime = runtime.borrow_mut();
+        let Some(runtime) = runtime.as_mut() else {
+            return false;
+        };
+        runtime
+            .browsers
+            .entry(identifier)
+            .or_insert_with(|| browser.clone());
+        runtime.deferred_browser_closes.push_back(browser);
+        true
+    });
+    super::cef_trace!(&format!(
+        "CLOSE_REQUEST_DEFERRED reason={reason} browser={identifier} queued={queued}"
+    ));
+    if queued {
+        schedule_work(0);
+    }
+}
+
+/// Execute callback-originated close requests only from a later event-loop
+/// turn. Call before entering the next CEF pump, never from a CEF callback.
+pub(super) fn close_deferred_browsers() {
+    if PUMPING.with(std::cell::Cell::get) {
+        super::cef_trace!("CLOSE_REQUEST_DISPATCH_DEFERRED_ACTIVE_PUMP");
+        PUMP_DEFERRED.with(defer_pump);
+        return;
+    }
+    let pending = RUNTIME.with(|runtime| {
+        let mut runtime = runtime.borrow_mut();
+        runtime
+            .as_mut()
+            .map(|runtime| std::mem::take(&mut runtime.deferred_browser_closes))
+            .unwrap_or_default()
+    });
+    for browser in pending {
+        let identifier = browser.identifier();
+        super::cef_trace!(&format!("CLOSE_REQUEST_DISPATCHED browser={identifier}"));
+        if let Some(host) = browser.host() {
+            host.close_browser(1);
+        } else {
+            super::cef_trace!(&format!("CLOSE_REQUEST_NO_HOST browser={identifier}"));
+        }
+    }
 }
 
 pub(super) fn is_shutting_down() -> bool {
@@ -626,8 +828,19 @@ pub(super) fn begin_shutdown() {
         runtime.shutting_down = true;
         runtime.browsers.values().cloned().collect::<Vec<_>>()
     });
+    let (pending, browsers) = {
+        let tracker = browsers()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        (tracker.pending_creations.len(), tracker.open_ids.len())
+    };
+    super::cef_trace!(&format!("SHUTDOWN_BEGIN pending={pending} open={browsers}"));
     for browser in open {
         if let Some(host) = browser.host() {
+            super::cef_trace!(&format!(
+                "SHUTDOWN_CLOSE_REQUEST browser={}",
+                browser.identifier()
+            ));
             host.close_browser(1);
         }
     }
@@ -643,6 +856,7 @@ pub(super) fn browser_closed(identifier: i32) {
         removed,
         "CEF closed an unknown or already-closed browser ID"
     );
+    super::cef_trace!(&format!("ON_BEFORE_CLOSE browser={identifier}"));
     RUNTIME.with(|runtime| {
         if let Some(runtime) = runtime.borrow_mut().as_mut() {
             runtime.browsers.remove(&identifier);
@@ -668,8 +882,14 @@ pub(super) fn ensure_accepting_browsers() -> Result<(), String> {
 
 pub(super) fn shutdown() -> Result<(), String> {
     if has_browsers() {
+        super::cef_trace!("SHUTDOWN_BLOCKED browser_or_creation_pending");
         return Err("CEF shutdown requested while browser creation or closure is pending".into());
     }
+    super::cef_trace!("CEF_SHUTDOWN");
+    SHUTDOWN_COMPLETE.store(true, std::sync::atomic::Ordering::Release);
+    SCHEDULER.with(|scheduler| {
+        scheduler.borrow_mut().take();
+    });
     RUNTIME.with(|runtime| {
         if runtime.borrow_mut().take().is_some() {
             cef::shutdown();
@@ -682,7 +902,8 @@ pub(super) fn shutdown() -> Result<(), String> {
 mod tests {
     use super::{
         browser_closed, browser_created, browser_creation_cancelled, browser_creation_failed,
-        browser_creation_started, has_browsers, mock_keychain_allowed, mock_keychain_requested,
+        browser_creation_started, close_race_trace_allowed, has_browsers, mock_keychain_allowed,
+        mock_keychain_requested, schedule_while_running,
     };
     use std::{collections::HashMap, fs, path::Path, time::SystemTime};
 
@@ -770,6 +991,75 @@ mod tests {
         ));
 
         fs::remove_dir_all(profile).unwrap();
+    }
+
+    #[test]
+    fn close_race_diagnostics_are_limited_to_temporary_fixture_runs() {
+        let temp_root = std::env::temp_dir();
+        let directory = temp_root.join(format!(
+            "zgx-cef-close-trace-test-{}-{:?}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let data_dir = directory.join("data");
+        let output_dir = directory.join("logs");
+        fs::create_dir_all(&data_dir).unwrap();
+        fs::create_dir_all(&output_dir).unwrap();
+
+        assert!(close_race_trace_allowed(
+            Some("cef_web_view"),
+            Some(&data_dir),
+            Some(&output_dir),
+            &temp_root,
+            true,
+        ));
+        assert!(!close_race_trace_allowed(
+            Some("Polyscale"),
+            Some(&data_dir),
+            Some(&output_dir),
+            &temp_root,
+            true,
+        ));
+        assert!(!close_race_trace_allowed(
+            Some("cef_web_view"),
+            Some(Path::new("/")),
+            Some(&output_dir),
+            &temp_root,
+            true,
+        ));
+        assert!(!close_race_trace_allowed(
+            Some("cef_web_view"),
+            Some(&data_dir),
+            Some(Path::new("/")),
+            &temp_root,
+            true,
+        ));
+        assert!(!close_race_trace_allowed(
+            Some("cef_web_view"),
+            Some(&data_dir),
+            Some(&output_dir),
+            &temp_root,
+            false,
+        ));
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn pump_scheduler_is_silent_after_cef_shutdown() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = calls.clone();
+        let scheduler: super::PumpScheduler = std::sync::Arc::new(move |_| {
+            observed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+
+        assert!(!schedule_while_running(true, Some(&scheduler), 0));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert!(schedule_while_running(false, Some(&scheduler), 12));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 
     #[test]

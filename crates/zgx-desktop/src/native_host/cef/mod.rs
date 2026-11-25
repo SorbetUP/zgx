@@ -6,6 +6,18 @@ mod runtime;
 
 use zgx::web_view::PageViews;
 
+#[cfg(debug_assertions)]
+macro_rules! cef_trace {
+    ($message:expr $(,)?) => {
+        $crate::native_host::cef::trace_close_race($message)
+    };
+}
+#[cfg(not(debug_assertions))]
+macro_rules! cef_trace {
+    ($message:expr $(,)?) => {};
+}
+pub(crate) use cef_trace;
+
 pub(crate) fn page_views(
     dialogs: crate::FileDialogs,
     tasks: crate::TaskSpawner,
@@ -23,6 +35,9 @@ pub(crate) fn page_views(
 
 pub(crate) fn pump() {
     runtime::pump();
+}
+pub(crate) fn close_deferred_browsers() {
+    runtime::close_deferred_browsers();
 }
 pub(crate) fn shutdown() -> Result<(), String> {
     runtime::shutdown()
@@ -49,6 +64,13 @@ pub(crate) fn set_scheduler(schedule: std::sync::Arc<dyn Fn(i64)>) {
 pub(crate) fn schedule_work(delay_ms: i64) {
     runtime::schedule_work(delay_ms);
 }
+#[cfg(debug_assertions)]
+pub(crate) fn trace_close_race(message: &str) {
+    runtime::trace_close_race_impl(message);
+}
+#[cfg(not(debug_assertions))]
+#[inline(always)]
+pub(crate) fn trace_close_race(_: &str) {}
 pub(crate) fn has_browsers() -> bool {
     runtime::has_browsers()
 }

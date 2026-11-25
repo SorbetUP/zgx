@@ -287,6 +287,7 @@ impl WebViewBackend for CefWebView {
 
 impl Drop for CefWebView {
     fn drop(&mut self) {
+        super::cef_trace!("WEBVIEW_BACKEND_DROP");
         self.0.lifecycle.set(BrowserLifecycle::Closing);
         if let Some(creation_id) = self.0.creation_id.take() {
             runtime::browser_creation_cancelled(creation_id);
@@ -299,6 +300,10 @@ impl Drop for CefWebView {
         // the RefCell borrow across that CEF call: on_before_close clears it.
         close_after_releasing_slot(&self.0.browser, |browser| {
             if let Some(host) = browser.host() {
+                super::cef_trace!(&format!(
+                    "CLOSE_REQUEST backend_drop browser={}",
+                    browser.identifier()
+                ));
                 host.close_browser(1);
             }
         });
@@ -627,29 +632,26 @@ pub(super) fn backend(
                 page.creation_id.set(None);
             }
             if !runtime::browser_created(creation_id, browser.identifier()) {
-                if let Some(host) = browser.host() {
-                    host.close_browser(1);
-                }
+                runtime::defer_browser_close(browser.clone(), "late_create");
                 return;
             }
             if runtime::register_browser(&browser).is_err() {
-                if let Some(host) = browser.host() {
-                    host.close_browser(1);
-                }
+                runtime::defer_browser_close(browser.clone(), "register_failed");
                 return;
             }
             let Some(page) = created_weak.upgrade() else {
-                if let Some(host) = browser.host() {
-                    host.close_browser(1);
-                }
+                runtime::defer_browser_close(browser.clone(), "controller_gone");
                 return;
             };
             *page.browser.borrow_mut() = Some(browser.clone());
             if page.lifecycle.get() != BrowserLifecycle::Creating {
+                super::cef_trace!(&format!(
+                    "CLOSE_REQUEST lifecycle={:?} browser={}",
+                    page.lifecycle.get(),
+                    browser.identifier()
+                ));
                 page.lifecycle.set(BrowserLifecycle::Closing);
-                if let Some(host) = browser.host() {
-                    host.close_browser(1);
-                }
+                runtime::defer_browser_close(browser.clone(), "lifecycle_mismatch");
                 return;
             }
             page.lifecycle.set(BrowserLifecycle::Ready);
@@ -676,6 +678,7 @@ pub(super) fn backend(
             let _ = page.web.upgrade();
         }),
         before_close: Rc::new(move |identifier| {
+            super::cef_trace!(&format!("BEFORE_CLOSE_CALLBACK browser={identifier}"));
             runtime::browser_closed(identifier);
             if let Some(page) = closed_weak.upgrade() {
                 page.lifecycle.set(BrowserLifecycle::Closed);
@@ -733,12 +736,18 @@ pub(super) fn backend(
         Some(&mut context),
     );
     if accepted == 0 {
+        super::cef_trace!(&format!("CEF_CREATE_REJECTED id={creation_id}"));
         runtime::browser_creation_failed(creation_id);
         page.creation_id.set(None);
         return Err("CEF rejected asynchronous windowless browser creation".into());
     }
+    super::cef_trace!(&format!("CEF_CREATE_ACCEPTED id={creation_id}"));
     runtime::schedule_work(0);
     web.attach(Rc::new(CefWebView(page.clone())));
+    if runtime::close_race_fixture_enabled() {
+        super::cef_trace!("FIXTURE_PAGE_CLOSE_AFTER_ACCEPTED");
+        web.close();
+    }
     Ok(page)
 }
 
@@ -843,30 +852,22 @@ pub(super) fn prepare_popup(
                 page.creation_id.set(None);
             }
             if !runtime::browser_created(creation_id, browser.identifier()) {
-                if let Some(host) = browser.host() {
-                    host.close_browser(1);
-                }
+                runtime::defer_browser_close(browser.clone(), "popup_late_create");
                 return;
             }
             if runtime::register_browser(&browser).is_err() {
-                if let Some(host) = browser.host() {
-                    host.close_browser(1);
-                }
+                runtime::defer_browser_close(browser.clone(), "popup_register_failed");
                 return;
             }
             let Some(page) = created_page.upgrade() else {
-                if let Some(host) = browser.host() {
-                    host.close_browser(1);
-                }
+                runtime::defer_browser_close(browser.clone(), "popup_controller_gone");
                 return;
             };
             *page.browser.borrow_mut() = Some(browser.clone());
             created_map.borrow_mut().remove(&popup_id);
             if page.lifecycle.get() != BrowserLifecycle::Creating {
                 page.lifecycle.set(BrowserLifecycle::Closing);
-                if let Some(host) = browser.host() {
-                    host.close_browser(1);
-                }
+                runtime::defer_browser_close(browser.clone(), "popup_lifecycle_mismatch");
                 return;
             }
             page.lifecycle.set(BrowserLifecycle::Ready);

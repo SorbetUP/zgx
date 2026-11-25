@@ -5,6 +5,7 @@ use std::{
     fs,
     io::{Read, Write},
     net::TcpListener,
+    path::Path,
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     sync::{Arc, Mutex},
     thread,
@@ -17,6 +18,35 @@ use zgx::{
 use zgx_desktop::{Application, WindowBounds, WindowOptions};
 
 const DOWNLOAD_PAYLOAD: &[u8] = b"cef-download-payload";
+
+#[cfg(debug_assertions)]
+fn trace_close_race(result: Option<&Path>, message: &str) {
+    let Some(result) = result else { return };
+    let (Some(parent), Ok(temp_dir)) = (result.parent(), std::env::temp_dir().canonicalize())
+    else {
+        return;
+    };
+    if !parent
+        .canonicalize()
+        .is_ok_and(|parent| parent.starts_with(temp_dir))
+    {
+        return;
+    }
+    let diagnostic = result.with_extension("diagnostic");
+    if fs::metadata(&diagnostic).is_ok_and(|metadata| metadata.len() >= 32 * 1024) {
+        return;
+    }
+    let message: String = message.chars().take(240).collect();
+    let _ = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(diagnostic)
+        .and_then(|mut file| writeln!(file, "{message}"));
+}
+
+#[cfg(not(debug_assertions))]
+#[inline(always)]
+fn trace_close_race(_: Option<&Path>, _: &str) {}
 
 const FIXTURE: &str = r#"<!doctype html>
 <meta charset="utf-8"><title>CEF OSR fixture</title>
@@ -352,6 +382,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some(result_path) = close_race_result_path.as_ref() {
         fs::write(result_path, "START\n")?;
+        trace_close_race(Some(result_path), "FIXTURE_START");
     }
     if let Some(result_path) = navigation_eval_race_result_path.as_ref() {
         fs::write(result_path, "START\n")?;
@@ -394,6 +425,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ..Default::default()
                 },
             );
+            trace_close_race(close_race_result_path.as_deref(), "WEBVIEW_CONTROLLER_CREATED");
             let late_shared = late_load_test.then(|| {
                 WebView::new(
                     &cx.ui.runtime,
@@ -675,8 +707,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 });
             } else if close_race_test {
-                // The mount callback below closes this page before the CEF
-                // creation callback is allowed to return to the message pump.
+                // The backend closes this fixture controller immediately
+                // after CEF accepts asynchronous creation; mounting closes
+                // the window while the late creation is still pending.
             } else if site_data_test {
                 let site_web = web.clone();
                 let site_origin = origin.clone();
@@ -1136,12 +1169,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let app = if close_race_test {
                 let page = web.clone();
                 let window = cx.window.clone();
+                let result_path = close_race_result_path.clone();
                 zgx::web_view::web_view(&web)
                     .grow()
                     .w_full()
                     .h_full()
                     .on_mount(move |_| {
-                        page.close();
+                        trace_close_race(result_path.as_deref(), "FIXTURE_ON_MOUNT");
+                        if !page.is_closed() {
+                            trace_close_race(
+                                result_path.as_deref(),
+                                "FIXTURE_FAIL_CONTROLLER_STILL_OPEN",
+                            );
+                        }
+                        trace_close_race(result_path.as_deref(), "FIXTURE_WINDOW_CLOSE");
                         window.close();
                     })
             } else if late_load_test {
@@ -1174,10 +1215,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let _view = cx.render(app);
         });
     if let Some(result_path) = close_race_result_path {
-        fs::write(
-            result_path,
-            if run_result.is_ok() { "PASS" } else { "FAIL" },
-        )?;
+        trace_close_race(
+            Some(&result_path),
+            if run_result.is_ok() {
+                "APPLICATION_RETURNED_OK"
+            } else {
+                "APPLICATION_RETURNED_ERROR"
+            },
+        );
+        let diagnostic = fs::read_to_string(result_path.with_extension("diagnostic"))?;
+        let positions = [
+            "CEF_CREATE_ACCEPTED",
+            "FIXTURE_PAGE_CLOSE_AFTER_ACCEPTED",
+            "CEF_ON_AFTER_CREATED",
+            "ON_AFTER_CREATED id=1 browser=1 active=false",
+            "CLOSE_REQUEST_DEFERRED reason=late_create",
+            "CEF_PUMP_RETURN",
+            "CLOSE_REQUEST_DISPATCHED",
+            "ON_BEFORE_CLOSE",
+        ]
+        .map(|marker| diagnostic.find(marker));
+        let deferred_close_ok = positions.iter().all(Option::is_some)
+            && positions.windows(2).all(|pair| pair[0] < pair[1]);
+        let pass = run_result.is_ok() && deferred_close_ok;
+        fs::write(result_path, if pass { "PASS" } else { "FAIL" })?;
+        if !deferred_close_ok {
+            return Err("close-race fixture missed a deferred CEF close lifecycle event".into());
+        }
     }
     let _ = fs::remove_dir_all(fixture_data_dir);
     run_result?;

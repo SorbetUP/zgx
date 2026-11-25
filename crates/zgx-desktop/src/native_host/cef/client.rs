@@ -344,11 +344,19 @@ wrap_life_span_handler! {
 
         fn on_after_created(&self, browser: Option<&mut Browser>) {
             if let Some(browser) = browser {
+                super::cef_trace!(&format!(
+                    "CEF_ON_AFTER_CREATED browser={}",
+                    browser.identifier()
+                ));
                 (self.callbacks.created)(browser.clone());
             }
         }
         fn on_before_close(&self, browser: Option<&mut Browser>) {
             if let Some(browser) = browser {
+                super::cef_trace!(&format!(
+                    "CEF_ON_BEFORE_CLOSE browser={}",
+                    browser.identifier()
+                ));
                 (self.callbacks.before_close)(browser.identifier());
             }
         }
