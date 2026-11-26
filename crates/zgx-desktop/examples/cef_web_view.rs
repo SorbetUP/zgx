@@ -322,12 +322,16 @@ fn start_fixture_server(
     let popup_diagnostic_path = std::env::var_os("ZGX_CEF_POPUP_RESULT")
         .map(std::path::PathBuf::from)
         .map(|path| path.with_extension("diagnostic"));
+    let drag_diagnostic_path = std::env::var_os("ZGX_CEF_DRAG_RESULT")
+        .map(std::path::PathBuf::from)
+        .map(|path| path.with_extension("diagnostic"));
     let html_base_log_path = html_base_result_path;
     thread::spawn(move || {
         for stream in listener.incoming().flatten() {
             let result_path = result_path.clone();
             let site_data_result_path = site_data_result_path.clone();
             let popup_diagnostic_path = popup_diagnostic_path.clone();
+            let drag_diagnostic_path = drag_diagnostic_path.clone();
             let html_base_log_path = html_base_log_path.clone();
             thread::spawn(move || {
                 let mut stream = stream;
@@ -341,6 +345,13 @@ fn start_fixture_server(
                         .append(true)
                         .open(path_out)
                         .and_then(|mut result| writeln!(result, "POPUP_HTTP:{path}"));
+                }
+                if let Some(path_out) = drag_diagnostic_path.as_ref() {
+                    let _ = fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(path_out)
+                        .and_then(|mut result| writeln!(result, "DRAG_HTTP:{path}"));
                 }
                 if let Some(result_path) = html_base_log_path.as_ref()
                     && let Ok(mut result) = fs::OpenOptions::new()
@@ -898,7 +909,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         zgx::timer::sleep(std::time::Duration::from_millis(50)).await;
                     }
                     if !ready {
-                        let _ = fs::write(&timeout_result, "FAIL:drag-pages-not-ready");
+                        let _ = fs::write(
+                            &timeout_result,
+                            format!(
+                                "FAIL:drag-pages-not-ready:source_title={:?}:source_loading={}:target_title={:?}:target_loading={}",
+                                source.title(),
+                                source.state().with_untracked(|state| state.loading),
+                                task_target.title(),
+                                task_target.state().with_untracked(|state| state.loading),
+                            ),
+                        );
                         window.close();
                         return;
                     }
