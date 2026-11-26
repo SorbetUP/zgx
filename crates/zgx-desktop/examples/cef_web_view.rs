@@ -478,7 +478,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let download_result_path =
         std::env::var_os("ZGX_CEF_DOWNLOAD_RESULT").map(std::path::PathBuf::from);
     let download_test = download_result_path.is_some();
-    let input_result_path = std::env::var_os("ZGX_CEF_INPUT_RESULT").map(std::path::PathBuf::from);
+    let input_result_path = std::env::args()
+        .find_map(|argument| {
+            argument
+                .strip_prefix("--cef-input-result=")
+                .map(std::path::PathBuf::from)
+        })
+        .or_else(|| std::env::var_os("ZGX_CEF_INPUT_RESULT").map(std::path::PathBuf::from));
+    let skip_input = std::env::var_os("ZGX_CEF_SKIP_INPUT").is_some()
+        || std::env::args().any(|argument| argument == "--cef-skip-input");
+    let skip_ime = std::env::var_os("ZGX_CEF_SKIP_IME").is_some()
+        || std::env::args().any(|argument| argument == "--cef-skip-ime");
     let input_test = input_result_path.is_some();
     let event_result_path = std::env::var_os("ZGX_CEF_EVENT_RESULT").map(std::path::PathBuf::from);
     let event_test = event_result_path.is_some();
@@ -1479,7 +1489,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 input_window.close();
                                 return;
                             };
-                            let skip_input = std::env::var_os("ZGX_CEF_SKIP_INPUT").is_some();
                             if !skip_input {
                                 input.dispatch(&scene, InputEvent::PointerMove { x, y });
                                 input.dispatch(&scene, InputEvent::PointerDown { x, y, button: PointerButton::Primary });
@@ -1491,7 +1500,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 input.dispatch(&scene, InputEvent::KeyUp { key: Key::Character("a".into()), modifiers: Modifiers::default() });
                                 trace_close_race(Some(&input_result), "INPUT_KEY_EVENTS_SENT");
                             }
-                            let skip_ime = std::env::var_os("ZGX_CEF_SKIP_IME").is_some();
                             if !skip_input && !skip_ime {
                                 input.dispatch(&scene, InputEvent::ImePreedit { text: "🦀".into(), cursor: Some((4, 4)) });
                                 input.dispatch(&scene, InputEvent::ImeCommit("🦀".into()));
@@ -1503,9 +1511,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 // before issuing the readback over DevTools.
                                 zgx::timer::sleep(std::time::Duration::from_millis(100)).await;
                                 trace_close_race(Some(&input_result), "INPUT_READBACK_REQUESTED");
+                                // Keep the WebView controller alive through
+                                // the asynchronous DevTools result. The task
+                                // only needs it to enqueue the request; without
+                                // this capture it can drop the last fixture
+                                // handle before CEF replies.
+                                let keep_alive = page.clone();
                                 page.evaluate_js(
                                     "document.querySelector('#typing').value",
                                     move |value| {
+                                        drop(keep_alive);
                                         trace_close_race(
                                             Some(&input_result),
                                             &format!("INPUT_READBACK_RESULT:{value:?}"),
@@ -1766,6 +1781,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             let _view = cx.render(app);
         });
+    if let Some(result_path) = input_result_path.as_ref() {
+        trace_close_race(
+            Some(result_path),
+            if run_result.is_ok() {
+                "INPUT_APPLICATION_RETURNED_OK"
+            } else {
+                "INPUT_APPLICATION_RETURNED_ERROR"
+            },
+        );
+        if let Err(error) = &run_result {
+            fs::write(result_path, format!("FAIL:application:{error}"))?;
+        }
+    }
     if let Some(result_path) = close_race_result_path {
         trace_close_race(
             Some(&result_path),
