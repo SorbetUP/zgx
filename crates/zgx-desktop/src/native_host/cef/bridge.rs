@@ -53,8 +53,10 @@ struct RendererBrowserConfig {
 /// Renderer-internal map of (browser id, frame id) to the security origin the
 /// browser computed for that frame's current document. Captured from
 /// `globalThis.origin` at context creation (see `on_context_created`); the
-/// page cannot forge it, and it is never derived from the frame's URL.
-type FrameOrigins = Arc<Mutex<HashMap<(i32, String), String>>>;
+/// page cannot forge it, and it is never derived from the frame's URL. The
+/// value stores the raw context pointer that set it, so releasing an OLD
+/// context never drops the origin of the NEW document in the same frame.
+type FrameOrigins = Arc<Mutex<HashMap<(i32, String), (String, usize)>>>;
 
 wrap_v8_handler! {
     struct PostMessageHandler { frame: Frame, browser_id: i32, frame_origins: FrameOrigins }
@@ -99,7 +101,7 @@ wrap_v8_handler! {
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner())
                 .get(&(self.browser_id, frame_id))
-                .cloned()
+                .map(|(origin, _)| origin.clone())
                 .unwrap_or_else(|| "null".to_owned());
             let name: CefString = MESSAGE_NAME.into();
             let Some(mut message) = process_message_create(Some(&name)) else {
@@ -227,7 +229,7 @@ wrap_render_process_handler! {
                 self.frame_origins
                     .lock()
                     .unwrap_or_else(|poison| poison.into_inner())
-                    .insert((browser_id, frame_id.clone()), origin.clone());
+                    .insert((browser_id, frame_id.clone()), (origin.clone(), context.get_raw() as usize));
                 bridge_trace(&format!(
                     "on-context-created origin id={browser_id} frame={frame_id} main={main_frame} opaque={}",
                     origin == "null"
@@ -333,17 +335,27 @@ wrap_render_process_handler! {
             &self,
             browser: Option<&mut Browser>,
             frame: Option<&mut Frame>,
-            _context: Option<&mut V8Context>,
+            context: Option<&mut V8Context>,
         ) {
-            // Contexts are per document: drop the origin entry with the
-            // context so a stale origin is never attached to a later document
-            // in the same frame.
-            let (Some(browser), Some(frame)) = (browser, frame) else { return };
+            // Contexts are per document: drop the origin entry only if this
+            // released context is the one that set it — a navigation creates
+            // the new document's context before the old one is released, and
+            // the old release must not erase the new document's origin.
+            let (Some(browser), Some(frame), Some(context)) = (browser, frame, context) else {
+                return;
+            };
             let frame_id = CefString::from(&frame.identifier()).to_string();
-            self.frame_origins
+            let released_raw = context.get_raw() as usize;
+            let mut origins = self
+                .frame_origins
                 .lock()
-                .unwrap_or_else(|poison| poison.into_inner())
-                .remove(&(browser.identifier(), frame_id));
+                .unwrap_or_else(|poison| poison.into_inner());
+            if origins
+                .get(&(browser.identifier(), frame_id.clone()))
+                .is_some_and(|(_, raw)| *raw == released_raw)
+            {
+                origins.remove(&(browser.identifier(), frame_id));
+            }
         }
     }
 }
