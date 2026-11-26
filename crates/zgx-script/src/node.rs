@@ -411,6 +411,51 @@ impl UserData for WebUd {
             })?;
             Ok(crate::calls::PromiseUd(promise))
         });
+        // `web:subscribe(fn)`: the page's platform events for as long as the
+        // page lives — `fn(event)` with one table per event (`event.kind` one
+        // of "started", "committed", "finished", "failed", "changed", "title",
+        // "message", "new_window", "process_terminated"; see
+        // `lower::web_event_table`) — whatever nodes show it, so a page hidden
+        // (its node unmounted, the page kept loaded) still reports. The
+        // returned handle disconnects it; calling it again, or after
+        // `web:close()`, does nothing.
+        methods.add_method("subscribe", |lua, w, f: Function| {
+            let vm = env(lua)?.vm.clone();
+            let subscription = w.0.subscribe(move |event| {
+                let Some(vm) = vm.upgrade() else { return };
+                let Ok(table) = crate::lower::web_event_table(&vm.lua, event) else {
+                    return;
+                };
+                if let Err(e) = vm.call::<()>(&f, table) {
+                    vm.report(e);
+                }
+            });
+            let disconnect = lua.create_function(move |_, ()| {
+                subscription.disconnect();
+                Ok(())
+            })?;
+            Ok(disconnect)
+        });
+        // `web:on_download(fn)`: the page's downloads for as long as it lives,
+        // unlike the webview's `on_download`, which lives with its node.
+        // Without this (or that), no download is saved.
+        methods.add_method("on_download", |lua, w, f: Function| {
+            let vm = env(lua)?.vm.clone();
+            w.0.set_download_handler(move |request, responder| {
+                let Some(vm) = vm.upgrade() else { return };
+                let download = crate::io::DownloadUd::new(request, responder);
+                vm.runtime.clone().batch(|| {
+                    let called = vm
+                        .lua
+                        .create_userdata(download)
+                        .and_then(|d| vm.call::<()>(&f, d));
+                    if let Err(e) = called {
+                        vm.report(e);
+                    }
+                });
+            });
+            Ok(())
+        });
     }
 }
 /// JSON as script data (objects as maps, arrays as lists).

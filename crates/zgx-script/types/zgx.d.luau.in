@@ -1553,6 +1553,16 @@ declare extern type Web with
 	-- A page from `ui.web(id, opts)` leaves the host's registry: the next
 	-- `ui.web(id)` makes a new one.
 	function close(self): ()
+	-- The page's platform events for as long as the page lives, whatever
+	-- nodes show it (a hidden page — its node unmounted, the page kept
+	-- loaded — still reports): `fn(event)` with one table per event. The
+	-- returned handle disconnects them; calling it again, or after
+	-- `close()`, does nothing.
+	function subscribe(self, fn: (e: WebControllerEvent) -> ...unknown): () -> ()
+	-- The page's downloads for as long as it lives, unlike the webview's
+	-- `on_download`, which lives with its node. Without this (or that),
+	-- no download is saved.
+	function on_download(self, fn: (d: Download) -> ...unknown): ()
 end
 export type WebOptions = {
 	transparent: boolean?,
@@ -1569,6 +1579,22 @@ export type WebOptions = {
 	[number]: never,
 }
 export type WebEvent = { kind: "started" | "committed" | "finished" | "failed" | "changed", url: string }
+-- `web:subscribe`'s event: what happened in the page, as one table.
+export type WebControllerEvent = {
+	kind: "started" | "committed" | "finished" | "failed" | "changed" | "title" | "message" | "new_window" | "process_terminated",
+	-- The navigation events ("started" … "changed") and "new_window": where.
+	url: string?,
+	-- "failed" only: why the navigation failed.
+	error: string?,
+	-- "title" only: the page's new title.
+	title: string?,
+	-- "message" only: what the page posted, as Luau data (JSON's shape,
+	-- whatever the page sent: `any`). `origin` is the sending frame's (any
+	-- page, any iframe, can post): check it before acting on it.
+	body: any?,
+	origin: string?,
+	main_frame: boolean?,
+}
 
 -- `ui.term(id, opts)`: a terminal session (a Ghostty surface with the
 -- desktop host's `ghostty` feature). Sessions outlive reloads: the run that

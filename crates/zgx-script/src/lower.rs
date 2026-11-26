@@ -2834,6 +2834,66 @@ fn drive_of(
     });
     Some((tokens, make))
 }
+/// A platform event as one Luau table, for `web:subscribe`'s handler:
+/// `kind` is one of `"started"`, `"committed"`, `"finished"`, `"failed"`,
+/// `"changed"` (each with `url`; `"failed"` also `error`), `"title"`
+/// (`title`), `"message"` (`body` as Luau data, `origin`, `main_frame`),
+/// `"new_window"` (`url`) or `"process_terminated"`.
+pub(crate) fn web_event_table(
+    lua: &mlua::Lua,
+    event: &zgx::web_view::WebViewEvent,
+) -> mlua::Result<mlua::Table> {
+    use zgx::web_view::WebViewEvent;
+    let table = lua.create_table()?;
+    match event {
+        WebViewEvent::NavigationStarted { url } => {
+            table.set("kind", "started")?;
+            table.set("url", url.as_str())?;
+        }
+        WebViewEvent::NavigationCommitted { url } => {
+            table.set("kind", "committed")?;
+            table.set("url", url.as_str())?;
+        }
+        WebViewEvent::NavigationFinished { url } => {
+            table.set("kind", "finished")?;
+            table.set("url", url.as_str())?;
+        }
+        WebViewEvent::NavigationFailed { url, error } => {
+            table.set("kind", "failed")?;
+            table.set("url", url.as_str())?;
+            table.set("error", error.as_str())?;
+        }
+        WebViewEvent::UrlChanged { url } => {
+            table.set("kind", "changed")?;
+            table.set("url", url.as_str())?;
+        }
+        WebViewEvent::TitleChanged { title } => {
+            table.set("kind", "title")?;
+            table.set("title", title.as_str())?;
+        }
+        WebViewEvent::Message {
+            body,
+            origin,
+            main_frame,
+        } => {
+            table.set("kind", "message")?;
+            // What the page posted, as Luau data; who sent it: check
+            // `origin` (and `main_frame`) before acting on it.
+            table.set("body", crate::node::json_value(body))?;
+            table.set("origin", origin.as_str())?;
+            table.set("main_frame", *main_frame)?;
+        }
+        WebViewEvent::NewWindowRequested { url } => {
+            table.set("kind", "new_window")?;
+            table.set("url", url.as_str())?;
+        }
+        WebViewEvent::ProcessTerminated => {
+            table.set("kind", "process_terminated")?;
+        }
+    }
+    Ok(table)
+}
+
 fn web_view_of(spec: &crate::node::WebSpec, vm: &Rc<Vm>, low: &Rc<Lowering>) -> View {
     use zgx::web_view::{WebViewEvent, web_view, web_view_src};
     let web = spec.web.clone();

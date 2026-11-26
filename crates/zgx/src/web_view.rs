@@ -621,6 +621,11 @@ struct Inner {
     queued: RefCell<Vec<WebViewCommand>>,
     listeners: RefCell<Vec<(u64, Listener)>>,
     next_listener: Cell<u64>,
+    /// Controller-level subscriptions ([`WebView::subscribe`]): kept here so
+    /// they live as long as the controller — a hidden page (its node
+    /// unmounted) still reports — and go only when they are disconnected or
+    /// the controller closes.
+    controller_subs: RefCell<Vec<WebViewSubscription>>,
     /// The last `set_src`, so an unchanged reactive source navigates once.
     src: RefCell<Option<String>>,
     policy: RefCell<Option<Policy>>,
@@ -666,16 +671,42 @@ impl WeakWebView {
 }
 /// Keeps an event subscription; dropping it unsubscribes.
 pub struct WebViewSubscription {
+    state: Rc<SubscriptionState>,
+}
+struct SubscriptionState {
     web: Weak<Inner>,
     id: u64,
+    /// False once disconnected: `disconnect` and `Drop` are then no-ops, so a
+    /// handle called (or dropped) twice, or after the controller closed,
+    /// unsubscribes exactly once.
+    active: Cell<bool>,
+}
+impl WebViewSubscription {
+    /// Stop the events now. Idempotent: calling it again, or after the
+    /// controller closed, does nothing.
+    pub fn disconnect(&self) {
+        if self.state.active.replace(false)
+            && let Some(inner) = self.state.web.upgrade()
+        {
+            inner.remove_listener(self.state.id);
+            inner.remove_controller_sub(self.state.id);
+        }
+    }
+    /// Whether it still receives events.
+    pub fn is_active(&self) -> bool {
+        self.state.active.get()
+    }
+}
+impl Clone for WebViewSubscription {
+    fn clone(&self) -> Self {
+        Self {
+            state: self.state.clone(),
+        }
+    }
 }
 impl Drop for WebViewSubscription {
     fn drop(&mut self) {
-        if let Some(inner) = self.web.upgrade()
-            && let Ok(mut listeners) = inner.listeners.try_borrow_mut()
-        {
-            listeners.retain(|(id, _)| *id != self.id);
-        }
+        self.disconnect();
     }
 }
 thread_local! {
@@ -726,6 +757,7 @@ impl WebView {
             queued: RefCell::new(Vec::new()),
             listeners: RefCell::new(Vec::new()),
             next_listener: Cell::new(0),
+            controller_subs: RefCell::new(Vec::new()),
             src: RefCell::new(None),
             policy: RefCell::new(None),
             chooser: RefCell::new(None),
@@ -862,12 +894,17 @@ impl WebView {
     /// End the page now: its platform page goes (with the process and the
     /// timers behind it), however many handles to this controller remain,
     /// and none is made for it again. Handles still kept (a script's, until
-    /// it collects them) do nothing.
+    /// it collects them) do nothing. Controller-level subscriptions
+    /// ([`WebView::subscribe`]) are disconnected here, once each.
     pub fn close(&self) {
         if self.0.closed.replace(true) {
             return;
         }
         self.0.queued.borrow_mut().clear();
+        // Taken out before dropping, so each subscription's own disconnect
+        // (which borrows this list) runs free of the borrow.
+        let controller_subs = std::mem::take(&mut *self.0.controller_subs.borrow_mut());
+        drop(controller_subs);
         drop(self.detach());
     }
     /// Whether it was closed (`close`).
@@ -1063,9 +1100,28 @@ impl WebView {
             .borrow_mut()
             .push((id, Rc::new(RefCell::new(listener))));
         WebViewSubscription {
-            web: Rc::downgrade(&self.0),
-            id,
+            state: Rc::new(SubscriptionState {
+                web: Rc::downgrade(&self.0),
+                id,
+                active: Cell::new(true),
+            }),
         }
+    }
+    /// Call `listener` with each platform event for as long as the controller
+    /// lives: until the returned subscription is disconnected (or dropped)
+    /// or the controller closes — whatever nodes show the page. A page
+    /// hidden (its node unmounted, the page kept loaded) still reports, so
+    /// what it does while hidden (navigating, posting, being active) reaches
+    /// the app. Unlike [`WebView::on_event`], whose subscription the caller
+    /// owns (a widget keeps it while its node is mounted), this one is kept
+    /// by the controller itself.
+    pub fn subscribe(&self, listener: impl FnMut(&WebViewEvent) + 'static) -> WebViewSubscription {
+        let subscription = self.on_event(listener);
+        self.0
+            .controller_subs
+            .borrow_mut()
+            .push(subscription.clone());
+        subscription
     }
 
     // The platform side.
@@ -1109,6 +1165,28 @@ impl WebView {
         for listener in listeners {
             if let Ok(mut listener) = listener.try_borrow_mut() {
                 listener(&event);
+            }
+        }
+    }
+}
+impl Inner {
+    /// Forget the listener `id` (a subscription's `disconnect`).
+    fn remove_listener(&self, id: u64) {
+        if let Ok(mut listeners) = self.listeners.try_borrow_mut() {
+            listeners.retain(|(lid, _)| *lid != id);
+        }
+    }
+    /// Forget the controller-level subscription `id`: the entry leaves the
+    /// list (dropping the clone it holds, whose own `disconnect` is then a
+    /// no-op — `active` is already false).
+    fn remove_controller_sub(&self, id: u64) {
+        let mut subs = self.controller_subs.borrow_mut();
+        let mut i = 0;
+        while i < subs.len() {
+            if subs[i].state.id == id {
+                subs.remove(i);
+            } else {
+                i += 1;
             }
         }
     }
@@ -1341,5 +1419,45 @@ mod tests {
         web.set_navigation_policy(|r| !r.url.starts_with("file:"));
         assert!(web.allows(&request("https://a.test/")));
         assert!(!web.allows(&request("file:///etc/passwd")));
+    }
+
+    #[test]
+    fn controller_subscriptions_live_until_disconnected_or_closed() {
+        let runtime = crate::reactive::Runtime::new();
+        let web = WebView::new(&runtime, WebViewOptions::default());
+        let hits = Rc::new(Cell::new(0));
+        let bump = {
+            let hits = hits.clone();
+            move |_: &WebViewEvent| hits.set(hits.get() + 1)
+        };
+        // A controller-level subscription: the controller keeps it, so it
+        // reports whatever nodes show the page (none here — it is "hidden").
+        let sub = web.subscribe(bump.clone());
+        assert!(sub.is_active());
+        web.emit(WebViewEvent::ProcessTerminated);
+        assert_eq!(hits.get(), 1);
+        // Disconnecting is idempotent: once, however often it is called.
+        sub.disconnect();
+        sub.disconnect();
+        assert!(!sub.is_active());
+        web.emit(WebViewEvent::ProcessTerminated);
+        assert_eq!(hits.get(), 1, "a disconnected subscription hears nothing");
+        // Another one, ended by the controller closing: exactly once.
+        let sub2 = web.subscribe(bump);
+        web.emit(WebViewEvent::ProcessTerminated);
+        assert_eq!(hits.get(), 2);
+        web.close();
+        assert!(!sub2.is_active());
+        web.emit(WebViewEvent::ProcessTerminated);
+        assert_eq!(hits.get(), 2, "close disconnects controller subscriptions");
+        // A handle used after close does not resurrect anything.
+        sub2.disconnect();
+        web.emit(WebViewEvent::ProcessTerminated);
+        assert_eq!(hits.get(), 2);
+        // The per-mount kind stays caller-owned, as before.
+        let mount = web.on_event(|_| {});
+        drop(mount);
+        web.emit(WebViewEvent::ProcessTerminated);
+        assert_eq!(hits.get(), 2);
     }
 }
