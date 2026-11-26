@@ -1,6 +1,6 @@
 use cef::{Browser, ImplBrowser, ImplBrowserHost, Rect};
 use std::sync::{Arc, Mutex};
-use std::{cell::RefCell, rc::Rc};
+use std::{cell::{Cell, RefCell}, rc::Rc};
 
 use zgx_gpu::viewport::{Viewport, ViewportFrame};
 
@@ -11,6 +11,9 @@ pub(super) struct Frame {
     pub width: u32,
     pub height: u32,
     pub pixels: Vec<u8>,
+    /// Dirty rects of the last paint (clamped to the surface). Empty means
+    /// the whole frame changed. Used to upload only the changed region.
+    pub dirty: Vec<Rect>,
     pub revision: u64,
     pub consumed: u64,
 }
@@ -66,6 +69,28 @@ pub(super) fn clamp_paint(
     })
 }
 
+/// Union bounding box of the dirty rects, as `(x, y, w, h)` in frame pixels.
+/// `None` (or a full-frame box) when nothing is dirty means "everything".
+fn dirty_union(dirty: &[Rect], size: (u32, u32)) -> Option<(u32, u32, u32, u32)> {
+    let mut iter = dirty.iter().filter(|r| r.width > 0 && r.height > 0);
+    let first = iter.next()?;
+    let mut x0 = first.x.max(0);
+    let mut y0 = first.y.max(0);
+    let mut x1 = (first.x + first.width).min(size.0 as i32);
+    let mut y1 = (first.y + first.height).min(size.1 as i32);
+    for r in iter {
+        x0 = x0.min(r.x.max(0));
+        y0 = y0.min(r.y.max(0));
+        x1 = x1.max((r.x + r.width).min(size.0 as i32));
+        y1 = y1.max((r.y + r.height).min(size.1 as i32));
+    }
+    let (x0, y0, x1, y1) = (x0.max(0), y0.max(0), x1.max(0), y1.max(0));
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    Some((x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32))
+}
+
 /// Clip `rect` to `bound`, keeping it inside `[0, bound]` on both axes.
 fn clamp_rect(rect: &Rect, bound: (i32, i32)) -> Rect {
     let x = rect.x.clamp(0, bound.0);
@@ -112,6 +137,7 @@ pub(super) fn release_frame_buffers(frame: &SharedFrame, popup: &SharedPopup) {
 pub(super) struct Painter {
     pub frame: SharedFrame,
     pub popup: SharedPopup,
+    pub visible: Rc<Cell<u32>>,
     size: (u32, u32),
     gpu: Option<Blit>,
     popup_gpu: Option<Blit>,
@@ -127,10 +153,12 @@ impl Painter {
         page_size: Arc<Mutex<(i32, i32)>>,
         scale: Arc<Mutex<f32>>,
         browser: Rc<RefCell<Option<Browser>>>,
+        visible: Rc<Cell<u32>>,
     ) -> Self {
         Self {
             frame,
             popup,
+            visible,
             size: (1024, 768),
             gpu: None,
             popup_gpu: None,
@@ -193,7 +221,14 @@ impl Viewport for Painter {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         let source_size = (shared.width, shared.height);
-        if source_size.0 > 0 && source_size.1 > 0 && shared.revision != shared.consumed {
+        // A hidden view holds no GPU texture: drop it and swallow the frame
+        // so hidden pages release their video memory.
+        let hidden = self.visible.get() == 0;
+        if hidden {
+            blit.texture = None;
+            shared.consumed = shared.revision;
+        }
+        if !hidden && source_size.0 > 0 && source_size.1 > 0 && shared.revision != shared.consumed {
             let fresh = blit
                 .texture
                 .as_ref()
@@ -232,25 +267,61 @@ impl Viewport for Painter {
             }
             if let Some((texture, _, _)) = &blit.texture {
                 // CEF returns tightly packed premultiplied BGRA pixels.
-                frame.queue.write_texture(
-                    wgpu::TexelCopyTextureInfo {
-                        texture,
-                        mip_level: 0,
-                        origin: wgpu::Origin3d::ZERO,
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    &shared.pixels,
-                    wgpu::TexelCopyBufferLayout {
-                        offset: 0,
-                        bytes_per_row: Some(source_size.0 * 4),
-                        rows_per_image: Some(source_size.1),
-                    },
-                    wgpu::Extent3d {
-                        width: source_size.0,
-                        height: source_size.1,
-                        depth_or_array_layers: 1,
-                    },
-                );
+                // Upload only the dirty region when it is much smaller than
+                // the whole frame: write_texture needs a 256-byte-aligned row
+                // pitch, so the region is staged into a pitched buffer.
+                let full = source_size.0 as u64 * source_size.1 as u64;
+                let region = dirty_union(&shared.dirty, source_size);
+                let region_area = region.map_or(full, |r| r.2 as u64 * r.3 as u64);
+                if let Some((rx, ry, rw, rh)) = region.filter(|_| region_area * 10 < full * 6) {
+                    let pitch = (rw as usize * 4 + 255) & !255;
+                    let mut staging = vec![0u8; pitch * rh as usize];
+                    for row in 0..rh as usize {
+                        let src = ((ry as usize + row) * source_size.0 as usize + rx as usize) * 4;
+                        let dst = row * pitch;
+                        staging[dst..dst + rw as usize * 4]
+                            .copy_from_slice(&shared.pixels[src..src + rw as usize * 4]);
+                    }
+                    frame.queue.write_texture(
+                        wgpu::TexelCopyTextureInfo {
+                            texture,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d { x: rx, y: ry, z: 0 },
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        &staging,
+                        wgpu::TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(pitch as u32),
+                            rows_per_image: Some(rh),
+                        },
+                        wgpu::Extent3d {
+                            width: rw,
+                            height: rh,
+                            depth_or_array_layers: 1,
+                        },
+                    );
+                } else {
+                    frame.queue.write_texture(
+                        wgpu::TexelCopyTextureInfo {
+                            texture,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d::ZERO,
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        &shared.pixels,
+                        wgpu::TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(source_size.0 * 4),
+                            rows_per_image: Some(source_size.1),
+                        },
+                        wgpu::Extent3d {
+                            width: source_size.0,
+                            height: source_size.1,
+                            depth_or_array_layers: 1,
+                        },
+                    );
+                }
             }
             shared.consumed = shared.revision;
         }
@@ -528,20 +599,22 @@ mod tests {
 
     #[test]
     fn closing_browser_releases_view_and_popup_cpu_frames() {
-        let frame = Arc::new(Mutex::new(Frame {
+        let frame = Arc::new(Mutex::new( Frame {
             width: 32,
             height: 32,
             pixels: vec![255; 32 * 32 * 4],
             revision: 4,
             consumed: 3,
+            dirty: Vec::new(),
         }));
         let popup = Arc::new(Mutex::new(PopupFrame {
-            frame: Frame {
+             frame: Frame {
                 width: 8,
                 height: 8,
                 pixels: vec![127; 8 * 8 * 4],
                 revision: 2,
                 consumed: 1,
+                dirty: Vec::new(),
             },
             rect: (10, 12, 8, 8),
             visible: true,
@@ -565,6 +638,17 @@ mod tests {
     }
 
     #[test]
+    fn dirty_union_boxes_and_clips_the_changed_region() {
+        let rect = |x, y, w, h| Rect { x, y, width: w, height: h };
+        assert_eq!(dirty_union(&[], (100, 100)), None);
+        assert_eq!(dirty_union(&[rect(10, 10, 5, 5), rect(20, 20, 5, 5)], (100, 100)), Some((10, 10, 15, 15)));
+        // Clipped to the frame bounds.
+        assert_eq!(dirty_union(&[rect(90, 90, 50, 50)], (100, 100)), Some((90, 90, 10, 10)));
+        // Empty rects are ignored.
+        assert_eq!(dirty_union(&[rect(0, 0, 0, 0), rect(5, 5, 4, 4)], (100, 100)), Some((5, 5, 4, 4)));
+    }
+
+    #[test]
     fn painter_composes_cef_bgra_pixels_into_the_zgx_target() {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -582,7 +666,7 @@ mod tests {
         .expect("request test device");
 
         // Two rows of CEF BGRA pixels: red/green, then blue/white.
-        let source = Arc::new(Mutex::new(Frame {
+        let source = Arc::new(Mutex::new( Frame {
             width: 2,
             height: 2,
             pixels: vec![
@@ -590,14 +674,16 @@ mod tests {
             ],
             revision: 1,
             consumed: 1,
+            dirty: Vec::new(),
         }));
         let popup = Arc::new(Mutex::new(PopupFrame {
-            frame: Frame {
+             frame: Frame {
                 width: 1,
                 height: 1,
                 pixels: vec![0, 0, 255, 255],
                 revision: 1,
                 consumed: 1,
+                dirty: Vec::new(),
             },
             rect: (1, 0, 1, 1),
             visible: true,
@@ -608,6 +694,7 @@ mod tests {
             Arc::new(Mutex::new((2, 2))),
             Arc::new(Mutex::new(1.)),
             Rc::new(RefCell::new(None)),
+            Rc::new(Cell::new(1)),
         );
         // Simulate device loss after the current page and popup frames were
         // already consumed. They must be re-uploaded without a new CEF paint.

@@ -491,17 +491,58 @@ fn initialize_inner() -> Result<Runtime, String> {
 }
 
 fn use_mock_keychain() -> bool {
+    // Explicit override wins: POLYSCALE_CEF_KEYCHAIN=mock|system.
+    if let Some(mode) = std::env::var_os("POLYSCALE_CEF_KEYCHAIN") {
+        return mode.to_string_lossy().eq_ignore_ascii_case("mock");
+    }
     let executable = std::env::current_exe().ok().and_then(|path| {
         path.file_stem()
             .map(|stem| stem.to_string_lossy().into_owned())
     });
     let data_dir = std::env::var_os("POLYSCALE_CEF_DATA_DIR").map(PathBuf::from);
-    mock_keychain_allowed(
+    if mock_keychain_allowed(
         executable.as_deref(),
         data_dir.as_deref(),
         &std::env::temp_dir(),
         mock_keychain_requested(|name| std::env::var_os(name).is_some()),
-    )
+    ) {
+        return true;
+    }
+    // A properly Developer-ID-signed build may use the real login keychain
+    // (macOS then asks once and "Always Allow" persists for that signature).
+    // Ad-hoc-signed or unsigned local builds would be prompted on EVERY
+    // launch because the signature changes each build — use the mock
+    // keychain there so dev builds never nag for the admin password.
+    #[cfg(target_os = "macos")]
+    {
+        static SIGNED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        return *SIGNED.get_or_init(|| !developer_id_signed());
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
+/// True when the running executable carries a Developer ID (trusted)
+/// signature, i.e. not an ad-hoc (`-`) or unsigned binary.
+#[cfg(target_os = "macos")]
+fn developer_id_signed() -> bool {
+    let Ok(exe) = std::env::current_exe() else { return false };
+    let Ok(output) = std::process::Command::new("codesign")
+        .args(["-dv", "--verbose=4"])
+        .arg(&exe)
+        .output()
+    else {
+        return false;
+    };
+    let text = String::from_utf8_lossy(&output.stderr);
+    text.lines()
+        .find(|line| line.starts_with("Authority="))
+        .is_some_and(|line| {
+            let authority = line.trim_start_matches("Authority=");
+            !authority.is_empty() && authority != "-" && !authority.starts_with("adhoc")
+        })
 }
 
 /// Whether an automated fixture asked for software rendering (a machine with

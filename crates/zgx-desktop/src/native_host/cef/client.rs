@@ -1,5 +1,5 @@
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::{HashMap, VecDeque},
     io::Write,
     rc::Rc,
@@ -77,6 +77,10 @@ pub(super) struct RenderState {
     pub size: Arc<Mutex<(i32, i32)>>,
     pub scale: Arc<Mutex<f32>>,
     pub invalidate: Rc<dyn Fn()>,
+    /// Shared with the page's mount count: 0 while the view is hidden. Paints
+    /// of a hidden view skip the CPU copy, and the renderer drops the GPU
+    /// texture so hidden pages do not hold video memory.
+    pub visible: Rc<Cell<u32>>,
 }
 
 #[derive(Clone)]
@@ -579,6 +583,17 @@ wrap_render_handler! {
             let mut frame = self.state.frame.lock().unwrap_or_else(|poison| poison.into_inner());
             frame.width = width;
             frame.height = height;
+            frame.dirty.clone_from(&paint.dirty_rects);
+            // A hidden view is not drawn: skip the CPU copy entirely and mark
+            // the frame consumed so the renderer neither uploads it nor keeps
+            // a GPU texture alive for it.
+            if self.state.visible.get() == 0 {
+                frame.pixels.clear();
+                frame.revision = frame.revision.wrapping_add(1);
+                frame.consumed = frame.revision;
+                drop(frame);
+                return;
+            }
             frame.pixels.clear();
             frame.pixels.extend_from_slice(pixels);
             frame.revision = frame.revision.wrapping_add(1);
@@ -1592,6 +1607,7 @@ pub(super) fn client(
     drag_start: Rc<dyn Fn(&DragData, i32, i32) -> bool>,
     html_documents: HtmlDocuments,
     origin_title: Option<Rc<dyn Fn(&str)>>,
+    visible: Rc<Cell<u32>>,
 ) -> Client {
     let state = RenderState {
         frame,
@@ -1599,6 +1615,7 @@ pub(super) fn client(
         size,
         scale,
         invalidate,
+        visible,
     };
     let render = CEFRenderHandler::new(state, drag_start);
     let find_replies = callbacks.find_replies.clone();

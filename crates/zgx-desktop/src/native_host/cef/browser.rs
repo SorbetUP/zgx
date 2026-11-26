@@ -54,7 +54,7 @@ pub(super) struct Page {
     next_evaluation: Cell<i32>,
     devtools_registration: RefCell<Option<Registration>>,
     lifecycle: Cell<BrowserLifecycle>,
-    visible: Cell<u32>,
+    visible: Rc<Cell<u32>>,
     input_modifiers: Cell<Modifiers>,
     mouse_buttons: Cell<u32>,
     drag_target_data: RefCell<Option<DragData>>,
@@ -798,12 +798,14 @@ pub(super) fn backend(
     let size = Arc::new(Mutex::new((1024, 768)));
     let scale = Arc::new(Mutex::new(1.));
     let browser = Rc::new(RefCell::new(None));
+    let visible = Rc::new(Cell::new(0));
     let gpu = zgx_gpu::viewport::view(Painter::new(
         frame.clone(),
         popup.clone(),
         size.clone(),
         scale.clone(),
         browser.clone(),
+        visible.clone(),
     ));
     let page = Rc::new(Page {
         web: web.downgrade(),
@@ -823,7 +825,7 @@ pub(super) fn backend(
         next_evaluation: Cell::new(0),
         devtools_registration: RefCell::new(None),
         lifecycle: Cell::new(BrowserLifecycle::Creating),
-        visible: Cell::new(0),
+        visible,
         input_modifiers: Cell::new(Modifiers::default()),
         mouse_buttons: Cell::new(0),
         drag_target_data: RefCell::new(None),
@@ -1001,6 +1003,7 @@ pub(super) fn backend(
         page.html_documents.clone(),
         // A main page's window title belongs to the app, not to the page.
         None,
+        page.visible.clone(),
     );
     let info = WindowInfo {
         windowless_rendering_enabled: 1,
@@ -1109,12 +1112,14 @@ pub(super) fn prepare_popup(
     let size = Arc::new(Mutex::new((800, 640)));
     let scale = Arc::new(Mutex::new(1.));
     let browser = Rc::new(RefCell::new(None));
+    let visible = Rc::new(Cell::new(0));
     let gpu = zgx_gpu::viewport::view(Painter::new(
         frame.clone(),
         popup.clone(),
         size.clone(),
         scale.clone(),
         browser.clone(),
+        visible.clone(),
     ));
     let page = Rc::new(Page {
         web: page_web.clone(),
@@ -1134,7 +1139,7 @@ pub(super) fn prepare_popup(
         next_evaluation: Cell::new(0),
         devtools_registration: RefCell::new(None),
         lifecycle: Cell::new(BrowserLifecycle::Creating),
-        visible: Cell::new(0),
+        visible,
         input_modifiers: Cell::new(Modifiers::default()),
         mouse_buttons: Cell::new(0),
         drag_target_data: RefCell::new(None),
@@ -1315,6 +1320,7 @@ pub(super) fn prepare_popup(
         drag_start,
         page.html_documents.clone(),
         Some(origin_title),
+        page.visible.clone(),
     );
     let content = view(page.clone());
     // Automated CEF fixtures keep the parent window off-screen so they do not
