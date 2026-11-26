@@ -9,6 +9,27 @@ const ENABLED_KEY: &str = "zgx_webview_messages";
 const SCRIPTS_KEY: &str = "zgx_user_scripts";
 const MESSAGE_NAME: &str = "zgx-webview-message";
 
+/// Debug-only bridge diagnostics. `ZGX_CEF_BRIDGE_TRACE=/path` appends bounded
+/// lifecycle lines (ids, booleans, error codes — never page content or URLs)
+/// from both browser and renderer processes. Compiled out in release.
+#[cfg(debug_assertions)]
+pub(super) fn bridge_trace(message: &str) {
+    let Some(path) = std::env::var_os("ZGX_CEF_BRIDGE_TRACE") else {
+        return;
+    };
+    use std::io::Write;
+    let line = format!("BRIDGE pid={} {message}\n", std::process::id());
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(std::path::PathBuf::from(path))
+    {
+        let _ = file.write_all(line.as_bytes());
+    }
+}
+#[cfg(not(debug_assertions))]
+pub(super) fn bridge_trace(_message: &str) {}
+
 fn encode_script(source: &str, main_frame_only: bool) -> String {
     let scope = if main_frame_only { "main" } else { "all" };
     format!("{scope}\n{source}")
@@ -40,7 +61,12 @@ wrap_v8_handler! {
             _retval: Option<&mut Option<V8Value>>,
             _exception: Option<&mut CefString>,
         ) -> i32 {
-            if name.is_none_or(|name| name.to_string() != "__zgxNativePostMessage") {
+            let name_ok = name.is_some_and(|name| name.to_string() == "__zgxNativePostMessage");
+            bridge_trace(&format!(
+                "v8-execute name_ok={name_ok} args={}",
+                arguments.map_or(0, |arguments| arguments.len())
+            ));
+            if !name_ok {
                 return 0;
             }
             let Some(Some(value)) = arguments.and_then(|arguments| arguments.first()) else {
@@ -51,15 +77,30 @@ wrap_v8_handler! {
             }
             let body = CefString::from(&value.string_value()).to_string();
             if body.len() > 1_048_576 || serde_json::from_str::<serde_json::Value>(&body).is_err() {
+                bridge_trace("v8-execute reject=body");
                 return 1;
             }
             let name: CefString = MESSAGE_NAME.into();
-            let Some(mut message) = process_message_create(Some(&name)) else { return 1 };
-            let Some(arguments) = message.argument_list() else { return 1 };
-            if arguments.set_size(1) == 0 { return 1; }
+            let Some(mut message) = process_message_create(Some(&name)) else {
+                bridge_trace("v8-execute reject=create-message");
+                return 1;
+            };
+            let Some(arguments) = message.argument_list() else {
+                bridge_trace("v8-execute reject=arg-list");
+                return 1;
+            };
+            if arguments.set_size(1) == 0 {
+                bridge_trace("v8-execute reject=set-size");
+                return 1;
+            }
             let body: CefString = body.as_str().into();
-            if arguments.set_string(0, Some(&body)) == 0 { return 1; }
-            self.frame.send_process_message(ProcessId::BROWSER, Some(&mut message));
+            if arguments.set_string(0, Some(&body)) == 0 {
+                bridge_trace("v8-execute reject=set-string");
+                return 1;
+            }
+            self.frame
+                .send_process_message(ProcessId::BROWSER, Some(&mut message));
+            bridge_trace("v8-execute sent");
             1
         }
     }
@@ -73,12 +114,20 @@ wrap_render_process_handler! {
             browser: Option<&mut Browser>,
             extra_info: Option<&mut DictionaryValue>,
         ) {
-            let (Some(browser), Some(extra_info)) = (browser, extra_info) else { return };
+            let (Some(browser), Some(extra_info)) = (browser, extra_info) else {
+                bridge_trace("on-browser-created missing-args");
+                return;
+            };
             let key: CefString = ENABLED_KEY.into();
             let mut config = RendererBrowserConfig {
                 messages: extra_info.bool(Some(&key)) != 0,
                 scripts: Vec::new(),
             };
+            bridge_trace(&format!(
+                "on-browser-created id={} messages={}",
+                browser.identifier(),
+                config.messages
+            ));
             let scripts_key: CefString = SCRIPTS_KEY.into();
             if let Some(scripts) = extra_info.list(Some(&scripts_key)) {
                 for index in 0..scripts.size() {
@@ -108,30 +157,47 @@ wrap_render_process_handler! {
             frame: Option<&mut Frame>,
             context: Option<&mut V8Context>,
         ) {
-            let (Some(browser), Some(frame), Some(context)) = (browser, frame, context) else { return };
+            let (Some(browser), Some(frame), Some(context)) = (browser, frame, context) else {
+                bridge_trace("on-context-created missing-args");
+                return;
+            };
+            let browser_id = browser.identifier();
+            let main_frame = frame.is_main() != 0;
             let Some(config) = self
                 .browser_configs
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner())
-                .get(&browser.identifier())
+                .get(&browser_id)
                 .cloned()
             else {
+                bridge_trace(&format!("on-context-created id={browser_id} main={main_frame} no-config"));
                 return;
             };
+            bridge_trace(&format!(
+                "on-context-created id={browser_id} main={main_frame} messages={}",
+                config.messages
+            ));
 
             if config.messages {
-                let Some(global) = context.global() else { return };
+                let Some(global) = context.global() else {
+                    bridge_trace("on-context-created no-global");
+                    return;
+                };
                 let mut handler = PostMessageHandler::new(frame.clone());
                 let native_name: CefString = "__zgxNativePostMessage".into();
                 let mut native = match v8_value_create_function(Some(&native_name), Some(&mut handler)) {
                     Some(native) => native,
-                    None => return,
+                    None => {
+                        bridge_trace("on-context-created create-function-failed");
+                        return;
+                    }
                 };
-                let _installed = global.set_value_bykey(
+                let installed = global.set_value_bykey(
                     Some(&native_name),
                     Some(&mut native),
                     V8Propertyattribute::default(),
                 );
+                bridge_trace(&format!("on-context-created installed-native={installed}"));
 
                 let source = r#"(() => {
               const send = value => globalThis.__zgxNativePostMessage(JSON.stringify(value));
@@ -151,8 +217,9 @@ wrap_render_process_handler! {
                 let source_url: CefString = "zgx://bridge/bootstrap".into();
                 let mut result = None;
                 let mut exception = None;
-                if context.enter() != 0 {
-                    let _evaluated = context.eval(
+                let entered = context.enter();
+                if entered != 0 {
+                    context.eval(
                         Some(&source),
                         Some(&source_url),
                         1,
@@ -160,6 +227,16 @@ wrap_render_process_handler! {
                         Some(&mut exception),
                     );
                     context.exit();
+                    let exception_text = exception
+                        .as_ref()
+                        .map(|exception| CefString::from(&exception.message()).to_string())
+                        .unwrap_or_else(|| "none".into());
+                    bridge_trace(&format!(
+                        "bootstrap exception={exception_text} result={}",
+                        result.is_some()
+                    ));
+                } else {
+                    bridge_trace(&format!("bootstrap enter-failed code={entered}"));
                 }
             }
 

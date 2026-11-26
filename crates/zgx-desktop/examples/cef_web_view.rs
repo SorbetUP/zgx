@@ -617,7 +617,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 WebViewOptions {
                     profile,
                     new_windows: popup_test,
-                    messages: drag_test || popup_test,
+                    // The event fixture asserts page messages from both the
+                    // main frame and a srcdoc iframe, so its bridge must be on.
+                    messages: drag_test || popup_test || event_test,
                     ..Default::default()
                 },
             );
@@ -729,7 +731,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     _ => eprintln!("CEF_DOWNLOAD_UNKNOWN_STATUS"),
                 });
             });
-            let event_subscription = event_result_path.map(|result_path| {
+            let event_subscription = event_result_path.clone().map(|result_path| {
                 let observed = Arc::new(Mutex::new((false, false, false)));
                 let event_state = observed.clone();
                 let event_done = Arc::new(AtomicBool::new(false));
@@ -1361,10 +1363,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 });
             } else if event_test {
                 web.load_html(EVENT_FIXTURE, None);
+                let probe_web = web.clone();
                 let web = web.clone();
                 cx.tasks.spawn(async move {
                     zgx::timer::sleep(std::time::Duration::from_millis(300)).await;
                     web.load_html(EVENT_CHANGED_FIXTURE, None);
+                });
+                // Diagnostic probe (CDP path, independent of the V8 bridge):
+                // which bridge entry points exist in the main frame document?
+                let probe_path = event_result_path.clone().expect("event test has result path");
+                cx.tasks.spawn(async move {
+                    zgx::timer::sleep(std::time::Duration::from_millis(2_500)).await;
+                    probe_web.evaluate_js(
+                        "JSON.stringify({native:typeof globalThis.__zgxNativePostMessage,zgx:typeof globalThis.zgx,zgxPost:typeof globalThis.zgx?.postMessage,webkit:typeof globalThis.webkit?.messageHandlers?.zgx?.postMessage})",
+                        move |result| {
+                            if let Ok(mut log) = fs::OpenOptions::new().append(true).open(&probe_path) {
+                                let _ = writeln!(log, "PROBE:{result:?}");
+                            }
+                        },
+                    );
                 });
             } else if eval_test {
                 web.load_html(EVENT_CHANGED_FIXTURE, None);

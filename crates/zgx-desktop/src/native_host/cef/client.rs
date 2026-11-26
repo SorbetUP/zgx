@@ -1100,7 +1100,13 @@ pub(super) struct CEFClient { render: RenderHandler, life: LifeSpanHandler, load
                 return 0;
             }
             let (Some(frame), Some(message)) = (frame, message) else { return 0 };
-            if CefString::from(&message.name()).to_string() != super::bridge::message_name() {
+            let message_name = CefString::from(&message.name()).to_string();
+            let url_len = CefString::from(&frame.url()).to_string().len();
+            super::bridge::bridge_trace(&format!(
+                "browser-process-message name={message_name} main_frame={} url_len={url_len}",
+                frame.is_main()
+            ));
+            if message_name != super::bridge::message_name() {
                 return 0;
             }
             let Some(arguments) = message.argument_list() else { return 1 };
