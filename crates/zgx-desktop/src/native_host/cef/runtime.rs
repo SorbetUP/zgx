@@ -41,6 +41,7 @@ static CLOSE_RACE_DIAGNOSTIC_LOCK: Mutex<()> = Mutex::new(());
 pub(super) fn trace_close_race_impl(message: &str) {
     let result = std::env::var_os("ZGX_CEF_STRESS_RESULT")
         .or_else(|| std::env::var_os("ZGX_CEF_CLOSE_RACE_RESULT"))
+        .or_else(|| std::env::var_os("ZGX_CEF_POPUP_CLOSE_RACE_RESULT"))
         .or_else(|| std::env::var_os("ZGX_CEF_DRAG_RESULT"))
         .or_else(|| std::env::var_os("ZGX_CEF_INPUT_RESULT"));
     let Some(path) = result.map(PathBuf::from) else {
@@ -57,6 +58,7 @@ pub(super) fn trace_close_race_impl(message: &str) {
         path.parent(),
         &std::env::temp_dir(),
         std::env::var_os("ZGX_CEF_CLOSE_RACE_RESULT").is_some()
+            || std::env::var_os("ZGX_CEF_POPUP_CLOSE_RACE_RESULT").is_some()
             || std::env::var_os("ZGX_CEF_STRESS_RESULT").is_some()
             || std::env::var_os("ZGX_CEF_DRAG_RESULT").is_some()
             || std::env::var_os("ZGX_CEF_INPUT_RESULT").is_some(),
@@ -224,7 +226,7 @@ wrap_browser_process_handler! {
 }
 
 wrap_app! {
-    struct CEFApplication { handler: BrowserProcessHandler, renderer: RenderProcessHandler, mock_keychain: bool }
+    struct CEFApplication { handler: BrowserProcessHandler, renderer: RenderProcessHandler, mock_keychain: bool, disable_gpu: bool }
     impl App {
         fn browser_process_handler(&self) -> Option<BrowserProcessHandler> { Some(self.handler.clone()) }
         fn render_process_handler(&self) -> Option<RenderProcessHandler> { Some(self.renderer.clone()) }
@@ -233,16 +235,23 @@ wrap_app! {
             process_type: Option<&CefString>,
             command_line: Option<&mut CommandLine>,
         ) {
-            #[cfg(target_os = "macos")]
-            {
-                let _ = process_type;
-                if self.mock_keychain && let Some(command_line) = command_line {
+            let _ = process_type;
+            if let Some(command_line) = command_line {
+                #[cfg(target_os = "macos")]
+                if self.mock_keychain {
                     let switch: CefString = "use-mock-keychain".into();
                     command_line.append_switch(Some(&switch));
                 }
+                // Headless machines without a usable GPU device make Chromium's
+                // GPU process abort the browser ("GPU process isn't usable");
+                // automated fixtures can opt into software rendering there.
+                if self.disable_gpu {
+                    for name in ["disable-gpu", "no-sandbox"] {
+                        let switch: CefString = name.into();
+                        command_line.append_switch(Some(&switch));
+                    }
+                }
             }
-            #[cfg(not(target_os = "macos"))]
-            let _ = (process_type, command_line);
         }
     }
 }
@@ -325,7 +334,7 @@ fn execute_process_with_args(args: Args, sandbox_info: *mut u8) -> Result<Option
     let _ = cef::api_hash(cef::sys::CEF_API_VERSION_LAST, 0);
     let handler = PumpHandler::new(Arc::new(|_| {}));
     let renderer = super::bridge::render_process_handler();
-    let mut app = CEFApplication::new(handler, renderer, use_mock_keychain());
+    let mut app = CEFApplication::new(handler, renderer, use_mock_keychain(), use_disable_gpu());
     let code = cef::execute_process(Some(args.as_main_args()), Some(&mut app), sandbox_info);
     PROCESSED.with(|done| done.set(true));
     Ok((code >= 0).then_some(code))
@@ -359,7 +368,7 @@ pub(super) fn execute_helper_process() -> Result<Option<i32>, String> {
     let _ = cef::api_hash(cef::sys::CEF_API_VERSION_LAST, 0);
     let handler = PumpHandler::new(Arc::new(|_| {}));
     let renderer = super::bridge::render_process_handler();
-    let mut app = CEFApplication::new(handler, renderer, use_mock_keychain());
+    let mut app = CEFApplication::new(handler, renderer, use_mock_keychain(), use_disable_gpu());
     let code = cef::execute_process(
         Some(args.as_main_args()),
         Some(&mut app),
@@ -448,6 +457,7 @@ fn initialize_inner() -> Result<Runtime, String> {
         handler,
         super::bridge::render_process_handler(),
         use_mock_keychain(),
+        use_disable_gpu(),
     );
     #[cfg(target_os = "windows")]
     let sandbox_info = WINDOWS_SANDBOX_INFO.with(std::cell::Cell::get);
@@ -485,6 +495,12 @@ fn use_mock_keychain() -> bool {
     )
 }
 
+/// Whether an automated fixture asked for software rendering (a machine with
+/// no usable GPU device would otherwise abort Chromium's GPU process).
+fn use_disable_gpu() -> bool {
+    std::env::var_os("ZGX_CEF_DISABLE_GPU").is_some() && use_mock_keychain()
+}
+
 fn mock_keychain_allowed(
     executable: Option<&str>,
     data_dir: Option<&std::path::Path>,
@@ -513,6 +529,7 @@ fn mock_keychain_requested(mut present: impl FnMut(&str) -> bool) -> bool {
         "ZGX_CEF_SITE_DATA_RESULT",
         "ZGX_CEF_LATE_LOAD_RESULT",
         "ZGX_CEF_CLOSE_RACE_RESULT",
+        "ZGX_CEF_POPUP_CLOSE_RACE_RESULT",
         "ZGX_CEF_STRESS_RESULT",
         "ZGX_CEF_NAV_EVAL_RACE_RESULT",
         "ZGX_CEF_POPUP_RESULT",
@@ -714,6 +731,14 @@ pub(super) fn release_child_web(creation_id: u64) {
     CHILD_WEBS.with(|webs| {
         webs.borrow_mut().remove(&creation_id);
     });
+}
+
+/// Drops a popup's child controller on a later event-loop turn. Dropping the
+/// last strong `WebView` can run `CefWebView`'s Drop, which asks CEF to close
+/// the browser — so it must never run while a CEF callback (on_before_close,
+/// on_before_popup_aborted, ...) is still on the stack.
+pub(super) fn release_child_web_deferred(creation_id: u64) {
+    zgx::native_view::post(move || release_child_web(creation_id));
 }
 
 pub(super) fn browser_creation_failed(creation_id: u64) -> bool {
