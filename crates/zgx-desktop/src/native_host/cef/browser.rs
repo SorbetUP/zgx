@@ -420,6 +420,7 @@ fn start_clear_site_data(page: &Page, browser: &Browser, url: &str, done: SiteDa
 fn apply(page: &Page, browser: &Browser, command: WebViewCommand) {
     match command {
         WebViewCommand::LoadUrl(url) => {
+            page.note_navigation();
             page.html_documents
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -430,6 +431,7 @@ fn apply(page: &Page, browser: &Browser, command: WebViewCommand) {
             }
         }
         WebViewCommand::LoadHtml { html, base_url } => {
+            page.note_navigation();
             let frame = browser.main_frame();
             if let Some(base) = base_url
                 && let Some(document_url) = client::normalize_document_url(&base)
@@ -456,11 +458,21 @@ fn apply(page: &Page, browser: &Browser, command: WebViewCommand) {
                 }
             }
         }
-        WebViewCommand::Reload => browser.reload(),
+        WebViewCommand::Reload => {
+            page.note_navigation();
+            browser.reload();
+        }
         WebViewCommand::Stop => browser.stop_load(),
-        WebViewCommand::GoBack => browser.go_back(),
-        WebViewCommand::GoForward => browser.go_forward(),
+        WebViewCommand::GoBack => {
+            page.note_navigation();
+            browser.go_back();
+        }
+        WebViewCommand::GoForward => {
+            page.note_navigation();
+            browser.go_forward();
+        }
         WebViewCommand::GoToHistory(n) => {
+            page.note_navigation();
             // A single History API navigation is deterministic; repeated
             // GoBack/GoForward calls race CEF's asynchronous history updates.
             if let Some(frame) = browser.main_frame() {
@@ -611,20 +623,8 @@ pub(super) fn backend(
         web: web.downgrade(),
         new_windows: web.options().new_windows,
         navigation_started: Rc::new(move || {
-            let Some(page) = navigation_weak.upgrade() else {
-                return;
-            };
-            page.navigation_generation
-                .set(page.navigation_generation.get().wrapping_add(1));
-            let replies = cancel_pending_evaluations(&page.evaluations);
-            if !replies.is_empty() {
-                zgx::native_view::post(move || {
-                    for reply in replies {
-                        reply(Err(
-                            "JavaScript evaluation was superseded by a navigation".into()
-                        ));
-                    }
-                });
+            if let Some(page) = navigation_weak.upgrade() {
+                page.note_navigation();
             }
         }),
         created: Rc::new(move |browser| {
@@ -835,8 +835,7 @@ pub(super) fn prepare_popup(
             let weak = Rc::downgrade(&page);
             move || {
                 if let Some(page) = weak.upgrade() {
-                    page.navigation_generation
-                        .set(page.navigation_generation.get().wrapping_add(1));
+                    page.note_navigation();
                 }
             }
         }),
@@ -1054,6 +1053,27 @@ impl Drop for Visible {
 }
 
 impl Page {
+    /// Account for a navigation: bump the document generation and fail every
+    /// pending JavaScript evaluation as superseded. Called both from CEF's
+    /// `on_load_start` and when a navigation command is applied, so the
+    /// generation moves even if CEF's load-start callback is delayed (data:
+    /// URLs) — an evaluation requested before the navigation must never
+    /// resolve against the new document.
+    fn note_navigation(&self) {
+        self.navigation_generation
+            .set(self.navigation_generation.get().wrapping_add(1));
+        let replies = cancel_pending_evaluations(&self.evaluations);
+        if !replies.is_empty() {
+            zgx::native_view::post(move || {
+                for reply in replies {
+                    reply(Err(
+                        "JavaScript evaluation was superseded by a navigation".into()
+                    ));
+                }
+            });
+        }
+    }
+
     /// Convert a ZGX window point into the CEF view's logical coordinates.
     /// CEF's windowless input APIs are relative to the browser view, unlike
     /// ZGX input events which are relative to the native window.
