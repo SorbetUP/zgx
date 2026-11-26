@@ -589,6 +589,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ..Default::default()
         })
         .run(|cx| {
+            if let Some(result_path) = input_result_path.as_ref() {
+                let result_path = result_path.clone();
+                cx.on_closed(move || {
+                    trace_close_race(Some(&result_path), "INPUT_WINDOW_CLOSED");
+                });
+            }
             let profile = if drag_test {
                 WebProfile::Named("zgx-drag-integration-fixture".into())
             } else if late_load_test {
@@ -1454,11 +1460,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         input_window.close();
                         return;
                     }
+                    trace_close_race(Some(&input_result), "INPUT_PAGE_READY");
                     let page = input_page.clone();
                     let scene = scene.clone();
                     input_page.evaluate_js(
                         "(()=>{const r=document.querySelector('#typing').getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2}})()",
                         move |result| {
+                            trace_close_race(
+                                Some(&input_result),
+                                &format!("INPUT_BOUNDS_RESULT:{result:?}"),
+                            );
                             let position = result
                                 .ok()
                                 .and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok())
@@ -1468,24 +1479,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 input_window.close();
                                 return;
                             };
-                            input.dispatch(&scene, InputEvent::PointerMove { x, y });
-                            input.dispatch(&scene, InputEvent::PointerDown { x, y, button: PointerButton::Primary });
-                            input.dispatch(&scene, InputEvent::PointerUp { x, y, button: PointerButton::Primary });
-                            input.dispatch(&scene, InputEvent::Focus);
-                            input.dispatch(&scene, InputEvent::KeyDown { key: Key::Character("a".into()), modifiers: Modifiers::default(), repeat: false });
-                            input.dispatch(&scene, InputEvent::Text("fixture-".into()));
-                            input.dispatch(&scene, InputEvent::KeyUp { key: Key::Character("a".into()), modifiers: Modifiers::default() });
-                            input.dispatch(&scene, InputEvent::ImePreedit { text: "🦀".into(), cursor: Some((4, 4)) });
-                            input.dispatch(&scene, InputEvent::ImeCommit("🦀".into()));
+                            let skip_input = std::env::var_os("ZGX_CEF_SKIP_INPUT").is_some();
+                            if !skip_input {
+                                input.dispatch(&scene, InputEvent::PointerMove { x, y });
+                                input.dispatch(&scene, InputEvent::PointerDown { x, y, button: PointerButton::Primary });
+                                input.dispatch(&scene, InputEvent::PointerUp { x, y, button: PointerButton::Primary });
+                                input.dispatch(&scene, InputEvent::Focus);
+                                trace_close_race(Some(&input_result), "INPUT_POINTER_AND_FOCUS_SENT");
+                                input.dispatch(&scene, InputEvent::KeyDown { key: Key::Character("a".into()), modifiers: Modifiers::default(), repeat: false });
+                                input.dispatch(&scene, InputEvent::Text("fixture-".into()));
+                                input.dispatch(&scene, InputEvent::KeyUp { key: Key::Character("a".into()), modifiers: Modifiers::default() });
+                                trace_close_race(Some(&input_result), "INPUT_KEY_EVENTS_SENT");
+                            }
+                            let skip_ime = std::env::var_os("ZGX_CEF_SKIP_IME").is_some();
+                            if !skip_input && !skip_ime {
+                                input.dispatch(&scene, InputEvent::ImePreedit { text: "🦀".into(), cursor: Some((4, 4)) });
+                                input.dispatch(&scene, InputEvent::ImeCommit("🦀".into()));
+                                trace_close_race(Some(&input_result), "INPUT_IME_EVENTS_SENT");
+                            }
                             input_tasks.spawn(async move {
                                 // CEF forwards OSR IME updates asynchronously to
                                 // the renderer; wait for that renderer task
                                 // before issuing the readback over DevTools.
                                 zgx::timer::sleep(std::time::Duration::from_millis(100)).await;
+                                trace_close_race(Some(&input_result), "INPUT_READBACK_REQUESTED");
                                 page.evaluate_js(
                                     "document.querySelector('#typing').value",
                                     move |value| {
-                                        let passed = value.as_deref() == Ok("\"fixture-🦀\"");
+                                        trace_close_race(
+                                            Some(&input_result),
+                                            &format!("INPUT_READBACK_RESULT:{value:?}"),
+                                        );
+                                        let expected = if skip_input { "\"\"" } else if skip_ime { "\"fixture-\"" } else { "\"fixture-🦀\"" };
+                                        let passed = value.as_deref() == Ok(expected);
                                         let status = if passed {
                                             "PASS".to_owned()
                                         } else {
