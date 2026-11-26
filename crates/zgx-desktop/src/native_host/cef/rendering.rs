@@ -1,4 +1,4 @@
-use cef::{Browser, ImplBrowser, ImplBrowserHost};
+use cef::{Browser, ImplBrowser, ImplBrowserHost, Rect};
 use std::sync::{Arc, Mutex};
 use std::{cell::RefCell, rc::Rc};
 
@@ -25,6 +25,68 @@ pub(super) struct PopupFrame {
 }
 
 pub(super) type SharedPopup = Arc<Mutex<PopupFrame>>;
+
+/// A CEF paint clamped to the surface it is drawn into: the buffer is never
+/// larger than the view (or popup) it belongs to, and its dirty rects are
+/// clipped to that same bound.
+pub(super) struct ClampedPaint {
+    pub width: u32,
+    pub height: u32,
+    pub dirty_rects: Vec<Rect>,
+}
+
+/// Clamp a CEF `on_paint` buffer to `bound` (the view size for page paints,
+/// the popup rect for popup paints). Returns `None` — the paint is ignored —
+/// when the buffer is empty (`width`/`height` <= 0) or larger than the bound,
+/// which happens while a resize is still in flight; oversized paints are
+/// logged once. Dirty rects are clipped to the bound and empty ones dropped.
+pub(super) fn clamp_paint(
+    width: i32,
+    height: i32,
+    dirty_rects: &[Rect],
+    bound: (i32, i32),
+) -> Option<ClampedPaint> {
+    if width <= 0 || height <= 0 {
+        return None;
+    }
+    let bound = (bound.0.max(1), bound.1.max(1));
+    if width > bound.0 || height > bound.1 {
+        log_oversized_paint_once(width, height, bound);
+        return None;
+    }
+    let dirty_rects = dirty_rects
+        .iter()
+        .map(|rect| clamp_rect(rect, bound))
+        .filter(|rect| rect.width > 0 && rect.height > 0)
+        .collect();
+    Some(ClampedPaint {
+        width: width as u32,
+        height: height as u32,
+        dirty_rects,
+    })
+}
+
+/// Clip `rect` to `bound`, keeping it inside `[0, bound]` on both axes.
+fn clamp_rect(rect: &Rect, bound: (i32, i32)) -> Rect {
+    let x = rect.x.clamp(0, bound.0);
+    let y = rect.y.clamp(0, bound.1);
+    let right = (rect.x + rect.width).clamp(0, bound.0);
+    let bottom = (rect.y + rect.height).clamp(0, bound.1);
+    Rect {
+        x,
+        y,
+        width: right - x,
+        height: bottom - y,
+    }
+}
+
+fn log_oversized_paint_once(width: i32, height: i32, bound: (i32, i32)) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static LOGGED: AtomicBool = AtomicBool::new(false);
+    if !LOGGED.swap(true, Ordering::Relaxed) {
+        eprintln!("CEF paint {width}x{height} exceeds the {bound:?} surface; ignoring it");
+    }
+}
 
 /// Release the CPU-side copies as soon as CEF confirms that a browser is
 /// closed. A viewport may briefly outlive its browser while ZGX tears down the
@@ -409,6 +471,60 @@ impl Blit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paints_are_clamped_to_the_surface_and_oversized_ones_dropped() {
+        let bound = (100, 80);
+        let paint = clamp_paint(
+            100,
+            80,
+            &[
+                Rect {
+                    x: 90,
+                    y: 70,
+                    width: 20,
+                    height: 20,
+                },
+                Rect {
+                    x: -5,
+                    y: -5,
+                    width: 10,
+                    height: 10,
+                },
+                Rect {
+                    x: 40,
+                    y: 40,
+                    width: 0,
+                    height: 8,
+                },
+            ],
+            bound,
+        )
+        .expect("a view-sized paint is accepted");
+        assert_eq!((paint.width, paint.height), (100, 80));
+        let rects: Vec<(i32, i32, i32, i32)> = paint
+            .dirty_rects
+            .iter()
+            .map(|rect| (rect.x, rect.y, rect.width, rect.height))
+            .collect();
+        assert_eq!(rects, [(90, 70, 10, 10), (0, 0, 5, 5)]);
+
+        // Empty and negative buffers are ignored silently.
+        assert!(clamp_paint(0, 80, &[], bound).is_none());
+        assert!(clamp_paint(100, 0, &[], bound).is_none());
+        assert!(clamp_paint(-3, -4, &[], bound).is_none());
+        // Buffers larger than the surface are ignored (logged once).
+        assert!(clamp_paint(101, 80, &[], bound).is_none());
+        assert!(clamp_paint(100, 81, &[], bound).is_none());
+        // A degenerate surface still clamps to at least 1x1.
+        let paint = clamp_paint(1, 1, &[], (0, 0)).expect("1x1 paint fits a degenerate surface");
+        assert_eq!((paint.width, paint.height), (1, 1));
+        assert!(clamp_paint(2, 1, &[], (0, 0)).is_none());
+        // Smaller buffers pass through untouched, with no dirty rects.
+        let paint = clamp_paint(50, 40, &[], bound).expect("smaller paint fits");
+        assert_eq!((paint.width, paint.height), (50, 40));
+        assert!(paint.dirty_rects.is_empty());
+    }
 
     #[test]
     fn closing_browser_releases_view_and_popup_cpu_frames() {

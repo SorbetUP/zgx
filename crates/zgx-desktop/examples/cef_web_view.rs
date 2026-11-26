@@ -100,8 +100,14 @@ const EVENT_FIXTURE: &str = r#"<!doctype html>
 const EVENT_CHANGED_FIXTURE: &str = r#"<!doctype html>
 <meta charset="utf-8"><title>CEF event changed</title>
 <p>cef-event-url-changed</p>
+<p>second findable phrase</p>
 <iframe srcdoc="<script>window.webkit.messageHandlers.zgx.postMessage({source:'iframe',value:7})</script>"></iframe>
 <script>window.webkit.messageHandlers.zgx.postMessage({source:"cef-fixture",value:42})</script>
+"#;
+
+const CRASH_FIXTURE: &str = r#"<!doctype html>
+<meta charset="utf-8"><title>crash fixture</title>
+<p>crash fixture marker</p>
 "#;
 
 const POLICY_FIXTURE: &str = r#"<!doctype html><meta charset=utf-8><title>policy</title>
@@ -237,13 +243,81 @@ async fn perform_drag(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
+fn run_find_stage(
+    web: &WebView,
+    texts: &[&str],
+    stage: usize,
+    remaining: &Arc<AtomicUsize>,
+    all_ok: &Arc<AtomicBool>,
+    result_path: &std::path::Path,
+    log_path: &std::path::Path,
+    window: &zgx_desktop::WindowHandle,
+    done: &Arc<AtomicBool>,
+) {
+    if stage >= texts.len() {
+        return;
+    }
+    let text = texts[stage].to_owned();
+    let text_reply = text.clone();
+    let web = web.clone();
+    let web_reply = web.clone();
+    let remaining = remaining.clone();
+    let all_ok = all_ok.clone();
+    let result_path = result_path.to_path_buf();
+    let log_path = log_path.to_path_buf();
+    let window = window.clone();
+    let done = done.clone();
+    let next = stage + 1;
+    let texts_owned: Vec<String> = texts.iter().map(|text| text.to_string()).collect();
+    web.find(&text, FindOptions::default(), move |result| {
+        if let Ok(mut log) = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+        {
+            let _ = writeln!(log, "find stage={stage} text={text_reply:?}: {result:?}");
+        }
+        if !result.found {
+            all_ok.store(false, Ordering::Release);
+        }
+        // Chain the next find from this reply, so each search is answered
+        // before the next starts (matching CEF's incremental identifiers).
+        if next < texts_owned.len() {
+            let texts: Vec<&str> = texts_owned.iter().map(String::as_str).collect();
+            run_find_stage(
+                &web_reply,
+                &texts,
+                next,
+                &remaining,
+                &all_ok,
+                &result_path,
+                &log_path,
+                &window,
+                &done,
+            );
+        }
+        if remaining.fetch_sub(1, Ordering::AcqRel) == 1 && !done.swap(true, Ordering::AcqRel) {
+            let result = if all_ok.load(Ordering::Acquire) {
+                "PASS"
+            } else {
+                "FAIL"
+            };
+            let _ = fs::write(result_path, result);
+            window.close();
+        }
+    });
+}
+
 fn run_evaluation_test(
     web: WebView,
     result_path: std::path::PathBuf,
     window: zgx_desktop::WindowHandle,
     done: Arc<AtomicBool>,
 ) {
-    let remaining = Arc::new(AtomicUsize::new(9));
+    // 8 evaluation cases + 3 chained find stages (initial, a different text,
+    // then the first text again to step to the next match).
+    let remaining = Arc::new(AtomicUsize::new(11));
     let all_ok = Arc::new(AtomicBool::new(true));
     let cases = [
         ("1 + 2", Ok("3")),
@@ -296,33 +370,23 @@ fn run_evaluation_test(
     let all_ok_find = all_ok.clone();
     let result_path_find = result_path.clone();
     let done_find = done.clone();
-    web.find(
+    let window_find = window.clone();
+    let log_path_find = result_path.with_extension("log");
+    let texts = [
         "cef-event-url-changed",
-        FindOptions::default(),
-        move |result| {
-            let matched = result.found;
-            if let Ok(mut log) = fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(result_path_find.with_extension("log"))
-            {
-                let _ = writeln!(log, "find cef-event-url-changed: {result:?}");
-            }
-            if !matched {
-                all_ok_find.store(false, Ordering::Release);
-            }
-            if remaining_find.fetch_sub(1, Ordering::AcqRel) == 1
-                && !done_find.swap(true, Ordering::AcqRel)
-            {
-                let result = if all_ok_find.load(Ordering::Acquire) {
-                    "PASS"
-                } else {
-                    "FAIL"
-                };
-                let _ = fs::write(result_path, result);
-                window.close();
-            }
-        },
+        "second findable phrase",
+        "cef-event-url-changed",
+    ];
+    run_find_stage(
+        &web,
+        &texts,
+        0,
+        &remaining_find,
+        &all_ok_find,
+        &result_path_find,
+        &log_path_find,
+        &window_find,
+        &done_find,
     );
 }
 
@@ -369,6 +433,7 @@ fn start_fixture_server(
     popup_test: bool,
     drag_test: bool,
     sandbox_test: bool,
+    crash_test: bool,
     html_base_result_path: Option<std::path::PathBuf>,
     fixed_port: Option<u16>,
 ) -> Result<String, Box<dyn std::error::Error>> {
@@ -566,6 +631,13 @@ fn start_fixture_server(
                     });
                     let body: &'static [u8] = if has_cookie { b"present" } else { b"absent" };
                     ("200 OK", "text/plain", "", body)
+                } else if crash_test && path == "/crash" {
+                    (
+                        "200 OK",
+                        "text/html; charset=utf-8",
+                        "Set-Cookie: crash_cookie=alive; SameSite=Lax\r\n",
+                        CRASH_FIXTURE.as_bytes(),
+                    )
                 } else if path == "/policy" {
                     (
                         "200 OK",
@@ -722,6 +794,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let policy_result_path =
         std::env::var_os("ZGX_CEF_POLICY_RESULT").map(std::path::PathBuf::from);
     let policy_test = policy_result_path.is_some();
+    let crash_result_path = std::env::var_os("ZGX_CEF_CRASH_RESULT").map(std::path::PathBuf::from);
+    let crash_test = crash_result_path.is_some();
     let drag_result_path = std::env::var_os("ZGX_CEF_DRAG_RESULT").map(std::path::PathBuf::from);
     let drag_test = drag_result_path.is_some();
     let drag_fixture_file = fixture_data_dir.join("drag-payload.txt");
@@ -743,7 +817,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         || popup_test
         || popup_close_race_test
         || drag_test
-        || policy_test;
+        || policy_test
+        || crash_test;
     if let Some(result_path) = download_result_path.as_ref() {
         fs::write(result_path, format!("START:auto={automated}\n"))?;
     }
@@ -804,6 +879,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
+    if let Some(result_path) = crash_result_path.as_ref() {
+        fs::write(result_path, "START\n")?;
+    }
     let origin = start_fixture_server(
         download_test,
         site_data_test || late_load_test,
@@ -811,6 +889,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         popup_test || popup_close_race_test,
         drag_test,
         sandbox_origin_test,
+        crash_test,
         html_base_result_path.clone(),
         fixed_site_data_port,
     )?;
@@ -1137,6 +1216,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let eval_done = Arc::new(AtomicBool::new(false));
             let mut popup_subscription = None;
             let mut drag_subscription = None;
+            let mut crash_subscription = None;
             if drag_test {
                 let target = drag_target_web
                     .as_ref()
@@ -2321,6 +2401,117 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         download_window.close();
                     }
                 });
+            } else if crash_test {
+                // The backend crashes this page's renderer once shortly after
+                // the browser is created (CDP Page.crash, fixture-only). The
+                // test asserts ProcessTerminated arrives and that navigation,
+                // evaluation and cookies still work after a reload.
+                let result_path = crash_result_path
+                    .clone()
+                    .expect("crash test has a result path");
+                let window = cx.window.clone();
+                let crash_done = Arc::new(AtomicBool::new(false));
+                let terminated = Arc::new(AtomicBool::new(false));
+                let reloaded = Arc::new(AtomicBool::new(false));
+                let log_path = result_path.with_extension("log");
+                let terminated_flag = terminated.clone();
+                let reloaded_flag = reloaded.clone();
+                let subscription = web.on_event(move |event| {
+                    match event {
+                        zgx::web_view::WebViewEvent::ProcessTerminated => {
+                            let _ = fs::OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open(&log_path)
+                                .and_then(|mut file| writeln!(file, "EVENT:ProcessTerminated"));
+                            terminated_flag.store(true, Ordering::Release);
+                        }
+                        zgx::web_view::WebViewEvent::NavigationFinished { url }
+                            if terminated_flag.load(Ordering::Acquire)
+                                && url.contains("/crash") =>
+                        {
+                            let _ = fs::OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open(&log_path)
+                                .and_then(|mut file| writeln!(file, "EVENT:NavigationFinished:{url}"));
+                            reloaded_flag.store(true, Ordering::Release);
+                        }
+                        _ => {}
+                    }
+                });
+                crash_subscription = Some(subscription);
+                web.load_url(format!("{origin}/crash"));
+                let page = web.clone();
+                let task_result = result_path.clone();
+                let task_window = window.clone();
+                let task_terminated = terminated.clone();
+                let task_reloaded = reloaded.clone();
+                let task_done = crash_done.clone();
+                cx.tasks.spawn(async move {
+                    // Wait for the renderer crash (the backend fires it ~2s
+                    // after the browser is created).
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                    while !task_terminated.load(Ordering::Acquire) {
+                        if std::time::Instant::now() >= deadline {
+                            let _ = fs::write(&task_result, "FAIL:no-process-terminated-event");
+                            task_window.close();
+                            return;
+                        }
+                        zgx::timer::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                    // Reload: navigation must work in the fresh renderer.
+                    page.reload();
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+                    while !task_reloaded.load(Ordering::Acquire) {
+                        if std::time::Instant::now() >= deadline {
+                            let _ = fs::write(
+                                &task_result,
+                                format!(
+                                    "FAIL:reload-after-crash:title={:?}:url={}",
+                                    page.title(),
+                                    page.url()
+                                ),
+                            );
+                            task_window.close();
+                            return;
+                        }
+                        zgx::timer::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                    // Cookies and evaluation must work after the crash+reload.
+                    let eval_result = task_result.clone();
+                    let eval_window = task_window.clone();
+                    let eval_done = task_done.clone();
+                    // Keep the controller alive until the asynchronous DevTools
+                    // reply arrives (the test-branch view only borrows `web`).
+                    let keep_alive = page.clone();
+                    page.evaluate_js(
+                        "({cookie:document.cookie,path:location.pathname})",
+                        move |result| {
+                            let _keep_alive = keep_alive;
+                            let expected = r#"{"cookie":"crash_cookie=alive","path":"/crash"}"#;
+                            let status = if result.as_deref() == Ok(expected) {
+                                "PASS"
+                            } else {
+                                &format!("FAIL:after-crash:{result:?}")
+                            };
+                            let status = status.to_owned();
+                            let _ = fs::write(&eval_result, status);
+                            eval_done.store(true, Ordering::Release);
+                            eval_window.close();
+                        },
+                    );
+                });
+                let timeout_result = result_path.clone();
+                let timeout_window = window.clone();
+                let timeout_done = crash_done.clone();
+                cx.tasks.spawn(async move {
+                    zgx::timer::sleep(std::time::Duration::from_secs(90)).await;
+                    if !timeout_done.swap(true, Ordering::AcqRel) {
+                        let _ = fs::write(timeout_result, "TIMEOUT:crash");
+                        timeout_window.close();
+                    }
+                });
             } else if !close_race_test && !navigation_eval_race_test && !popup_close_race_test {
                 let fixture = FIXTURE.to_owned();
                 web.load_html(&fixture, Some(&origin));
@@ -2470,7 +2661,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .child(source_view)
                     .child(drag_file_source.grow())
                     .child(target_view)
-            } else if download_test || input_test || popup_test || popup_close_race_test || html_base_test {
+            } else if download_test || input_test || popup_test || popup_close_race_test || html_base_test || crash_test {
                 zgx::web_view::web_view(&web)
                     .grow()
                     .w_full()
@@ -2482,6 +2673,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 || sandbox_subscription.is_some()
                 || popup_subscription.is_some()
                 || drag_subscription.is_some()
+                || crash_subscription.is_some()
             {
                 app.on_mount(move |handle| {
                     if let Some(subscription) = event_subscription {
@@ -2494,6 +2686,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         handle.retain(subscription);
                     }
                     if let Some(subscription) = drag_subscription {
+                        handle.retain(subscription);
+                    }
+                    if let Some(subscription) = crash_subscription {
                         handle.retain(subscription);
                     }
                 })
