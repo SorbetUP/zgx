@@ -54,9 +54,14 @@ struct RendererBrowserConfig {
 /// browser computed for that frame's current document. Captured from
 /// `globalThis.origin` at context creation (see `on_context_created`); the
 /// page cannot forge it, and it is never derived from the frame's URL. The
-/// value stores the raw context pointer that set it, so releasing an OLD
-/// context never drops the origin of the NEW document in the same frame.
-type FrameOrigins = Arc<Mutex<HashMap<(i32, String), (String, usize)>>>;
+/// value stores `(origin, context raw, global-proxy raw)`: when a message's
+/// receiver object is that recorded global proxy, `PostMessageHandler` reads
+/// the LIVE `origin` off it (always the current document's origin) and
+/// refreshes the entry. Entries are overwritten on each context creation and
+/// never removed on release — removing there could drop a NEW document's
+/// entry when an OLD context is released late; the map dies with the
+/// renderer process, so stale entries are bounded.
+type FrameOrigins = Arc<Mutex<HashMap<(i32, String), (String, usize, usize)>>>;
 
 wrap_v8_handler! {
     struct PostMessageHandler { frame: Frame, browser_id: i32, frame_origins: FrameOrigins }
@@ -89,20 +94,46 @@ wrap_v8_handler! {
                 return 1;
             }
             // SECURITY: attach the browser-computed security origin of this
-            // frame's document as a second argument. It comes from the
-            // renderer-internal map (captured from `globalThis.origin` when
-            // the context was created), so the page cannot forge it. A missing
-            // entry fails safe to "null" (opaque origin = untrusted): e.g. a
-            // sandboxed iframe with an http(s) URL must NOT be attributed that
-            // http origin.
+            // frame's document as a second argument. The receiver object of a
+            // normal `globalThis.__zgxNativePostMessage(...)` call IS the
+            // frame's global proxy; when its raw pointer matches the one
+            // recorded at context creation, we read `origin` live off the
+            // receiver (unforgeable on the real global) — this is always the
+            // CURRENT document's origin, even when the value captured at
+            // context creation was still the initial document's. The stored
+            // value is the fallback; a missing entry or a receiver that is
+            // not the recorded global fails safe to "null" (opaque origin =
+            // untrusted): e.g. a sandboxed iframe with an http(s) URL must
+            // NOT be attributed that http origin, and a forged receiver must
+            // not be able to claim any origin.
             let frame_id = CefString::from(&self.frame.identifier()).to_string();
-            let origin = self
+            let object_raw = _object.as_ref().map(|object| object.get_raw() as usize);
+            let mut origins = self
                 .frame_origins
                 .lock()
-                .unwrap_or_else(|poison| poison.into_inner())
-                .get(&(self.browser_id, frame_id))
-                .map(|(origin, _)| origin.clone())
-                .unwrap_or_else(|| "null".to_owned());
+                .unwrap_or_else(|poison| poison.into_inner());
+            let entry = origins.get(&(self.browser_id, frame_id.clone())).cloned();
+            let origin = match (entry, object_raw) {
+                (Some((stored, context_raw, global_raw)), Some(raw)) if raw == global_raw && global_raw != 0 => {
+                    let origin_key: CefString = "origin".into();
+                    let live = _object.and_then(|object| object.value_bykey(Some(&origin_key)))
+                        .filter(|value| value.is_string() != 0)
+                        .map(|value| CefString::from(&value.string_value()).to_string())
+                        .filter(|origin| super::client::is_valid_security_origin(origin));
+                    match live {
+                        Some(live) => {
+                            if live != stored {
+                                origins.insert((self.browser_id, frame_id.clone()), (live.clone(), context_raw, global_raw));
+                            }
+                            live
+                        }
+                        None => stored,
+                    }
+                }
+                (Some((stored, ..)), _) => stored,
+                (None, _) => "null".to_owned(),
+            };
+            drop(origins);
             let name: CefString = MESSAGE_NAME.into();
             let Some(mut message) = process_message_create(Some(&name)) else {
                 bridge_trace("v8-execute reject=create-message");
@@ -128,7 +159,6 @@ wrap_v8_handler! {
             }
             self.frame
                 .send_process_message(ProcessId::BROWSER, Some(&mut message));
-            bridge_trace("v8-execute sent");
             1
         }
     }
@@ -169,6 +199,11 @@ wrap_render_process_handler! {
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner())
                 .insert(browser.identifier(), config);
+            // frame_origins entries are never removed here: CEF can invoke
+            // browser/context callbacks while frames are already torn down,
+            // and removing entries for a browser whose renderer process
+            // still serves other frames loses live origins. Liveness is
+            // enforced at message time instead (see PostMessageHandler).
         }
 
         fn on_browser_destroyed(&self, browser: Option<&mut Browser>) {
@@ -178,10 +213,10 @@ wrap_render_process_handler! {
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner())
                 .remove(&browser_id);
-            self.frame_origins
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner())
-                .retain(|(id, _), _| *id != browser_id);
+            // Do NOT retain() frame_origins here: CEF can invoke this while
+            // frames are already torn down, and removing entries for a
+            // browser whose renderer still runs other frames is wrong.
+            // Stale entries are filtered lazily in on_browser_created.
         }
 
         fn on_context_created(
@@ -226,10 +261,28 @@ wrap_render_process_handler! {
                     .map(|value| CefString::from(&value.string_value()).to_string())
                     .filter(|origin| super::client::is_valid_security_origin(origin))
                     .unwrap_or_else(|| "null".to_owned());
+                // Capture the raw pointer of the global PROXY (`globalThis`),
+                // which is what a normal `globalThis.__zgxNativePostMessage()`
+                // call passes as the receiver — unlike context.global(), which
+                // may be the unwrapped global object with a different pointer.
+                let proxy_code: CefString = "globalThis".into();
+                let mut proxy_result = None;
+                let mut proxy_exception = None;
+                context.eval(
+                    Some(&proxy_code),
+                    Some(&code_url),
+                    1,
+                    Some(&mut proxy_result),
+                    Some(&mut proxy_exception),
+                );
+                let global_raw = proxy_result
+                    .as_ref()
+                    .map(|value| value.get_raw() as usize)
+                    .unwrap_or(0);
                 self.frame_origins
                     .lock()
                     .unwrap_or_else(|poison| poison.into_inner())
-                    .insert((browser_id, frame_id.clone()), (origin.clone(), context.get_raw() as usize));
+                    .insert((browser_id, frame_id.clone()), (origin.clone(), context.get_raw() as usize, global_raw));
                 bridge_trace(&format!(
                     "on-context-created origin id={browser_id} frame={frame_id} main={main_frame} opaque={}",
                     origin == "null"
@@ -333,29 +386,15 @@ wrap_render_process_handler! {
 
         fn on_context_released(
             &self,
-            browser: Option<&mut Browser>,
-            frame: Option<&mut Frame>,
-            context: Option<&mut V8Context>,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            _context: Option<&mut V8Context>,
         ) {
-            // Contexts are per document: drop the origin entry only if this
-            // released context is the one that set it — a navigation creates
-            // the new document's context before the old one is released, and
-            // the old release must not erase the new document's origin.
-            let (Some(browser), Some(frame), Some(context)) = (browser, frame, context) else {
-                return;
-            };
-            let frame_id = CefString::from(&frame.identifier()).to_string();
-            let released_raw = context.get_raw() as usize;
-            let mut origins = self
-                .frame_origins
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner());
-            if origins
-                .get(&(browser.identifier(), frame_id.clone()))
-                .is_some_and(|(_, raw)| *raw == released_raw)
-            {
-                origins.remove(&(browser.identifier(), frame_id));
-            }
+            // A frame's origin entry is deliberately kept here: it is
+            // overwritten by the next on_context_created for that frame, and
+            // removing on release risks dropping the NEW document's entry
+            // when the OLD context is released late. The map lives and dies
+            // with the renderer process, so stale entries are bounded.
         }
     }
 }
