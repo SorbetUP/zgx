@@ -909,9 +909,62 @@ fn next_document_chunk<'a>(body: &'a [u8], offset: &mut usize, limit: usize) -> 
     &body[start..end]
 }
 
+/// Maps CEF's transition type to ZGX's navigation kind.
+fn navigation_kind(transition: TransitionType) -> zgx::web_view::NavigationKind {
+    navigation_kind_raw(cef::sys::cef_transition_type_t::from(transition) as u32)
+}
+
+/// Forward/back is a qualifier flag combined with the base type, so test it
+/// on the raw value.
+fn navigation_kind_raw(raw: u32) -> zgx::web_view::NavigationKind {
+    use zgx::web_view::NavigationKind;
+    let forward_back =
+        cef::sys::cef_transition_type_t::from(TransitionType::FORWARD_BACK_FLAG) as u32;
+    if raw & forward_back != 0 {
+        return NavigationKind::BackForward;
+    }
+    let source_mask = cef::sys::cef_transition_type_t::from(TransitionType::SOURCE_MASK) as u32;
+    let base = raw & source_mask;
+    if base == cef::sys::cef_transition_type_t::from(TransitionType::LINK) as u32 {
+        NavigationKind::Link
+    } else if base == cef::sys::cef_transition_type_t::from(TransitionType::FORM_SUBMIT) as u32 {
+        NavigationKind::FormSubmission
+    } else if base == cef::sys::cef_transition_type_t::from(TransitionType::RELOAD) as u32 {
+        NavigationKind::Reload
+    } else {
+        NavigationKind::Other
+    }
+}
+
 wrap_request_handler! {
-    struct CEFRequestHandler { html_documents: HtmlDocuments, handlers: HtmlHandlerKeepAlive }
+    struct CEFRequestHandler { html_documents: HtmlDocuments, handlers: HtmlHandlerKeepAlive, web: zgx::web_view::WeakWebView }
     impl RequestHandler {
+        fn on_before_browse(
+            &self,
+            _browser: Option<&mut Browser>,
+            frame: Option<&mut Frame>,
+            request: Option<&mut Request>,
+            _user_gesture: i32,
+            _is_redirect: i32,
+        ) -> i32 {
+            // Answer synchronously on the UI thread, as the policy requires:
+            // cancel (1) when the controller's navigation policy refuses.
+            let (Some(frame), Some(request)) = (frame, request) else {
+                return 1;
+            };
+            let Some(web) = self.web.upgrade() else {
+                return 1;
+            };
+            let destination = CefString::from(&request.url()).to_string();
+            let navigation = zgx::web_view::NavigationRequest {
+                url: destination,
+                main_frame: frame.is_main() != 0,
+                kind: navigation_kind(request.transition_type()),
+                source_url: CefString::from(&frame.url()).to_string(),
+            };
+            i32::from(!web.allows(&navigation))
+        }
+
         fn resource_request_handler(
             &self,
             _browser: Option<&mut Browser>,
@@ -1205,7 +1258,11 @@ pub(super) fn client(
             permission,
             dialog,
         },
-        CEFRequestHandler::new(html_documents, Arc::new(Mutex::new(HashMap::new()))),
+        CEFRequestHandler::new(
+            html_documents,
+            Arc::new(Mutex::new(HashMap::new())),
+            web.clone(),
+        ),
         web,
     )
 }
@@ -1255,11 +1312,39 @@ mod tests {
     use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
     use super::{
-        DownloadUpdate, file_dialog_selection, is_user_cancelled_load, next_document_chunk,
-        normalize_document_url, update_download_status,
+        DownloadUpdate, file_dialog_selection, is_user_cancelled_load, navigation_kind,
+        navigation_kind_raw, next_document_chunk, normalize_document_url, update_download_status,
     };
-    use cef::FileDialogMode;
-    use zgx::web_view::DownloadStatus;
+    use cef::{FileDialogMode, TransitionType};
+    use zgx::web_view::{DownloadStatus, NavigationKind};
+
+    #[test]
+    fn transition_type_maps_to_navigation_kind() {
+        let raw = |t: TransitionType| cef::sys::cef_transition_type_t::from(t) as u32;
+        let forward_back = raw(TransitionType::FORWARD_BACK_FLAG);
+        assert_eq!(
+            navigation_kind_raw(raw(TransitionType::LINK)),
+            NavigationKind::Link
+        );
+        assert_eq!(
+            navigation_kind_raw(raw(TransitionType::FORM_SUBMIT)),
+            NavigationKind::FormSubmission
+        );
+        assert_eq!(
+            navigation_kind_raw(raw(TransitionType::RELOAD)),
+            NavigationKind::Reload
+        );
+        // Forward/back is a qualifier flag combined with the base type.
+        assert_eq!(
+            navigation_kind_raw(raw(TransitionType::LINK) | forward_back),
+            NavigationKind::BackForward
+        );
+        assert_eq!(
+            navigation_kind_raw(raw(TransitionType::AUTO_TOPLEVEL)),
+            NavigationKind::Other
+        );
+        assert_eq!(navigation_kind(TransitionType::LINK), NavigationKind::Link);
+    }
 
     #[test]
     fn html_document_reader_serves_bounded_chunks_and_finishes_at_eof() {

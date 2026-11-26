@@ -786,6 +786,16 @@ pub(super) fn prepare_popup(
         runtime::retain_child_web(creation_id, child.clone());
     }
     let child_weak = child.as_ref().map(|child| child.downgrade());
+    // The child inherits the opener's navigation policy (a policy-less parent
+    // allows everything, so this is just delegation).
+    if let (Some(parent), Some(child)) = (web.upgrade(), child.as_ref()) {
+        let parent_weak = parent.downgrade();
+        child.set_navigation_policy(move |request| {
+            parent_weak
+                .upgrade()
+                .is_some_and(|parent| parent.allows(request))
+        });
+    }
     let page_web = child_weak.clone().unwrap_or_else(|| web.clone());
     let frame = Arc::new(Mutex::default());
     let popup = Arc::new(Mutex::default());

@@ -104,6 +104,11 @@ const EVENT_CHANGED_FIXTURE: &str = r#"<!doctype html>
 <script>window.webkit.messageHandlers.zgx.postMessage({source:"cef-fixture",value:42})</script>
 "#;
 
+const POLICY_FIXTURE: &str = r#"<!doctype html><meta charset=utf-8><title>policy</title>
+<a id="allowed" href="/policy-allowed">allowed</a>
+<a id="denied" href="/policy-denied">denied</a>
+"#;
+
 const POPUP_PARENT_FIXTURE: &str = r#"<!doctype html><meta charset=utf-8><title>popup parent</title>
 <script>
 window.__popupMessages=[];
@@ -429,6 +434,29 @@ fn start_fixture_server(
                     });
                     let body: &'static [u8] = if has_cookie { b"present" } else { b"absent" };
                     ("200 OK", "text/plain", "", body)
+                } else if path == "/policy" {
+                    (
+                        "200 OK",
+                        "text/html; charset=utf-8",
+                        "",
+                        POLICY_FIXTURE.as_bytes(),
+                    )
+                } else if path == "/policy-allowed" {
+                    (
+                        "200 OK",
+                        "text/html; charset=utf-8",
+                        "",
+                        b"<!doctype html><meta charset=utf-8><title>policy allowed</title>"
+                            .as_slice(),
+                    )
+                } else if path == "/policy-denied" {
+                    (
+                        "200 OK",
+                        "text/html; charset=utf-8",
+                        "",
+                        b"<!doctype html><meta charset=utf-8><title>policy denied</title>"
+                            .as_slice(),
+                    )
                 } else if path == "/event-changed" {
                     (
                         "200 OK",
@@ -522,6 +550,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let navigation_eval_race_test = navigation_eval_race_result_path.is_some();
     let popup_result_path = std::env::var_os("ZGX_CEF_POPUP_RESULT").map(std::path::PathBuf::from);
     let popup_test = popup_result_path.is_some();
+    let policy_result_path =
+        std::env::var_os("ZGX_CEF_POLICY_RESULT").map(std::path::PathBuf::from);
+    let policy_test = policy_result_path.is_some();
     let drag_result_path = std::env::var_os("ZGX_CEF_DRAG_RESULT").map(std::path::PathBuf::from);
     let drag_test = drag_result_path.is_some();
     let drag_fixture_file = fixture_data_dir.join("drag-payload.txt");
@@ -540,7 +571,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         || stress_test
         || navigation_eval_race_test
         || popup_test
-        || drag_test;
+        || drag_test
+        || policy_test;
     if let Some(result_path) = download_result_path.as_ref() {
         fs::write(result_path, format!("START:auto={automated}\n"))?;
     }
@@ -574,6 +606,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         fs::write(result_path, "START\n")?;
     }
     if let Some(result_path) = drag_result_path.as_ref() {
+        fs::write(result_path, "START\n")?;
+    }
+    if let Some(result_path) = policy_result_path.as_ref() {
         fs::write(result_path, "START\n")?;
     }
     let origin = start_fixture_server(
@@ -1223,6 +1258,66 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 });
                 web.load_url(format!("{origin}/site-data"));
+            } else if policy_test {
+                let page = web.clone();
+                let result_path = policy_result_path
+                    .clone()
+                    .expect("policy test has a result path");
+                let window = cx.window.clone();
+                let policy_diagnostic = result_path.with_extension("diagnostic");
+                web.set_navigation_policy(move |request| {
+                    let _ = fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&policy_diagnostic)
+                        .and_then(|mut file| {
+                            writeln!(
+                                file,
+                                "POLICY url={} main={} kind={:?}",
+                                request.url, request.main_frame, request.kind
+                            )
+                        });
+                    !request.url.contains("/policy-denied")
+                });
+                web.load_url(format!("{origin}/policy"));
+                cx.tasks.spawn(async move {
+                    for _ in 0..200 {
+                        if page.title() == "policy"
+                            && !page.state().with_untracked(|state| state.loading)
+                        {
+                            break;
+                        }
+                        zgx::timer::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                    if page.title() != "policy" {
+                        let _ = fs::write(&result_path, "FAIL:policy-page-load");
+                        window.close();
+                        return;
+                    }
+                    // A denied link must be cancelled before any request.
+                    page.evaluate_js("document.querySelector('#denied').click()", |_| {});
+                    zgx::timer::sleep(std::time::Duration::from_secs(1)).await;
+                    let url_after_denied = page.url();
+                    // An allowed link must navigate.
+                    page.evaluate_js("document.querySelector('#allowed').click()", |_| {});
+                    let mut allowed_committed = false;
+                    for _ in 0..100 {
+                        if page.url().contains("/policy-allowed") {
+                            allowed_committed = true;
+                            break;
+                        }
+                        zgx::timer::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                    let status = if url_after_denied.contains("/policy-denied") {
+                        "FAIL:denied-navigation-committed"
+                    } else if !allowed_committed {
+                        "FAIL:allowed-navigation-blocked"
+                    } else {
+                        "PASS"
+                    };
+                    let _ = fs::write(&result_path, status);
+                    window.close();
+                });
             } else if popup_test {
                 let result = popup_result_path
                     .clone()
