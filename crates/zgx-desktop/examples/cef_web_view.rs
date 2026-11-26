@@ -109,6 +109,21 @@ const POLICY_FIXTURE: &str = r#"<!doctype html><meta charset=utf-8><title>policy
 <a id="denied" href="/policy-denied">denied</a>
 "#;
 
+// Sandbox-origin fixture: the parent is served over http, but the iframe is
+// `sandbox="allow-scripts"` (no allow-same-origin), so its security origin is
+// OPAQUE ("null") even though its URL is http. Its message must arrive with
+// origin "null", never with the server's http origin.
+const SANDBOX_PARENT_FIXTURE: &str = r#"<!doctype html>
+<meta charset="utf-8"><title>sandbox parent</title>
+<iframe sandbox="allow-scripts" src="/sandbox-child"></iframe>
+<script>window.webkit.messageHandlers.zgx.postMessage({source:"sandbox-parent"})</script>
+"#;
+
+const SANDBOX_CHILD_FIXTURE: &str = r#"<!doctype html>
+<meta charset="utf-8"><title>sandbox child</title>
+<script>window.webkit.messageHandlers.zgx.postMessage({source:"sandbox-child"})</script>
+"#;
+
 const POPUP_PARENT_FIXTURE: &str = r#"<!doctype html><meta charset=utf-8><title>popup parent</title>
 <script>
 window.__popupMessages=[];
@@ -316,6 +331,7 @@ fn start_fixture_server(
     site_data_test: bool,
     popup_test: bool,
     drag_test: bool,
+    sandbox_test: bool,
     html_base_result_path: Option<std::path::PathBuf>,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
@@ -471,6 +487,20 @@ fn start_fixture_server(
                         "",
                         EVENT_FIXTURE.as_bytes(),
                     )
+                } else if sandbox_test && path == "/sandbox-parent" {
+                    (
+                        "200 OK",
+                        "text/html; charset=utf-8",
+                        "",
+                        SANDBOX_PARENT_FIXTURE.as_bytes(),
+                    )
+                } else if sandbox_test && path == "/sandbox-child" {
+                    (
+                        "200 OK",
+                        "text/html; charset=utf-8",
+                        "",
+                        SANDBOX_CHILD_FIXTURE.as_bytes(),
+                    )
                 } else if download_test && path == "/download" {
                     (
                         "200 OK",
@@ -520,6 +550,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let input_test = input_result_path.is_some();
     let event_result_path = std::env::var_os("ZGX_CEF_EVENT_RESULT").map(std::path::PathBuf::from);
     let event_test = event_result_path.is_some();
+    let sandbox_origin_result_path =
+        std::env::var_os("ZGX_CEF_SANDBOX_ORIGIN_RESULT").map(std::path::PathBuf::from);
+    let sandbox_origin_test = sandbox_origin_result_path.is_some();
     let eval_result_path = std::env::var_os("ZGX_CEF_EVAL_RESULT").map(std::path::PathBuf::from);
     let eval_test = eval_result_path.is_some();
     let html_base_result_path = std::env::args()
@@ -563,6 +596,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let automated = download_test
         || input_test
         || event_test
+        || sandbox_origin_test
         || eval_test
         || html_base_test
         || site_data_test
@@ -577,6 +611,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         fs::write(result_path, format!("START:auto={automated}\n"))?;
     }
     if let Some(result_path) = event_result_path.as_ref() {
+        fs::write(result_path, "START\n")?;
+    }
+    if let Some(result_path) = sandbox_origin_result_path.as_ref() {
         fs::write(result_path, "START\n")?;
     }
     if let Some(result_path) = input_result_path.as_ref() {
@@ -616,6 +653,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         site_data_test || late_load_test,
         popup_test,
         drag_test,
+        sandbox_origin_test,
         html_base_result_path.clone(),
     )?;
     if let Some(result_path) = event_result_path.as_ref() {
@@ -654,7 +692,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     new_windows: popup_test,
                     // The event fixture asserts page messages from both the
                     // main frame and a srcdoc iframe, so its bridge must be on.
-                    messages: drag_test || popup_test || event_test,
+                    // The sandbox fixture asserts the sandboxed iframe's
+                    // message arrives with origin "null".
+                    messages: drag_test || popup_test || event_test || sandbox_origin_test,
                     ..Default::default()
                 },
             );
@@ -848,6 +888,74 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let timeout_path = result_path;
                 cx.tasks.spawn(async move {
                     zgx::timer::sleep(std::time::Duration::from_secs(12)).await;
+                    if !completed.load(Ordering::Acquire) {
+                        let _ = fs::write(timeout_path, "TIMEOUT");
+                        timeout_window.close();
+                    }
+                });
+                subscription
+            });
+            // Sandbox-origin fixture: a `sandbox="allow-scripts"` iframe is
+            // served over http, so frame.url() would say the http origin —
+            // but its security origin is opaque and must arrive as "null".
+            let sandbox_subscription = sandbox_origin_result_path.clone().map(|result_path| {
+                let observed = Arc::new(Mutex::new((false, false)));
+                let event_state = observed.clone();
+                let event_done = Arc::new(AtomicBool::new(false));
+                let completed = event_done.clone();
+                let log_path = result_path.clone();
+                let write_path = result_path.clone();
+                let window = cx.window.clone();
+                let expected_origin = origin.clone();
+                let subscription = web.on_event(move |event| {
+                    let zgx::web_view::WebViewEvent::Message {
+                        body,
+                        origin: message_origin,
+                        main_frame,
+                    } = event
+                    else {
+                        return;
+                    };
+                    if let Ok(mut log) = fs::OpenOptions::new().append(true).open(&log_path) {
+                        let _ = writeln!(log, "SANDBOX_EVENT:{body}:{message_origin}:{main_frame}");
+                    }
+                    let mut observed = event_state
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner());
+                    match body.as_str() {
+                        r#"{"source":"sandbox-child"}"# => {
+                            // The sandboxed iframe has an opaque origin even
+                            // though its URL is http: it must arrive as
+                            // "null", never as the fixture server's origin.
+                            if message_origin == "null" {
+                                observed.0 = true;
+                            } else {
+                                drop(observed);
+                                let _ = fs::write(
+                                    &write_path,
+                                    format!("FAIL:sandbox-child-origin:{message_origin}"),
+                                );
+                                window.close();
+                                return;
+                            }
+                        }
+                        r#"{"source":"sandbox-parent"}"# => {
+                            if message_origin == &expected_origin {
+                                observed.1 = true;
+                            }
+                        }
+                        _ => {}
+                    }
+                    if observed.0 && observed.1 {
+                        event_done.store(true, Ordering::Release);
+                        let _ = fs::write(&write_path, "PASS");
+                        window.close();
+                    }
+                });
+                let timeout_window = cx.window.clone();
+                let timeout_path = result_path;
+                cx.tasks.spawn(async move {
+                    zgx::timer::sleep(std::time::Duration::from_secs(15)).await;
                     if !completed.load(Ordering::Acquire) {
                         let _ = fs::write(timeout_path, "TIMEOUT");
                         timeout_window.close();
@@ -1488,6 +1596,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         },
                     );
                 });
+            } else if sandbox_origin_test {
+                web.load_url(format!("{origin}/sandbox-parent"));
             } else if event_test {
                 web.load_html(EVENT_FIXTURE, None);
                 let probe_web = web.clone();
@@ -1906,11 +2016,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 app
             };
             let app = if event_subscription.is_some()
+                || sandbox_subscription.is_some()
                 || popup_subscription.is_some()
                 || drag_subscription.is_some()
             {
                 app.on_mount(move |handle| {
                     if let Some(subscription) = event_subscription {
+                        handle.retain(subscription);
+                    }
+                    if let Some(subscription) = sandbox_subscription {
                         handle.retain(subscription);
                     }
                     if let Some(subscription) = popup_subscription {
