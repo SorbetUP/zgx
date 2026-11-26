@@ -37,7 +37,7 @@ pub(super) struct Page {
     /// cleared when the browser callback arrives or the page is dropped.
     creation_id: Cell<Option<u64>>,
     permissions: runtime::PermissionStoreHandle,
-    profile: String,
+    origins: runtime::OriginStoreHandle,
     browser: Rc<RefCell<Option<Browser>>>,
     html_documents: client::HtmlDocuments,
     pending: RefCell<Vec<WebViewCommand>>,
@@ -384,16 +384,36 @@ fn start_clear_site_data(page: &Page, browser: &Browser, url: &str, done: SiteDa
         return;
     }
     // Clear every origin of the site, not just the one asked for: the URL's
-    // own origin plus every origin this profile has visited whose host is the
-    // site's host or a subdomain of it. Without a public suffix list the site
-    // is the URL's exact host, so sibling subdomains are covered when the URL
-    // is on the parent host; origins actually visited are always included.
-    let Some(site) = zgx::web_view::site_host(url) else {
+    // own origin plus every origin this profile knows — persisted from
+    // earlier runs and this session — whose host's registrable domain
+    // (eTLD+1, from the Public Suffix List) is the URL's, so sibling
+    // subdomains (a.b.example.co.uk next to example.co.uk) and other ports
+    // of the site go too.
+    let Some(site_host) = zgx::web_view::site_host(url) else {
         done(Err(format!("{url} has no site")));
         return;
     };
-    let origins = runtime::site_origins(&page.profile, &site, &origin);
+    let Some(site) = runtime::registrable_domain(&site_host) else {
+        done(Err(format!("{url} has no registrable domain")));
+        return;
+    };
+    let origins = runtime::site_origins(&page.origins, &site, &origin);
+    // Cookies are the one record a per-origin storage clear can miss: a
+    // cookie set with `Domain=.example.com` belongs to no single origin, and
+    // HttpOnly ones never reach script. Enumerate them all through the
+    // profile's cookie manager and delete every one whose domain belongs to
+    // the site, then ask delete_cookies to remove each by URL and name as
+    // well.
     let outcome = Rc::new(RefCell::new((0usize, None::<String>)));
+    match delete_site_cookies(&host, &site) {
+        Ok(count) => outcome.borrow_mut().0 += count,
+        Err(error) => {
+            let mut outcome = outcome.borrow_mut();
+            if outcome.1.is_none() {
+                outcome.1 = Some(error);
+            }
+        }
+    }
     let done = Rc::new(RefCell::new(Some(done)));
     let remaining_slot = Rc::new(std::cell::Cell::new(origins.len()));
     let store = page.permissions.clone();
@@ -463,6 +483,72 @@ fn start_clear_site_data(page: &Page, browser: &Browser, url: &str, done: SiteDa
             reply(Err("CEF rejected Storage.clearDataForOrigin".into()));
         }
     }
+}
+
+wrap_cookie_visitor! {
+    struct SiteCookieVisitor {
+        site: String,
+        matched: Rc<RefCell<Vec<(String, String, String)>>>,
+        deleted: Rc<std::cell::Cell<usize>>,
+    }
+    impl CookieVisitor {
+        fn visit(
+            &self,
+            cookie: Option<&Cookie>,
+            _count: i32,
+            _total: i32,
+            delete_cookie: Option<&mut i32>,
+        ) -> i32 {
+            let Some(cookie) = cookie else { return 0 };
+            let domain = cookie.domain.to_string();
+            let Some(registrable) = runtime::registrable_domain(domain.trim_start_matches('.'))
+            else {
+                return 0;
+            };
+            if registrable == self.site {
+                // Delete the cookie right here, HttpOnly ones included, and
+                // remember it so delete_cookies removes it by URL and name
+                // as well.
+                if let Some(delete) = delete_cookie {
+                    *delete = 1;
+                }
+                self.deleted.set(self.deleted.get() + 1);
+                self.matched.borrow_mut().push((
+                    cookie.name.to_string(),
+                    domain,
+                    cookie.path.to_string(),
+                ));
+            }
+            0
+        }
+    }
+}
+
+/// Delete every cookie of the profile's request context whose domain belongs
+/// to `site` (the registrable domain being cleared): host-only cookies of the
+/// site's origins, `Domain=.example.com` ones shared by its subdomains, and
+/// HttpOnly ones. Returns how many cookies matched.
+fn delete_site_cookies(host: &BrowserHost, site: &str) -> Result<usize, String> {
+    let context = host
+        .request_context()
+        .ok_or_else(|| "CEF request context is not available".to_owned())?;
+    let manager = context
+        .cookie_manager(None)
+        .ok_or_else(|| "CEF cookie manager is not available".to_owned())?;
+    let matched: Rc<RefCell<Vec<(String, String, String)>>> = Rc::new(RefCell::new(Vec::new()));
+    let deleted = Rc::new(std::cell::Cell::new(0usize));
+    let mut visitor = SiteCookieVisitor::new(site.to_owned(), matched.clone(), deleted.clone());
+    manager.visit_all_cookies(Some(&mut visitor));
+    for (name, domain, path) in matched.borrow().iter() {
+        let host_part = domain.trim_start_matches('.');
+        let path = if path.is_empty() { "/" } else { path.as_str() };
+        for scheme in ["http", "https"] {
+            let url: CefString = format!("{scheme}://{host_part}{path}").as_str().into();
+            let name: CefString = name.as_str().into();
+            let _ = manager.delete_cookies(Some(&url), Some(&name), None);
+        }
+    }
+    Ok(deleted.get())
 }
 
 fn apply(page: &Page, browser: &Browser, command: WebViewCommand) {
@@ -612,6 +698,7 @@ pub(super) fn backend(
     };
     let context = runtime::request_context(&profile, persistent)?;
     let permissions = runtime::permission_store(&profile, persistent)?;
+    let origins = runtime::origin_store(&profile, persistent)?;
     let frame = Arc::new(Mutex::default());
     let popup = Arc::new(Mutex::default());
     let size = Arc::new(Mutex::new((1024, 768)));
@@ -628,7 +715,7 @@ pub(super) fn backend(
         web: web.downgrade(),
         creation_id: Cell::new(None),
         permissions: permissions.clone(),
-        profile: profile.clone(),
+        origins: origins.clone(),
         browser: browser.clone(),
         html_documents: Arc::new(Mutex::new(HashMap::new())),
         pending: RefCell::new(Vec::new()),
@@ -761,6 +848,7 @@ pub(super) fn backend(
         None,
         profile.clone(),
         permissions,
+        origins,
         dialogs,
         tasks,
         windows,
@@ -814,6 +902,7 @@ pub(super) fn prepare_popup(
     web: zgx::web_view::WeakWebView,
     profile: String,
     permissions: runtime::PermissionStoreHandle,
+    origins: runtime::OriginStoreHandle,
     dialogs: crate::FileDialogs,
     tasks: crate::TaskSpawner,
     windows: crate::WindowFactory,
@@ -862,7 +951,7 @@ pub(super) fn prepare_popup(
         web: page_web.clone(),
         creation_id: Cell::new(Some(creation_id)),
         permissions: permissions.clone(),
-        profile: profile.clone(),
+        origins: origins.clone(),
         browser: browser.clone(),
         html_documents: Arc::new(Mutex::new(HashMap::new())),
         pending: RefCell::new(Vec::new()),
@@ -1008,6 +1097,7 @@ pub(super) fn prepare_popup(
         Some(web),
         profile,
         permissions,
+        origins,
         dialogs,
         tasks,
         windows.clone(),

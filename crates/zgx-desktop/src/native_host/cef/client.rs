@@ -8,7 +8,7 @@ use std::{
 
 use cef::{self, *};
 
-use super::runtime::PermissionStoreHandle;
+use super::runtime::{OriginStoreHandle, PermissionStoreHandle};
 use super::{
     rendering::{SharedFrame, SharedPopup},
     runtime,
@@ -288,6 +288,7 @@ wrap_life_span_handler! {
         callbacks: BrowserCallbacks,
         profile: String,
         store: PermissionStoreHandle,
+        origins: OriginStoreHandle,
         dialogs: crate::FileDialogs,
         tasks: crate::TaskSpawner,
         windows: crate::WindowFactory,
@@ -337,6 +338,7 @@ wrap_life_span_handler! {
                 self.callbacks.web.clone(),
                 self.profile.clone(),
                 self.store.clone(),
+                self.origins.clone(),
                 self.dialogs.clone(),
                 self.tasks.clone(),
                 self.windows.clone(),
@@ -493,7 +495,7 @@ wrap_render_handler! {
 }
 
 wrap_load_handler! {
-    pub(super) struct CEFLoadHandler { web: zgx::web_view::WeakWebView, navigation_started: Rc<dyn Fn()>, profile: String }
+    pub(super) struct CEFLoadHandler { web: zgx::web_view::WeakWebView, navigation_started: Rc<dyn Fn()>, origins: OriginStoreHandle }
     impl LoadHandler {
         fn on_load_start(&self, _browser: Option<&mut Browser>, frame: Option<&mut cef::Frame>, _transition: TransitionType) {
             let Some(frame) = frame.filter(|frame| frame.is_main() != 0) else { return };
@@ -514,15 +516,21 @@ wrap_load_handler! {
             });
         }
         fn on_load_end(&self, browser: Option<&mut Browser>, frame: Option<&mut cef::Frame>, _status: i32) {
-            let Some(frame) = frame.filter(|frame| frame.is_main() != 0) else { return };
-            let url = CefString::from(&frame.url()).to_string();
-            // Remember this profile's visited origin so site-data removal can
-            // cover every origin of the site, not only the one asked for.
+            let url = frame
+                .as_ref()
+                .map(|frame| CefString::from(&frame.url()).to_string())
+                .unwrap_or_default();
+            // Remember every frame's origin that committed an HTTP(S)
+            // navigation, main frame and subframes alike, so site-data
+            // removal can cover every origin of the site, not only the top
+            // page's.
             if let Some(origin) = origin_from_url(&url)
                 && (origin.starts_with("http://") || origin.starts_with("https://"))
             {
-                super::runtime::record_visited_origin(&self.profile, origin);
+                super::runtime::record_visited_origin(&self.origins, origin);
             }
+            let Some(frame) = frame.filter(|frame| frame.is_main() != 0) else { return };
+            let url = CefString::from(&frame.url()).to_string();
             let (can_go_back, can_go_forward) = browser
                 .map(|browser| (browser.can_go_back() != 0, browser.can_go_forward() != 0))
                 .unwrap_or_default();
@@ -1274,6 +1282,7 @@ pub(super) fn client(
     download_owner: Option<zgx::web_view::WeakWebView>,
     profile: String,
     store: PermissionStoreHandle,
+    origins: OriginStoreHandle,
     dialogs: crate::FileDialogs,
     tasks: crate::TaskSpawner,
     windows: crate::WindowFactory,
@@ -1294,12 +1303,13 @@ pub(super) fn client(
         callbacks,
         profile.clone(),
         store.clone(),
+        origins.clone(),
         dialogs.clone(),
         tasks.clone(),
         windows,
         Rc::new(RefCell::new(HashMap::new())),
     );
-    let load = CEFLoadHandler::new(web.clone(), navigation_started, profile.clone());
+    let load = CEFLoadHandler::new(web.clone(), navigation_started, origins);
     let display = CEFDisplayHandler::new(web.clone());
     let download = CEFDownloadHandler::new(
         web.clone(),

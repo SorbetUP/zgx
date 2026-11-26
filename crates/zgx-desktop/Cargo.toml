@@ -52,7 +52,7 @@ webview2 = ["dep:webview2-com", "zgx-gpu/composition", "windows/Win32_Graphics_D
 # and where it is missing pages are placeholders.
 webkitgtk = []
 # CEF OSR pages composited into the ZGX renderer.
-cef = ["dep:cef", "dep:wgpu"]
+cef = ["dep:cef", "dep:wgpu", "dep:psl"]
 # macOS system WebKit pages (disabled when the CEF backend is selected).
 macos-webkit = ["dep:objc2-web-kit"]
 cef-package = ["cef", "cef/build-util", "dep:semver"]
@@ -92,6 +92,9 @@ rfd = "=0.17.2"
 open = "=5.4.4"
 cef = { version = "=156.7.0", default-features = false, features = ["sandbox", "resources"], optional = true }
 wgpu = { version = "29.0.4", default-features = false, optional = true }
+# The Public Suffix List, embedded: a host's registrable domain (eTLD+1) for
+# site-data removal (`cef` backend).
+psl = { version = "2", optional = true }
 semver = { version = "1.0", optional = true }
 serde_json = "1"
 
