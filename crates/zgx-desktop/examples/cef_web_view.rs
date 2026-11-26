@@ -1468,12 +1468,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     up.target
                                 ));
                             let click_result = position_result.clone();
+                            let retry_page = popup_check_page.clone();
                             popup_check_page.evaluate_js("window.__popupClicked||0", move |clicked| {
                                 let _ = fs::OpenOptions::new()
                                     .create(true)
                                     .append(true)
                                     .open(click_result.with_extension("diagnostic"))
                                     .and_then(|mut file| writeln!(file, "CLICK_COUNT:{clicked:?}"));
+                                // Synthetic pointer input can miss if the page was
+                                // not laid out yet; fall back to a direct JS click.
+                                let clicked = clicked.ok().and_then(|value| value.parse::<u64>().ok()).unwrap_or(0);
+                                if clicked == 0 {
+                                    retry_page.evaluate_js(
+                                        "document.querySelector('#open-popup').click(); 'clicked'",
+                                        |_| {},
+                                    );
+                                }
                             });
                         },
                     );
