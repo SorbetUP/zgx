@@ -37,6 +37,7 @@ pub(super) struct Page {
     /// cleared when the browser callback arrives or the page is dropped.
     creation_id: Cell<Option<u64>>,
     permissions: runtime::PermissionStoreHandle,
+    profile: String,
     browser: Rc<RefCell<Option<Browser>>>,
     html_documents: client::HtmlDocuments,
     pending: RefCell<Vec<WebViewCommand>>,
@@ -382,38 +383,85 @@ fn start_clear_site_data(page: &Page, browser: &Browser, url: &str, done: SiteDa
         done(Err("CEF site-data observer is unavailable".into()));
         return;
     }
-    let mut id = page.next_evaluation.get().wrapping_add(1).max(1);
-    while page.evaluations.borrow().contains_key(&id) || page.site_data.borrow().contains_key(&id) {
-        id = id.wrapping_add(1).max(1);
-    }
-    page.next_evaluation.set(id);
-    let Some(mut params) = dictionary_value_create() else {
-        done(Err("CEF could not allocate site-data parameters".into()));
+    // Clear every origin of the site, not just the one asked for: the URL's
+    // own origin plus every origin this profile has visited whose host is the
+    // site's host or a subdomain of it. Without a public suffix list the site
+    // is the URL's exact host, so sibling subdomains are covered when the URL
+    // is on the parent host; origins actually visited are always included.
+    let Some(site) = zgx::web_view::site_host(url) else {
+        done(Err(format!("{url} has no site")));
         return;
     };
-    let origin_key: CefString = "origin".into();
-    let origin_value: CefString = origin.as_str().into();
-    let types_key: CefString = "storageTypes".into();
-    let types_value: CefString = "all".into();
-    let _ = params.set_string(Some(&origin_key), Some(&origin_value));
-    let _ = params.set_string(Some(&types_key), Some(&types_value));
+    let origins = runtime::site_origins(&page.profile, &site, &origin);
+    let outcome = Rc::new(RefCell::new((0usize, None::<String>)));
+    let done = Rc::new(RefCell::new(Some(done)));
+    let remaining_slot = Rc::new(std::cell::Cell::new(origins.len()));
     let store = page.permissions.clone();
-    let cleared_origin = origin.clone();
-    let done: SiteDataReply = Box::new(move |result| match result {
-        Ok(count) => match store.borrow_mut().forget_origin(&cleared_origin) {
-            Ok(()) => done(Ok(count)),
-            Err(error) => done(Err(format!(
-                "site data was cleared but its saved permissions could not be removed: {error}"
-            ))),
-        },
-        Err(error) => done(Err(error)),
-    });
-    page.site_data.borrow_mut().insert(id, done);
-    let method: CefString = "Storage.clearDataForOrigin".into();
-    if host.execute_dev_tools_method(id, Some(&method), Some(&mut params)) == 0
-        && let Some(done) = page.site_data.borrow_mut().remove(&id)
-    {
-        done(Err("CEF rejected Storage.clearDataForOrigin".into()));
+    for cleared_origin in origins {
+        let mut id = page.next_evaluation.get().wrapping_add(1).max(1);
+        while page.evaluations.borrow().contains_key(&id)
+            || page.site_data.borrow().contains_key(&id)
+        {
+            id = id.wrapping_add(1).max(1);
+        }
+        page.next_evaluation.set(id);
+        let Some(mut params) = dictionary_value_create() else {
+            if let Some(done) = done.borrow_mut().take() {
+                done(Err("CEF could not allocate site-data parameters".into()));
+            }
+            return;
+        };
+        let origin_key: CefString = "origin".into();
+        let origin_value: CefString = cleared_origin.as_str().into();
+        let types_key: CefString = "storageTypes".into();
+        let types_value: CefString = "all".into();
+        let _ = params.set_string(Some(&origin_key), Some(&origin_value));
+        let _ = params.set_string(Some(&types_key), Some(&types_value));
+        let remaining_slot = remaining_slot.clone();
+        let outcome = outcome.clone();
+        let done = done.clone();
+        let store = store.clone();
+        let origin_for_reply = cleared_origin.clone();
+        let reply: SiteDataReply = Box::new(move |result| {
+            {
+                let mut outcome = outcome.borrow_mut();
+                match result {
+                    Ok(count) => {
+                        outcome.0 += count;
+                        if let Err(error) = store.borrow_mut().forget_origin(&origin_for_reply)
+                            && outcome.1.is_none()
+                        {
+                            outcome.1 = Some(format!(
+                                "site data was cleared but its saved permissions could not be removed: {error}"
+                            ));
+                        }
+                    }
+                    Err(error) => {
+                        if outcome.1.is_none() {
+                            outcome.1 = Some(error);
+                        }
+                    }
+                }
+            }
+            let left = remaining_slot.get() - 1;
+            remaining_slot.set(left);
+            if left == 0
+                && let Some(done) = done.borrow_mut().take()
+            {
+                let (count, error) = (outcome.borrow().0, outcome.borrow().1.clone());
+                match error {
+                    Some(error) => done(Err(error)),
+                    None => done(Ok(count)),
+                }
+            }
+        });
+        page.site_data.borrow_mut().insert(id, reply);
+        let method: CefString = "Storage.clearDataForOrigin".into();
+        if host.execute_dev_tools_method(id, Some(&method), Some(&mut params)) == 0
+            && let Some(reply) = page.site_data.borrow_mut().remove(&id)
+        {
+            reply(Err("CEF rejected Storage.clearDataForOrigin".into()));
+        }
     }
 }
 
@@ -580,6 +628,7 @@ pub(super) fn backend(
         web: web.downgrade(),
         creation_id: Cell::new(None),
         permissions: permissions.clone(),
+        profile: profile.clone(),
         browser: browser.clone(),
         html_documents: Arc::new(Mutex::new(HashMap::new())),
         pending: RefCell::new(Vec::new()),
@@ -813,6 +862,7 @@ pub(super) fn prepare_popup(
         web: page_web.clone(),
         creation_id: Cell::new(Some(creation_id)),
         permissions: permissions.clone(),
+        profile: profile.clone(),
         browser: browser.clone(),
         html_documents: Arc::new(Mutex::new(HashMap::new())),
         pending: RefCell::new(Vec::new()),

@@ -493,7 +493,7 @@ wrap_render_handler! {
 }
 
 wrap_load_handler! {
-    pub(super) struct CEFLoadHandler { web: zgx::web_view::WeakWebView, navigation_started: Rc<dyn Fn()> }
+    pub(super) struct CEFLoadHandler { web: zgx::web_view::WeakWebView, navigation_started: Rc<dyn Fn()>, profile: String }
     impl LoadHandler {
         fn on_load_start(&self, _browser: Option<&mut Browser>, frame: Option<&mut cef::Frame>, _transition: TransitionType) {
             let Some(frame) = frame.filter(|frame| frame.is_main() != 0) else { return };
@@ -516,6 +516,13 @@ wrap_load_handler! {
         fn on_load_end(&self, browser: Option<&mut Browser>, frame: Option<&mut cef::Frame>, _status: i32) {
             let Some(frame) = frame.filter(|frame| frame.is_main() != 0) else { return };
             let url = CefString::from(&frame.url()).to_string();
+            // Remember this profile's visited origin so site-data removal can
+            // cover every origin of the site, not only the one asked for.
+            if let Some(origin) = origin_from_url(&url)
+                && (origin.starts_with("http://") || origin.starts_with("https://"))
+            {
+                super::runtime::record_visited_origin(&self.profile, origin);
+            }
             let (can_go_back, can_go_forward) = browser
                 .map(|browser| (browser.can_go_back() != 0, browser.can_go_forward() != 0))
                 .unwrap_or_default();
@@ -642,12 +649,23 @@ wrap_find_handler! {
     }
 }
 
+/// A permission callback waiting for its one-shot decision. Kept in a
+/// registry so a dismissal (or a closed browser) can settle it exactly once.
+pub(super) enum PendingPermission {
+    Prompt(PermissionPromptCallback),
+    Media(MediaAccessCallback),
+}
+
+pub(super) type PendingPermissions = Rc<RefCell<HashMap<u64, PendingPermission>>>;
+
 wrap_permission_handler! {
     pub(super) struct CEFPermissionHandler {
         profile: String,
         store: PermissionStoreHandle,
         dialogs: crate::FileDialogs,
         tasks: crate::TaskSpawner,
+        pending: PendingPermissions,
+        next_media_token: std::cell::Cell<u64>,
     }
     impl PermissionHandler {
         fn on_request_media_access_permission(
@@ -681,10 +699,27 @@ wrap_permission_handler! {
             if requested_permissions & video != 0 {
                 requests.push((video, "camera", "camera"));
             }
+            let browser_id = _browser.as_ref().map(|browser| browser.identifier());
+            let token = self.next_media_token.get().wrapping_add(1).max(1);
+            self.next_media_token.set(token);
+            self.pending
+                .borrow_mut()
+                .insert(token, PendingPermission::Media(callback.clone()));
+            let pending = self.pending.clone();
             let profile = self.profile.clone();
             let store = self.store.clone();
             let dialogs = self.dialogs.clone();
             self.tasks.spawn(async move {
+                // One-shot: take the callback out of the registry; if it is
+                // gone (dismissed) or its browser closed, do not call into CEF.
+                let Some(PendingPermission::Media(callback)) = pending.borrow_mut().remove(&token)
+                else {
+                    return;
+                };
+                if browser_id.is_some_and(|id| !super::runtime::browser_is_open(id)) {
+                    callback.cancel();
+                    return;
+                }
                 let mut granted = 0;
                 for (flag, permission, label) in requests {
                     if request_permission(&profile, &store, &dialogs, &origin, permission, label).await {
@@ -702,7 +737,7 @@ wrap_permission_handler! {
         fn on_show_permission_prompt(
             &self,
             _browser: Option<&mut Browser>,
-            _prompt_id: u64,
+            prompt_id: u64,
             requesting_origin: Option<&CefString>,
             requested_permissions: u32,
             callback: Option<&mut PermissionPromptCallback>,
@@ -716,6 +751,10 @@ wrap_permission_handler! {
                 callback.cont(PermissionRequestResult::DENY);
                 return 1;
             };
+            // Register the callback so a dismissal settles it exactly once.
+            self.pending
+                .borrow_mut()
+                .insert(prompt_id, PendingPermission::Prompt(callback.clone()));
             let kinds = [
                 (
                     PermissionRequestTypes::CAMERA_PAN_TILT_ZOOM.get_raw(),
@@ -736,19 +775,45 @@ wrap_permission_handler! {
                 .into_iter()
                 .filter(|(flag, _, _)| requested_permissions & flag != 0)
                 .collect();
+            let pending = self.pending.clone();
             let profile = self.profile.clone();
             let store = self.store.clone();
             let dialogs = self.dialogs.clone();
             self.tasks.spawn(async move {
+                let mut accepted = true;
                 for (_, permission, label) in requests {
                     if !request_permission(&profile, &store, &dialogs, &origin, permission, label).await {
-                        callback.cont(PermissionRequestResult::DENY);
-                        return;
+                        accepted = false;
+                        break;
                     }
                 }
-                callback.cont(PermissionRequestResult::ACCEPT);
+                // One-shot: only settle the prompt if it is still pending.
+                if let Some(PendingPermission::Prompt(callback)) =
+                    pending.borrow_mut().remove(&prompt_id)
+                {
+                    callback.cont(if accepted {
+                        PermissionRequestResult::ACCEPT
+                    } else {
+                        PermissionRequestResult::DENY
+                    });
+                }
             });
             1
+        }
+
+        fn on_dismiss_permission_prompt(
+            &self,
+            _browser: Option<&mut Browser>,
+            prompt_id: u64,
+            result: PermissionRequestResult,
+        ) {
+            // The page went away before deciding: settle the callback once
+            // with CEF's dismissal result so it cannot fire later.
+            if let Some(PendingPermission::Prompt(callback)) =
+                self.pending.borrow_mut().remove(&prompt_id)
+            {
+                callback.cont(result);
+            }
         }
     }
 }
@@ -1234,7 +1299,7 @@ pub(super) fn client(
         windows,
         Rc::new(RefCell::new(HashMap::new())),
     );
-    let load = CEFLoadHandler::new(web.clone(), navigation_started);
+    let load = CEFLoadHandler::new(web.clone(), navigation_started, profile.clone());
     let display = CEFDisplayHandler::new(web.clone());
     let download = CEFDownloadHandler::new(
         web.clone(),
@@ -1244,7 +1309,14 @@ pub(super) fn client(
     );
     let audio = CEFAudioHandler::new(web.clone());
     let find = CEFFindHandler::new(find_replies);
-    let permission = CEFPermissionHandler::new(profile, store, dialogs, tasks);
+    let permission = CEFPermissionHandler::new(
+        profile,
+        store,
+        dialogs,
+        tasks,
+        Rc::new(RefCell::new(HashMap::new())),
+        std::cell::Cell::new(0),
+    );
     let dialog = CEFDialogHandler::new(web.clone());
     CEFClient::new(
         render,

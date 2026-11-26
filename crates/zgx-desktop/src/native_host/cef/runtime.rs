@@ -904,6 +904,54 @@ pub(super) fn browser_closed(identifier: i32) {
     schedule_work(0);
 }
 
+/// Whether CEF still tracks this browser as open (a permission prompt whose
+/// browser closed must not call back into it).
+/// Origins each profile has visited (main-frame HTTP/HTTPS), so site-data
+/// removal can cover every origin of the site, not just the one asked for.
+static VISITED_ORIGINS: OnceLock<Mutex<HashMap<String, std::collections::HashSet<String>>>> =
+    OnceLock::new();
+
+fn visited_origins() -> &'static Mutex<HashMap<String, std::collections::HashSet<String>>> {
+    VISITED_ORIGINS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub(super) fn record_visited_origin(profile: &str, origin: String) {
+    visited_origins()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .entry(profile.to_owned())
+        .or_default()
+        .insert(origin);
+}
+
+/// Every origin this profile has visited whose host belongs to `site_host`
+/// (the host itself or a subdomain of it), plus `extra`.
+pub(super) fn site_origins(profile: &str, site_host: &str, extra: &str) -> Vec<String> {
+    let mut origins = vec![extra.to_owned()];
+    let visited = visited_origins()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if let Some(set) = visited.get(profile) {
+        for origin in set {
+            let Some(host) = zgx::web_view::site_host(origin) else {
+                continue;
+            };
+            if zgx::web_view::site_matches(&host, site_host) && !origins.contains(origin) {
+                origins.push(origin.clone());
+            }
+        }
+    }
+    origins
+}
+
+pub(super) fn browser_is_open(identifier: i32) -> bool {
+    browsers()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .open_ids
+        .contains(&identifier)
+}
+
 pub(super) fn has_browsers() -> bool {
     let tracker = browsers()
         .lock()
@@ -942,9 +990,31 @@ mod tests {
     use super::{
         browser_closed, browser_created, browser_creation_cancelled, browser_creation_failed,
         browser_creation_started, close_race_trace_allowed, has_browsers, mock_keychain_allowed,
-        mock_keychain_requested, schedule_while_running,
+        mock_keychain_requested, record_visited_origin, schedule_while_running, site_origins,
     };
     use std::{collections::HashMap, fs, path::Path, time::SystemTime};
+
+    #[test]
+    fn site_origins_cover_the_site_host_and_its_subdomains() {
+        let profile = format!("site-origins-test-{}", std::process::id());
+        record_visited_origin(&profile, "https://example.com/".into());
+        record_visited_origin(&profile, "https://app.example.com/".into());
+        record_visited_origin(&profile, "https://evil-example.com/".into());
+        record_visited_origin(&profile, "https://example.com.evil.test/".into());
+        let origins = site_origins(&profile, "example.com", "https://example.com/page");
+        assert!(origins.contains(&"https://example.com/page".to_owned()));
+        assert!(origins.contains(&"https://example.com/".to_owned()));
+        assert!(origins.contains(&"https://app.example.com/".to_owned()));
+        assert!(!origins.contains(&"https://evil-example.com/".to_owned()));
+        assert!(!origins.contains(&"https://example.com.evil.test/".to_owned()));
+        // A different profile's visits do not leak in.
+        let other = site_origins(
+            "site-origins-test-other",
+            "example.com",
+            "https://example.com/",
+        );
+        assert_eq!(other, vec!["https://example.com/".to_owned()]);
+    }
 
     #[test]
     fn a_reentrant_cef_pump_is_deferred_until_the_active_call_returns() {
