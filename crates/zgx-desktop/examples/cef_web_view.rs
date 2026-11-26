@@ -326,17 +326,59 @@ fn run_evaluation_test(
     );
 }
 
+fn append_result(path: &Path, line: &str) {
+    let _ = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .and_then(|mut file| writeln!(file, "{line}"));
+}
+
+async fn wait_for_result_line(path: &Path, needle: &str, deadline: std::time::Instant) -> bool {
+    loop {
+        if fs::read_to_string(path)
+            .unwrap_or_default()
+            .contains(needle)
+        {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        zgx::timer::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+async fn wait_for_title(web: &WebView, prefix: &str, deadline: std::time::Instant) -> String {
+    loop {
+        let title = web.title();
+        if title.starts_with(prefix) {
+            return title;
+        }
+        if std::time::Instant::now() >= deadline {
+            return title;
+        }
+        zgx::timer::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
 fn start_fixture_server(
     download_test: bool,
     site_data_test: bool,
+    site_data_frame: bool,
     popup_test: bool,
     drag_test: bool,
     sandbox_test: bool,
     html_base_result_path: Option<std::path::PathBuf>,
+    fixed_port: Option<u16>,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let listener = TcpListener::bind(("127.0.0.1", 0))?;
+    let listener = TcpListener::bind(("127.0.0.1", fixed_port.unwrap_or(0)))?;
     let address = listener.local_addr()?;
     let origin = format!("http://{address}");
+    // A subdomain-style sibling of `localhost` (all of *.localhost is
+    // loopback), served by the same listener, to stand in for two same-site
+    // hosts such as example.com and app.example.com.
+    let sibling_origin = format!("http://sub.localhost:{}", address.port());
     let result_path = std::env::var_os("ZGX_CEF_DOWNLOAD_RESULT").map(std::path::PathBuf::from);
     let site_data_result_path =
         std::env::var_os("ZGX_CEF_SITE_DATA_RESULT").map(std::path::PathBuf::from);
@@ -354,6 +396,7 @@ fn start_fixture_server(
             let popup_diagnostic_path = popup_diagnostic_path.clone();
             let drag_diagnostic_path = drag_diagnostic_path.clone();
             let html_base_log_path = html_base_log_path.clone();
+            let sibling_origin = sibling_origin.clone();
             thread::spawn(move || {
                 let mut stream = stream;
                 let mut request = [0; 2048];
@@ -400,6 +443,86 @@ fn start_fixture_server(
                         let _ = writeln!(result, "HTTP:{path} download={download_test}");
                     }
                 }
+                // Site-data fixture pages that depend on the request (a
+                // domain cookie only for *.localhost hosts) or on the run
+                // phase (a subframe embedding the sibling origin) are built
+                // here, before the static chain below.
+                if site_data_test
+                    && matches!(
+                        path,
+                        "/site-data" | "/site-data-frame" | "/cookie-check-all" | "/verify"
+                    )
+                {
+                    let host_is_localhost = request
+                        .lines()
+                        .find(|line| line.to_ascii_lowercase().starts_with("host:"))
+                        .is_some_and(|line| line.contains("localhost"));
+                    // Only the data pages set cookies; the read-only pages
+                    // (/verify, /cookie-check-all) must not, or they would
+                    // re-create what the clear is expected to remove.
+                    let sets_cookies = matches!(path, "/site-data" | "/site-data-frame");
+                    let mut headers = String::new();
+                    if sets_cookies {
+                        headers.push_str(
+                            "Set-Cookie: fixture_cookie=connected; HttpOnly; SameSite=Lax\r\n",
+                        );
+                        if host_is_localhost {
+                            // A Domain=.localhost cookie, shared by the site's
+                            // subdomains: the record a per-origin storage clear
+                            // alone can miss.
+                            headers.push_str(
+                                "Set-Cookie: site_domain_cookie=shared; Domain=localhost; Path=/; SameSite=Lax\r\n",
+                            );
+                        }
+                    }
+                    let (body, extra_headers) = if path == "/site-data" {
+                        let frame = if site_data_frame {
+                            format!("<iframe src=\"{sibling_origin}/site-data-frame\"></iframe>")
+                        } else {
+                            String::new()
+                        };
+                        (
+                            format!(
+                                "<!doctype html><meta charset=utf-8><title>site-data</title><script>localStorage.setItem('polyscale-site-data','present')</script>{frame}"
+                            ),
+                            String::new(),
+                        )
+                    } else if path == "/site-data-frame" {
+                        (
+                            "<!doctype html><meta charset=utf-8><title>site-data frame</title><script>localStorage.setItem('polyscale-site-data','present')</script>".to_owned(),
+                            String::new(),
+                        )
+                    } else if path == "/cookie-check-all" {
+                        let cookie_header = request
+                            .lines()
+                            .find(|line| line.to_ascii_lowercase().starts_with("cookie:"))
+                            .unwrap_or("");
+                        let fixture = if cookie_header.contains("fixture_cookie=connected") {
+                            "present"
+                        } else {
+                            "absent"
+                        };
+                        let domain = if cookie_header.contains("site_domain_cookie=shared") {
+                            "present"
+                        } else {
+                            "absent"
+                        };
+                        (format!("fixture={fixture};domain={domain}"), String::new())
+                    } else {
+                        (
+                            "<!doctype html><meta charset=utf-8><title>verify</title><script>(async()=>{const c=await fetch('/cookie-check-all').then(r=>r.text());document.title='cookie:'+c+'|local:'+localStorage.getItem('polyscale-site-data');})()</script>".to_owned(),
+                            String::new(),
+                        )
+                    };
+                    let _ = extra_headers;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.write_all(body.as_bytes());
+                    return;
+                }
                 let (status, content_type, headers, body) = if popup_test && path == "/popup-parent"
                 {
                     (
@@ -435,13 +558,6 @@ fn start_fixture_server(
                         "text/plain; charset=utf-8",
                         "",
                         b"drag-link-destination".as_slice(),
-                    )
-                } else if site_data_test && path == "/site-data" {
-                    (
-                        "200 OK",
-                        "text/html; charset=utf-8",
-                        "Set-Cookie: fixture_cookie=connected; HttpOnly; SameSite=Lax\r\n",
-                        b"<!doctype html><meta charset=utf-8><title>site-data</title><script>localStorage.setItem('polyscale-site-data','present')</script>".as_slice(),
                     )
                 } else if site_data_test && path == "/cookie-check" {
                     let has_cookie = request.lines().any(|line| {
@@ -526,12 +642,24 @@ fn start_fixture_server(
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // This executable is a development fixture, not a distributed app. Keep
     // its Chromium test profile away from the user's Keychain so repeated
-    // launches do not prompt for "Chromium Safe Storage" access.
-    let fixture_data_dir =
-        std::env::temp_dir().join(format!("zgx-cef-fixture-{}", std::process::id()));
+    // launches do not prompt for "Chromium Safe Storage" access. A data dir
+    // set from outside is kept (and not removed on exit), so a "restart"
+    // scenario can run two fixture processes over the same profile directory.
+    let external_data_dir = std::env::var_os("POLYSCALE_CEF_DATA_DIR");
+    let fixture_data_dir = external_data_dir
+        .clone()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::temp_dir().join(format!("zgx-cef-fixture-{}", std::process::id()))
+        });
     unsafe {
         std::env::set_var("ZGX_CEF_TEST_FIXTURE", "1");
         std::env::set_var("POLYSCALE_CEF_DATA_DIR", &fixture_data_dir);
+    }
+    if external_data_dir.is_some() {
+        // Create it up front so the mock-keychain fixture check (which
+        // canonicalizes the data dir) accepts it from the first launch.
+        let _ = fs::create_dir_all(&fixture_data_dir);
     }
     let download_result_path =
         std::env::var_os("ZGX_CEF_DOWNLOAD_RESULT").map(std::path::PathBuf::from);
@@ -569,6 +697,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let site_data_result_path =
         std::env::var_os("ZGX_CEF_SITE_DATA_RESULT").map(std::path::PathBuf::from);
     let site_data_test = site_data_result_path.is_some();
+    // "record" and "verify" run the site-data fixture as two processes over
+    // the same POLYSCALE_CEF_DATA_DIR: a simulated restart that must still
+    // let clear_site_data find the site's origins (and clear a
+    // subdomain-style sibling origin) from the persisted registry.
+    let site_data_phase = std::env::var("ZGX_CEF_SITE_DATA_PHASE").unwrap_or_default();
     let late_load_result_path =
         std::env::var_os("ZGX_CEF_LATE_LOAD_RESULT").map(std::path::PathBuf::from);
     let late_load_test = late_load_result_path.is_some();
@@ -648,14 +781,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(result_path) = policy_result_path.as_ref() {
         fs::write(result_path, "START\n")?;
     }
+    // The restart scenario runs two fixture processes that must serve the
+    // site on the same port, so both see the same origins: the record
+    // process leaves its port beside the result file and the verify process
+    // binds it again.
+    let site_data_port_file = site_data_result_path
+        .as_ref()
+        .map(|path| path.with_extension("port"));
+    let fixed_site_data_port = if site_data_phase == "verify" {
+        site_data_port_file
+            .as_ref()
+            .and_then(|path| fs::read_to_string(path).ok())
+            .and_then(|text| text.trim().parse::<u16>().ok())
+    } else {
+        None
+    };
     let origin = start_fixture_server(
         download_test,
         site_data_test || late_load_test,
+        site_data_test && site_data_phase == "record",
         popup_test,
         drag_test,
         sandbox_origin_test,
         html_base_result_path.clone(),
+        fixed_site_data_port,
     )?;
+    if site_data_test
+        && site_data_phase == "record"
+        && let Some(port_file) = &site_data_port_file
+    {
+        let _ = fs::write(
+            port_file,
+            format!("{}\n", origin.rsplit(':').next().unwrap_or_default()),
+        );
+    }
     if let Some(result_path) = event_result_path.as_ref() {
         let mut result = fs::OpenOptions::new().append(true).open(result_path)?;
         writeln!(result, "ORIGIN:{origin}")?;
@@ -682,6 +841,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 WebProfile::Named("zgx-drag-integration-fixture".into())
             } else if late_load_test {
                 WebProfile::Named("zgx-late-load-fixture".into())
+            } else if site_data_test {
+                // Persistent, so the restart scenario (record then verify
+                // over the same data dir) exercises the on-disk registry.
+                WebProfile::Default
             } else {
                 WebProfile::Ephemeral
             };
@@ -1289,6 +1452,142 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // after CEF accepts asynchronous creation; mounting closes
                 // the window while the late creation is still pending.
             } else if site_data_test {
+                let site_data_port = origin.rsplit(':').next().unwrap_or_default().to_owned();
+                let localhost_origin = format!("http://localhost:{site_data_port}");
+                // A subdomain-style sibling of localhost (all of *.localhost
+                // is loopback, served by the same listener): together with
+                // localhost it simulates two same-site hosts.
+                let sibling_origin = format!("http://sub.localhost:{site_data_port}");
+                if site_data_phase == "record" {
+                    // Restart scenario, process 1: visit the site on both of
+                    // its hosts — the sibling only through a subframe, which
+                    // is what records its origin — then exit, leaving the
+                    // profile's origin registry persisted in
+                    // POLYSCALE_CEF_DATA_DIR.
+                    let result_path = site_data_result_path
+                        .clone()
+                        .expect("site-data test has a result path");
+                    let window = cx.window.clone();
+                    append_result(&result_path, &format!("LOAD:{localhost_origin}/site-data"));
+                    cx.tasks.spawn(async move {
+                        let deadline =
+                            std::time::Instant::now() + std::time::Duration::from_secs(20);
+                        let served =
+                            wait_for_result_line(&result_path, "HTTP:/site-data\n", deadline).await
+                                && wait_for_result_line(
+                                    &result_path,
+                                    "HTTP:/site-data-frame",
+                                    deadline,
+                                )
+                                .await;
+                        if !served {
+                            let _ = fs::write(&result_path, "FAIL:record-pages-not-served");
+                            window.close();
+                            return;
+                        }
+                        zgx::timer::sleep(std::time::Duration::from_millis(500)).await;
+                        append_result(&result_path, "PHASE1:DONE");
+                        window.close();
+                    });
+                    web.load_url(format!("{localhost_origin}/site-data"));
+                } else if site_data_phase == "verify" {
+                    // Restart scenario, process 2 (same data dir): the site is
+                    // not visited this session, so only the persisted registry
+                    // can name its origins; clearing from one of them must
+                    // remove the other's data too.
+                    let result_path = site_data_result_path
+                        .clone()
+                        .expect("site-data test has a result path");
+                    let window = cx.window.clone();
+                    let verify_web = web.clone();
+                    let clear_origin = localhost_origin.clone();
+                    let sibling = sibling_origin.clone();
+                    let main_host = localhost_origin.clone();
+                    cx.tasks.spawn(async move {
+                        let deadline =
+                            std::time::Instant::now() + std::time::Duration::from_secs(40);
+                        // Load a page on another site (127.0.0.1), so no
+                        // localhost origin is recorded this session.
+                        if !wait_for_result_line(&result_path, "HTTP:/\n", deadline).await {
+                            let _ = fs::write(&result_path, "FAIL:verify-page-not-served");
+                            window.close();
+                            return;
+                        }
+                        zgx::timer::sleep(std::time::Duration::from_millis(300)).await;
+                        // The registry persisted by the record process names
+                        // both same-site origins.
+                        let registry_ok = std::env::var_os("POLYSCALE_CEF_DATA_DIR")
+                            .map(std::path::PathBuf::from)
+                            .and_then(|dir| {
+                                let component = format!(
+                                    "p-{}",
+                                    "default"
+                                        .bytes()
+                                        .map(|byte| format!("{byte:02x}"))
+                                        .collect::<String>()
+                                );
+                                let bytes =
+                                    fs::read(dir.join(component).join("visited-origins.json"))
+                                        .ok()?;
+                                let origins: Vec<String> =
+                                    serde_json::from_slice(&bytes).ok()?;
+                                Some(origins.contains(&main_host) && origins.contains(&sibling))
+                            })
+                            .unwrap_or(false);
+                        append_result(&result_path, &format!("REGISTRY:persisted={registry_ok}"));
+                        if !registry_ok {
+                            let _ = fs::write(&result_path, "FAIL:persisted-registry");
+                            window.close();
+                            return;
+                        }
+                        // Clear the site from a URL on one of its hosts.
+                        let cleared_slot = Arc::new(Mutex::new(None::<Result<usize, String>>));
+                        {
+                            let slot = cleared_slot.clone();
+                            verify_web.clear_site_data(&clear_origin, move |result| {
+                                *slot.lock().unwrap_or_else(|poison| poison.into_inner()) =
+                                    Some(result);
+                            });
+                        }
+                        let cleared = loop {
+                            if let Some(result) =
+                                cleared_slot.lock().unwrap_or_else(|poison| poison.into_inner()).take()
+                            {
+                                break result;
+                            }
+                            if std::time::Instant::now() >= deadline {
+                                break Err("clear_site_data timed out".to_owned());
+                            }
+                            zgx::timer::sleep(std::time::Duration::from_millis(50)).await;
+                        };
+                        append_result(&result_path, &format!("CLEAR:{cleared:?}"));
+                        if let Err(error) = &cleared {
+                            let _ = fs::write(&result_path, format!("FAIL:clear:{error}"));
+                            window.close();
+                            return;
+                        }
+                        // Cookies (HttpOnly and Domain=.localhost included)
+                        // and localStorage of both same-site origins must be
+                        // gone.
+                        let expected = "cookie:fixture=absent;domain=absent|local:null";
+                        verify_web.load_url(format!("{sibling}/verify"));
+                        let sibling_title = wait_for_title(&verify_web, "cookie:", deadline).await;
+                        append_result(&result_path, &format!("SIBLING:{sibling_title}"));
+                        verify_web.load_url(format!("{main_host}/verify"));
+                        let main_title = wait_for_title(&verify_web, "cookie:", deadline).await;
+                        append_result(&result_path, &format!("MAIN:{main_title}"));
+                        let success = sibling_title == expected && main_title == expected;
+                        let _ = fs::write(
+                            &result_path,
+                            format!(
+                                "{}:sibling={sibling_title}|main={main_title}",
+                                if success { "PASS" } else { "FAIL" }
+                            ),
+                        );
+                        window.close();
+                    });
+                    web.load_url(origin.clone());
+                } else {
                 let site_web = web.clone();
                 let site_origin = origin.clone();
                 let result_path = site_data_result_path
@@ -1366,6 +1665,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 });
                 web.load_url(format!("{origin}/site-data"));
+                }
             } else if policy_test {
                 let page = web.clone();
                 let result_path = policy_result_path
@@ -2114,7 +2414,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err("CEF stress fixture did not close all created browsers cleanly".into());
         }
     }
-    let _ = fs::remove_dir_all(fixture_data_dir);
+    if external_data_dir.is_none() {
+        let _ = fs::remove_dir_all(fixture_data_dir);
+    }
     run_result?;
     Ok(())
 }

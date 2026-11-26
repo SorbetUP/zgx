@@ -151,6 +151,11 @@ static SHUTDOWN_COMPLETE: AtomicBool = AtomicBool::new(false);
 struct Runtime {
     contexts: HashMap<String, RequestContext>,
     permissions: HashMap<String, PermissionStoreHandle>,
+    /// Visited-origin registries of persistent profiles, loaded from disk
+    /// when the profile opens. Ephemeral profiles keep theirs in
+    /// `session_origins` only, so their visits never reach a disk registry.
+    origins: HashMap<String, OriginStoreHandle>,
+    session_origins: HashMap<String, OriginStoreHandle>,
     browsers: HashMap<i32, Browser>,
     deferred_browser_closes: VecDeque<Browser>,
     shutting_down: bool,
@@ -224,7 +229,7 @@ wrap_browser_process_handler! {
 }
 
 wrap_app! {
-    struct CEFApplication { handler: BrowserProcessHandler, renderer: RenderProcessHandler, mock_keychain: bool }
+    struct CEFApplication { handler: BrowserProcessHandler, renderer: RenderProcessHandler, mock_keychain: bool, disable_gpu: bool }
     impl App {
         fn browser_process_handler(&self) -> Option<BrowserProcessHandler> { Some(self.handler.clone()) }
         fn render_process_handler(&self) -> Option<RenderProcessHandler> { Some(self.renderer.clone()) }
@@ -233,16 +238,23 @@ wrap_app! {
             process_type: Option<&CefString>,
             command_line: Option<&mut CommandLine>,
         ) {
-            #[cfg(target_os = "macos")]
-            {
-                let _ = process_type;
-                if self.mock_keychain && let Some(command_line) = command_line {
+            let _ = process_type;
+            if let Some(command_line) = command_line {
+                #[cfg(target_os = "macos")]
+                if self.mock_keychain {
                     let switch: CefString = "use-mock-keychain".into();
                     command_line.append_switch(Some(&switch));
                 }
+                // Headless machines without a usable GPU device make Chromium's
+                // GPU process abort the browser ("GPU process isn't usable");
+                // automated fixtures can opt into software rendering there.
+                if self.disable_gpu {
+                    for name in ["disable-gpu", "no-sandbox"] {
+                        let switch: CefString = name.into();
+                        command_line.append_switch(Some(&switch));
+                    }
+                }
             }
-            #[cfg(not(target_os = "macos"))]
-            let _ = (process_type, command_line);
         }
     }
 }
@@ -325,7 +337,7 @@ fn execute_process_with_args(args: Args, sandbox_info: *mut u8) -> Result<Option
     let _ = cef::api_hash(cef::sys::CEF_API_VERSION_LAST, 0);
     let handler = PumpHandler::new(Arc::new(|_| {}));
     let renderer = super::bridge::render_process_handler();
-    let mut app = CEFApplication::new(handler, renderer, use_mock_keychain());
+    let mut app = CEFApplication::new(handler, renderer, use_mock_keychain(), use_disable_gpu());
     let code = cef::execute_process(Some(args.as_main_args()), Some(&mut app), sandbox_info);
     PROCESSED.with(|done| done.set(true));
     Ok((code >= 0).then_some(code))
@@ -359,7 +371,7 @@ pub(super) fn execute_helper_process() -> Result<Option<i32>, String> {
     let _ = cef::api_hash(cef::sys::CEF_API_VERSION_LAST, 0);
     let handler = PumpHandler::new(Arc::new(|_| {}));
     let renderer = super::bridge::render_process_handler();
-    let mut app = CEFApplication::new(handler, renderer, use_mock_keychain());
+    let mut app = CEFApplication::new(handler, renderer, use_mock_keychain(), use_disable_gpu());
     let code = cef::execute_process(
         Some(args.as_main_args()),
         Some(&mut app),
@@ -448,6 +460,7 @@ fn initialize_inner() -> Result<Runtime, String> {
         handler,
         super::bridge::render_process_handler(),
         use_mock_keychain(),
+        use_disable_gpu(),
     );
     #[cfg(target_os = "windows")]
     let sandbox_info = WINDOWS_SANDBOX_INFO.with(std::cell::Cell::get);
@@ -465,6 +478,8 @@ fn initialize_inner() -> Result<Runtime, String> {
     Ok(Runtime {
         contexts: HashMap::new(),
         permissions: HashMap::new(),
+        origins: HashMap::new(),
+        session_origins: HashMap::new(),
         browsers: HashMap::new(),
         deferred_browser_closes: VecDeque::new(),
         shutting_down: false,
@@ -483,6 +498,12 @@ fn use_mock_keychain() -> bool {
         &std::env::temp_dir(),
         mock_keychain_requested(|name| std::env::var_os(name).is_some()),
     )
+}
+
+/// Whether an automated fixture asked for software rendering (a machine with
+/// no usable GPU device would otherwise abort Chromium's GPU process).
+fn use_disable_gpu() -> bool {
+    std::env::var_os("ZGX_CEF_DISABLE_GPU").is_some() && use_mock_keychain()
 }
 
 fn mock_keychain_allowed(
@@ -906,39 +927,165 @@ pub(super) fn browser_closed(identifier: i32) {
 
 /// Whether CEF still tracks this browser as open (a permission prompt whose
 /// browser closed must not call back into it).
-/// Origins each profile has visited (main-frame HTTP/HTTPS), so site-data
-/// removal can cover every origin of the site, not just the one asked for.
-static VISITED_ORIGINS: OnceLock<Mutex<HashMap<String, std::collections::HashSet<String>>>> =
-    OnceLock::new();
+/// The most origins one profile's registry keeps: past the bound the oldest
+/// are dropped, so a long-lived profile cannot grow it without end.
+const MAX_VISITED_ORIGINS: usize = 10_000;
 
-fn visited_origins() -> &'static Mutex<HashMap<String, std::collections::HashSet<String>>> {
-    VISITED_ORIGINS.get_or_init(|| Mutex::new(HashMap::new()))
+pub(super) type OriginStoreHandle = Rc<RefCell<VisitedOriginStore>>;
+
+/// The HTTP(S) origins a profile has committed navigations to, oldest first.
+/// Persistent profiles write the registry to `visited-origins.json` under the
+/// profile's data directory (atomically), so site-data removal still knows
+/// the site's origins after a restart; ephemeral profiles keep theirs in RAM
+/// only (`path` is `None`), never leaking into a disk registry.
+pub(super) struct VisitedOriginStore {
+    order: VecDeque<String>,
+    seen: HashSet<String>,
+    path: Option<PathBuf>,
 }
 
-pub(super) fn record_visited_origin(profile: &str, origin: String) {
-    visited_origins()
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner())
-        .entry(profile.to_owned())
-        .or_default()
-        .insert(origin);
-}
+impl VisitedOriginStore {
+    /// An in-RAM-only registry (ephemeral profiles).
+    #[cfg(test)]
+    fn session() -> Self {
+        Self {
+            order: VecDeque::new(),
+            seen: HashSet::new(),
+            path: None,
+        }
+    }
 
-/// Every origin this profile has visited whose host belongs to `site_host`
-/// (the host itself or a subdomain of it), plus `extra`.
-pub(super) fn site_origins(profile: &str, site_host: &str, extra: &str) -> Vec<String> {
-    let mut origins = vec![extra.to_owned()];
-    let visited = visited_origins()
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
-    if let Some(set) = visited.get(profile) {
-        for origin in set {
-            let Some(host) = zgx::web_view::site_host(origin) else {
-                continue;
-            };
-            if zgx::web_view::site_matches(&host, site_host) && !origins.contains(origin) {
-                origins.push(origin.clone());
+    fn load(path: Option<PathBuf>) -> Result<Self, String> {
+        let mut store = Self {
+            order: VecDeque::new(),
+            seen: HashSet::new(),
+            path,
+        };
+        let Some(path) = &store.path else {
+            return Ok(store);
+        };
+        if path.is_file() {
+            let bytes = std::fs::read(path)
+                .map_err(|error| format!("cannot read visited origins: {error}"))?;
+            let origins: Vec<String> = serde_json::from_slice(&bytes)
+                .map_err(|error| format!("invalid visited-origin registry: {error}"))?;
+            for origin in origins.into_iter().take(MAX_VISITED_ORIGINS) {
+                store.record_in_memory(origin);
             }
+        }
+        Ok(store)
+    }
+
+    fn record_in_memory(&mut self, origin: String) {
+        if self.seen.insert(origin.clone()) {
+            self.order.push_back(origin);
+            while self.order.len() > MAX_VISITED_ORIGINS {
+                let Some(oldest) = self.order.pop_front() else {
+                    break;
+                };
+                self.seen.remove(&oldest);
+            }
+        }
+    }
+
+    /// Record a committed HTTP(S) origin, persisting the registry and
+    /// dropping the oldest origins past the bound.
+    fn record(&mut self, origin: String) -> Result<(), String> {
+        if self.seen.contains(&origin) {
+            return Ok(());
+        }
+        self.record_in_memory(origin);
+        self.persist()
+    }
+
+    fn persist(&self) -> Result<(), String> {
+        let Some(path) = &self.path else {
+            return Ok(());
+        };
+        let bytes = serde_json::to_vec(&self.order)
+            .map_err(|error| format!("cannot encode visited origins: {error}"))?;
+        let temporary = path.with_extension("json.tmp");
+        std::fs::write(&temporary, bytes)
+            .map_err(|error| format!("cannot write visited origins: {error}"))?;
+        #[cfg(target_os = "windows")]
+        if path.exists() {
+            std::fs::remove_file(path)
+                .map_err(|error| format!("cannot replace visited origins: {error}"))?;
+        }
+        std::fs::rename(&temporary, path)
+            .map_err(|error| format!("cannot save visited origins: {error}"))
+    }
+}
+
+/// The registrable domain (eTLD+1) a host belongs to, from the Public Suffix
+/// List: `example.co.uk` for `a.b.example.co.uk`, `example.com` for
+/// `app.example.com`. IP addresses and `localhost` (with any subdomain, all
+/// loopback per RFC 6761) are their own site: the host itself. A host that is
+/// itself a public suffix or has no dot falls back to the exact host, so
+/// clearing it can never match another site's origins (matching is by
+/// equality of registrable domains).
+pub(super) fn registrable_domain(host: &str) -> Option<String> {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    if host.is_empty() {
+        return None;
+    }
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return Some(host);
+    }
+    if host == "localhost" || host.ends_with(".localhost") {
+        return Some("localhost".to_owned());
+    }
+    Some(psl::domain_str(&host).unwrap_or(&host).to_owned())
+}
+
+/// The profile's visited-origin registry, loaded from disk the first time a
+/// persistent profile opens and kept in RAM only for ephemeral ones.
+pub(super) fn origin_store(profile: &str, persistent: bool) -> Result<OriginStoreHandle, String> {
+    initialize()?;
+    RUNTIME.with(|runtime| {
+        let mut runtime = runtime.borrow_mut();
+        let runtime = runtime.as_mut().expect("runtime initialized");
+        let registry = if persistent {
+            &mut runtime.origins
+        } else {
+            &mut runtime.session_origins
+        };
+        if let Some(store) = registry.get(profile) {
+            return Ok(store.clone());
+        }
+        let path = if persistent {
+            let directory = data_root()?.join(profile_component(profile)?);
+            std::fs::create_dir_all(&directory)
+                .map_err(|error| format!("cannot create visited-origin registry: {error}"))?;
+            Some(directory.join("visited-origins.json"))
+        } else {
+            None
+        };
+        let store = Rc::new(RefCell::new(VisitedOriginStore::load(path)?));
+        registry.insert(profile.to_owned(), store.clone());
+        Ok(store)
+    })
+}
+
+pub(super) fn record_visited_origin(store: &OriginStoreHandle, origin: String) {
+    if let Err(error) = store.borrow_mut().record(origin) {
+        super::cef_trace!(&format!("VISITED_ORIGIN_NOT_SAVED: {error}"));
+    }
+}
+
+/// Every origin known for the profile (persisted and this session) whose host
+/// belongs to `site` — the registrable domain — plus `extra` (the URL's own
+/// origin), so site-data removal covers the whole site: sibling subdomains
+/// and all ports, not just the host asked for.
+pub(super) fn site_origins(store: &OriginStoreHandle, site: &str, extra: &str) -> Vec<String> {
+    let mut origins = vec![extra.to_owned()];
+    let store = store.borrow();
+    for origin in &store.order {
+        let Some(host) = zgx::web_view::site_host(origin) else {
+            continue;
+        };
+        if registrable_domain(&host).as_deref() == Some(site) && !origins.contains(origin) {
+            origins.push(origin.clone());
         }
     }
     origins
@@ -988,32 +1135,167 @@ pub(super) fn shutdown() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        browser_closed, browser_created, browser_creation_cancelled, browser_creation_failed,
-        browser_creation_started, close_race_trace_allowed, has_browsers, mock_keychain_allowed,
-        mock_keychain_requested, record_visited_origin, schedule_while_running, site_origins,
+        OriginStoreHandle, VisitedOriginStore, browser_closed, browser_created,
+        browser_creation_cancelled, browser_creation_failed, browser_creation_started,
+        close_race_trace_allowed, has_browsers, mock_keychain_allowed, mock_keychain_requested,
+        record_visited_origin, registrable_domain, schedule_while_running, site_origins,
     };
-    use std::{collections::HashMap, fs, path::Path, time::SystemTime};
+    use std::{cell::RefCell, collections::HashMap, fs, path::Path, rc::Rc, time::SystemTime};
+
+    fn session_store() -> OriginStoreHandle {
+        Rc::new(RefCell::new(VisitedOriginStore::session()))
+    }
 
     #[test]
-    fn site_origins_cover_the_site_host_and_its_subdomains() {
-        let profile = format!("site-origins-test-{}", std::process::id());
-        record_visited_origin(&profile, "https://example.com/".into());
-        record_visited_origin(&profile, "https://app.example.com/".into());
-        record_visited_origin(&profile, "https://evil-example.com/".into());
-        record_visited_origin(&profile, "https://example.com.evil.test/".into());
-        let origins = site_origins(&profile, "example.com", "https://example.com/page");
+    fn registrable_domain_uses_the_public_suffix_list() {
+        assert_eq!(
+            registrable_domain("example.co.uk").as_deref(),
+            Some("example.co.uk")
+        );
+        assert_eq!(
+            registrable_domain("a.b.example.co.uk").as_deref(),
+            Some("example.co.uk")
+        );
+        assert_eq!(
+            registrable_domain("EXAMPLE.COM").as_deref(),
+            Some("example.com")
+        );
+        assert_eq!(
+            registrable_domain("app.example.com").as_deref(),
+            Some("example.com")
+        );
+        // A lookalike suffix is its own site, not the site under it.
+        assert_eq!(
+            registrable_domain("evil-example.com").as_deref(),
+            Some("evil-example.com")
+        );
+        assert_eq!(
+            registrable_domain("example.com.evil.test").as_deref(),
+            Some("evil.test")
+        );
+        // IPs and localhost are exact hosts.
+        assert_eq!(
+            registrable_domain("127.0.0.1").as_deref(),
+            Some("127.0.0.1")
+        );
+        assert_eq!(registrable_domain("::1").as_deref(), Some("::1"));
+        assert_eq!(
+            registrable_domain("localhost").as_deref(),
+            Some("localhost")
+        );
+        assert_eq!(
+            registrable_domain("sub.localhost").as_deref(),
+            Some("localhost")
+        );
+        // A public suffix alone still names itself, never a wider site.
+        assert_eq!(registrable_domain("co.uk").as_deref(), Some("co.uk"));
+        assert_eq!(registrable_domain("com").as_deref(), Some("com"));
+        assert_eq!(registrable_domain("."), None);
+        assert_eq!(registrable_domain(""), None);
+    }
+
+    #[test]
+    fn site_origins_cover_the_registrable_domain_and_its_subdomains() {
+        let store = session_store();
+        record_visited_origin(&store, "https://example.com/".into());
+        record_visited_origin(&store, "https://app.example.com/".into());
+        record_visited_origin(&store, "https://example.com:8443/".into());
+        record_visited_origin(&store, "https://evil-example.com/".into());
+        record_visited_origin(&store, "https://example.com.evil.test/".into());
+        record_visited_origin(&store, "https://other.example.co.uk/".into());
+        let origins = site_origins(&store, "example.com", "https://example.com/page");
         assert!(origins.contains(&"https://example.com/page".to_owned()));
         assert!(origins.contains(&"https://example.com/".to_owned()));
         assert!(origins.contains(&"https://app.example.com/".to_owned()));
+        // Another port of the same host is the same site.
+        assert!(origins.contains(&"https://example.com:8443/".to_owned()));
         assert!(!origins.contains(&"https://evil-example.com/".to_owned()));
         assert!(!origins.contains(&"https://example.com.evil.test/".to_owned()));
-        // A different profile's visits do not leak in.
-        let other = site_origins(
-            "site-origins-test-other",
-            "example.com",
-            "https://example.com/",
+        assert!(!origins.contains(&"https://other.example.co.uk/".to_owned()));
+        // co.uk-style suffixes: the whole registrable domain matches.
+        let store = session_store();
+        record_visited_origin(&store, "https://a.b.example.co.uk/".into());
+        record_visited_origin(&store, "https://example.co.uk/".into());
+        record_visited_origin(&store, "https://example.uk/".into());
+        let origins = site_origins(&store, "example.co.uk", "https://example.co.uk/x");
+        assert!(origins.contains(&"https://a.b.example.co.uk/".to_owned()));
+        assert!(origins.contains(&"https://example.co.uk/".to_owned()));
+        assert!(!origins.contains(&"https://example.uk/".to_owned()));
+        // IPs and localhost match only themselves.
+        let store = session_store();
+        record_visited_origin(&store, "http://127.0.0.1:8080/".into());
+        record_visited_origin(&store, "http://localhost:8080/".into());
+        record_visited_origin(&store, "http://sub.localhost:8080/".into());
+        let origins = site_origins(&store, "127.0.0.1", "http://127.0.0.1:9000/");
+        assert_eq!(
+            origins,
+            vec![
+                "http://127.0.0.1:9000/".to_owned(),
+                "http://127.0.0.1:8080/".to_owned()
+            ]
         );
-        assert_eq!(other, vec!["https://example.com/".to_owned()]);
+        let origins = site_origins(&store, "localhost", "http://localhost:9000/");
+        assert!(origins.contains(&"http://localhost:8080/".to_owned()));
+        assert!(origins.contains(&"http://sub.localhost:8080/".to_owned()));
+        assert!(!origins.contains(&"http://127.0.0.1:8080/".to_owned()));
+        // A different profile's visits do not leak in.
+        let other = session_store();
+        let origins = site_origins(&other, "example.com", "https://example.com/");
+        assert_eq!(origins, vec!["https://example.com/".to_owned()]);
+    }
+
+    #[test]
+    fn visited_origins_persist_across_a_reload_and_are_bounded() {
+        let root = std::env::temp_dir().join(format!(
+            "zgx-cef-origins-test-{}-{:?}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("visited-origins.json");
+
+        let store = Rc::new(RefCell::new(
+            VisitedOriginStore::load(Some(path.clone())).unwrap(),
+        ));
+        for index in 0..super::MAX_VISITED_ORIGINS + 25 {
+            record_visited_origin(&store, format!("https://host-{index:05}.example.com/"));
+        }
+        {
+            let store = store.borrow();
+            assert_eq!(store.order.len(), super::MAX_VISITED_ORIGINS);
+            // The oldest were dropped (the last MAX were kept).
+            assert!(!store.seen.contains("https://host-00000.example.com/"));
+            assert!(!store.seen.contains("https://host-00024.example.com/"));
+            assert!(store.seen.contains("https://host-00025.example.com/"));
+            assert!(store.seen.contains(&format!(
+                "https://host-{:05}.example.com/",
+                super::MAX_VISITED_ORIGINS + 24
+            )));
+        }
+        // Re-recording a known origin changes nothing.
+        record_visited_origin(&store, "https://host-00025.example.com/".into());
+        assert_eq!(store.borrow().order.len(), super::MAX_VISITED_ORIGINS);
+
+        // A fresh store over the same file sees the persisted registry.
+        let reloaded = Rc::new(RefCell::new(
+            VisitedOriginStore::load(Some(path.clone())).unwrap(),
+        ));
+        let origins = site_origins(&reloaded, "example.com", "https://example.com/");
+        assert!(origins.contains(&"https://host-00025.example.com/".to_owned()));
+        assert_eq!(origins.len(), super::MAX_VISITED_ORIGINS + 1);
+
+        // A session (ephemeral) store never writes anything to disk.
+        let session = session_store();
+        record_visited_origin(&session, "https://ephemeral.example/".into());
+        assert!(session.borrow().path.is_none());
+        assert!(session.borrow().seen.contains("https://ephemeral.example/"));
+        let on_disk: Vec<String> = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(!on_disk.contains(&"https://ephemeral.example/".to_owned()));
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
