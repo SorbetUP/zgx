@@ -5323,6 +5323,83 @@ mod tests {
         }
     }
 
+    /// `web:subscribe` reports the page's events for as long as the page
+    /// lives — while no node shows it, after its widget unmounted — and the
+    /// returned handle (like `web:close()`) stops them. `web:on_download`
+    /// reaches the script the same way.
+    #[test]
+    fn a_webs_controller_subscription_outlives_its_widget() {
+        const SCRIPT: &str = r##"
+            local web = ui.web { profile = "ephemeral" }
+            local log = ui.state("web-log", "")
+            local disconnect = web:subscribe(function(e)
+                log:set(log:get() .. e.kind .. ";")
+            end)
+            web:on_download(function(d) log:set(log:get() .. "download:" .. d.name .. ";") end)
+            local shown = ui.state("shown", true)
+            return ui.column {
+                ui.show(shown, function()
+                    return ui.webview { id = "page", web = web, w = 50, h = 50 }
+                end),
+                ui.button { id = "hide", w = 20, h = 20, on_click = function() shown:set(false) end },
+                ui.button { id = "off", w = 20, h = 20, on_click = function() disconnect() end },
+                ui.text { id = "log", function() return log:get() end },
+            }
+        "##;
+        let mut h = testing::TestApp::inline(SCRIPT);
+        assert_eq!(h.host.error().get(), None, "the script loaded");
+        let page = h.find("page").expect("the webview node");
+        let Some(zgx::native_view::NativeContent::Web(web)) = h.natives.content(page) else {
+            panic!("no page behind the node")
+        };
+        use zgx::web_view::WebViewEvent;
+        web.emit(WebViewEvent::NavigationCommitted {
+            url: "https://a.test/".into(),
+        });
+        h.settle();
+        h.frames(1);
+        assert_eq!(h.text("log"), "committed;");
+        // The widget unmounts (the page stays, hidden): the controller-level
+        // subscription still reports.
+        h.click("hide");
+        h.frames(2);
+        assert!(h.find("page").is_none(), "the node went");
+        web.emit(WebViewEvent::Message {
+            body: r#"{"polyscale":"page-activity"}"#.into(),
+            origin: "https://a.test".into(),
+            main_frame: true,
+        });
+        web.emit(WebViewEvent::TitleChanged { title: "A".into() });
+        h.settle();
+        h.frames(1);
+        assert_eq!(h.text("log"), "committed;message;title;");
+        // A download the hidden page starts still reaches the script.
+        web.download(
+            zgx::web_view::DownloadRequest::new("https://a.test/f.bin", "f.bin", ""),
+            zgx::web_view::DownloadResponder::new(|_| {}),
+        );
+        h.settle();
+        h.frames(1);
+        assert_eq!(h.text("log"), "committed;message;title;download:f.bin;");
+        // The disconnect handle stops the events; called again, nothing.
+        h.click("off");
+        web.emit(WebViewEvent::ProcessTerminated);
+        h.settle();
+        h.frames(1);
+        assert_eq!(h.text("log"), "committed;message;title;download:f.bin;");
+        // So does closing the controller.
+        let _ = web.subscribe(|_| {});
+        web.close();
+        web.emit(WebViewEvent::ProcessTerminated);
+        h.settle();
+        h.frames(1);
+        assert_eq!(
+            h.text("log"),
+            "committed;message;title;download:f.bin;",
+            "a closed page reports nothing"
+        );
+    }
+
     /// The CPU reading lasts through the exact one-millisecond boundary;
     /// a reversed timestamp is still fresh, as with saturating subtraction.
     #[test]
