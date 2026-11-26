@@ -2890,6 +2890,11 @@ pub(crate) fn web_event_table(
         WebViewEvent::ProcessTerminated => {
             table.set("kind", "process_terminated")?;
         }
+        WebViewEvent::ActivityChanged { active, reason } => {
+            table.set("kind", "activity")?;
+            table.set("active", *active)?;
+            table.set("reason", reason.as_str())?;
+        }
     }
     Ok(table)
 }
