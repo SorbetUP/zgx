@@ -106,8 +106,13 @@ const EVENT_CHANGED_FIXTURE: &str = r#"<!doctype html>
 
 const POPUP_PARENT_FIXTURE: &str = r#"<!doctype html><meta charset=utf-8><title>popup parent</title>
 <script>
+window.__popupMessages=[];
+fetch('/popup-bridge-report?zgx='+encodeURIComponent(typeof window.zgx)+'&post='+encodeURIComponent(typeof window.zgx?.postMessage));
 window.addEventListener('message', event => {
-  window.zgx.postMessage({source:'popup-parent',ok:event.origin===location.origin&&event.data?.ok===true});
+  window.__popupMessages.push({origin:event.origin,data:event.data});
+  fetch('/popup-parent-report?origin='+encodeURIComponent(event.origin)+'&data='+encodeURIComponent(JSON.stringify(event.data)));
+  try { window.zgx.postMessage({source:'popup-parent',ok:event.origin===location.origin&&event.data?.ok===true,eventOrigin:event.origin,data:event.data,hasSource:!!event.source}); }
+  catch (error) { fetch('/popup-bridge-error?error='+encodeURIComponent(String(error))+'&zgx='+encodeURIComponent(typeof window.zgx)); }
 });
 function openFixturePopup(){window.__popupClicked=(window.__popupClicked||0)+1;window.open('/popup-child', 'fixture-popup');}
 </script><button id="open-popup" onclick="openFixturePopup()">Open fixture popup</button>
@@ -116,8 +121,9 @@ function openFixturePopup(){window.__popupClicked=(window.__popupClicked||0)+1;w
 const POPUP_CHILD_FIXTURE: &str = r#"<!doctype html><meta charset=utf-8><title>popup child</title>
 <script>
 const ok=!!window.opener&&document.cookie.includes('popup_cookie=shared');
-if(window.opener)window.opener.postMessage({ok},location.origin);
-setTimeout(()=>window.close(),150);
+fetch('/popup-report?opener='+Number(!!window.opener)+'&cookie='+encodeURIComponent(document.cookie));
+if(window.opener)window.opener.postMessage({ok,hasOpener:!!window.opener,cookie:document.cookie},'*');
+setTimeout(()=>window.close(),1000);
 </script><p>Completing popup fixture</p>
 "#;
 
@@ -584,7 +590,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 WebViewOptions {
                     profile,
                     new_windows: popup_test,
-                    messages: drag_test,
+                    messages: drag_test || popup_test,
                     ..Default::default()
                 },
             );
@@ -1210,13 +1216,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     else {
                         return;
                     };
-                    if origin != &expected_origin
-                        || body != r#"{"source":"popup-parent","ok":true}"#
-                    {
+                    let _ = fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(diagnostics.with_extension("diagnostic"))
+                        .and_then(|mut file| writeln!(file, "POPUP_APP_MESSAGE:{origin}:{body}"));
+                    if origin != &expected_origin {
+                        return;
+                    }
+                    let Ok(message) = serde_json::from_str::<serde_json::Value>(body) else {
+                        return;
+                    };
+                    if message["source"] != "popup-parent" {
                         return;
                     }
                     if !callback_done.swap(true, Ordering::AcqRel) {
-                        let _ = fs::write(&callback_result, "PASS");
+                        let result = if message["ok"] == true {
+                            "PASS".to_owned()
+                        } else {
+                            format!("FAIL:popup-message:{message}")
+                        };
+                        let _ = fs::write(&callback_result, result);
                         window.close();
                     }
                 });

@@ -933,12 +933,19 @@ pub(super) fn prepare_popup(
         page.html_documents.clone(),
     );
     let content = view(page.clone());
+    // Automated CEF fixtures keep the parent window off-screen so they do not
+    // disturb the user's desktop. Keep popup windows off-screen as well; a
+    // popup test should exercise the real child browser without displaying a
+    // sign-in window on the machine running the test.
+    let popup_bounds = std::env::var_os("ZGX_CEF_POPUP_RESULT")
+        .map(|_| crate::WindowBounds::new(800, 640).at(-10_000, -10_000));
     let window = windows.open(
         crate::WindowOptions {
             title: "Sign in".into(),
             width: 800.,
             height: 640.,
             min_size: Some((360., 280.)),
+            bounds: popup_bounds,
             decorations: true,
             ..Default::default()
         },

@@ -294,11 +294,14 @@ wrap_life_span_handler! {
             window_info: Option<&mut WindowInfo>,
             client: Option<&mut Option<Client>>,
             _settings: Option<&mut BrowserSettings>,
-            _extra_info: Option<&mut Option<DictionaryValue>>,
-            _no_javascript_access: Option<&mut i32>,
+            extra_info: Option<&mut Option<DictionaryValue>>,
+            no_javascript_access: Option<&mut i32>,
         ) -> i32 {
             let url = target_url.map(ToString::to_string).unwrap_or_default();
-            trace_popup_fixture(&format!("CEF_BEFORE_POPUP:{popup_id}:{url}"));
+            let no_javascript_access = no_javascript_access.as_deref().copied();
+            trace_popup_fixture(&format!(
+                "CEF_BEFORE_POPUP:{popup_id}:{url}:no_javascript_access={no_javascript_access:?}"
+            ));
             if !self.callbacks.new_windows {
                 return 1;
             }
@@ -310,6 +313,12 @@ wrap_life_span_handler! {
                 }
             });
             let (Some(window_info), Some(client)) = (window_info, client) else { return 1 };
+            // A popup is a distinct CEF browser process context. Propagate the
+            // owning WebView's renderer configuration so messages and user
+            // scripts work in the child just as they do in the parent.
+            if let (Some(extra_info), Some(web)) = (extra_info, self.callbacks.web.upgrade()) {
+                *extra_info = super::bridge::extra_info(web.options());
+            }
             let creation_id = runtime::browser_creation_started();
             let Some(prepared) = super::browser::prepare_popup(
                 self.callbacks.web.clone(),
