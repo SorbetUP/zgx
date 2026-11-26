@@ -27,8 +27,45 @@ pub(super) fn trace_popup_fixture(message: &str) {
 pub(super) type HtmlDocuments = Arc<Mutex<HashMap<String, Arc<Vec<u8>>>>>;
 type HtmlHandlerKeepAlive = Arc<Mutex<HashMap<u64, ResourceRequestHandler>>>;
 
-pub(super) type FindReplies = Rc<RefCell<VecDeque<FindReply>>>;
+/// Pending find replies. CEF reports results with an incremental identifier
+/// per active search (`on_find_result`'s `identifier`), so replies are keyed
+/// by that identifier once it is known; replies for requests whose identifier
+/// has not been reported yet wait in `unassigned` (CEF assigns identifiers in
+/// request order, so the oldest unassigned reply belongs to the next new
+/// identifier).
+#[derive(Default)]
+pub(super) struct FindRepliesState {
+    pub by_id: HashMap<i32, FindReply>,
+    pub unassigned: VecDeque<FindReply>,
+}
+
+pub(super) type FindReplies = Rc<RefCell<FindRepliesState>>;
 type FindReply = Box<dyn FnOnce(zgx::web_view::FindResult)>;
+
+/// Match an `on_find_result` notification to its reply: adopt the oldest
+/// unassigned reply under `identifier` if it is not known yet, and on the
+/// final update take the reply out and build its result. Returns the reply
+/// with the result to deliver, or `None` while the search is still running.
+pub(super) fn take_find_reply(
+    state: &mut FindRepliesState,
+    identifier: i32,
+    count: i32,
+    final_update: i32,
+) -> Option<(FindReply, zgx::web_view::FindResult)> {
+    if !state.by_id.contains_key(&identifier)
+        && let Some(reply) = state.unassigned.pop_front()
+    {
+        state.by_id.insert(identifier, reply);
+    }
+    if final_update == 0 {
+        return None;
+    }
+    let reply = state.by_id.remove(&identifier)?;
+    let mut result = zgx::web_view::FindResult::default();
+    result.found = count > 0;
+    result.matches = (!cfg!(target_os = "macos")).then_some(count.max(0) as u32);
+    Some((reply, result))
+}
 
 #[derive(Clone)]
 pub(super) struct RenderState {
@@ -47,6 +84,9 @@ pub(super) struct BrowserCallbacks {
     pub web: zgx::web_view::WeakWebView,
     pub new_windows: bool,
     pub navigation_started: Rc<dyn Fn()>,
+    /// Called with the browser's identifier and a human-readable reason when
+    /// the browser's renderer process terminated (crash or kill).
+    pub render_terminated: Rc<dyn Fn(i32, String)>,
 }
 
 wrap_download_handler! {
@@ -440,15 +480,51 @@ wrap_render_handler! {
             &self,
             _browser: Option<&mut Browser>,
             kind: PaintElementType,
-            _dirty_rects: Option<&[Rect]>,
+            dirty_rects: Option<&[Rect]>,
             buffer: *const u8,
             width: i32,
             height: i32,
         ) {
-            if buffer.is_null() || width <= 0 || height <= 0 {
+            if buffer.is_null() {
                 return;
             }
-            let (width, height) = (width as u32, height as u32);
+            // Clamp the paint to the surface it belongs to: the view for page
+            // paints, the popup rect for popup paints, both in device pixels
+            // (the view size is logical, CEF paints at view * scale). Paints
+            // that are empty or still sized for a previous (larger) surface
+            // are ignored.
+            let view = *self.state.size.lock().unwrap_or_else(|poison| poison.into_inner());
+            let scale = *self.state.scale.lock().unwrap_or_else(|poison| poison.into_inner());
+            let device = |logical: (i32, i32)| {
+                (
+                    (logical.0.max(0) as f32 * scale.max(0.01)).round().max(1.) as i32,
+                    (logical.1.max(0) as f32 * scale.max(0.01)).round().max(1.) as i32,
+                )
+            };
+            let bound = if kind == PaintElementType::POPUP {
+                let popup = self.state.popup.lock().unwrap_or_else(|poison| poison.into_inner());
+                if popup.rect.2 > 0 && popup.rect.3 > 0 {
+                    device((popup.rect.2, popup.rect.3))
+                } else {
+                    device(view)
+                }
+            } else {
+                device(view)
+            };
+            let Some(paint) =
+                super::rendering::clamp_paint(width, height, dirty_rects.unwrap_or(&[]), bound)
+            else {
+                return;
+            };
+            if !paint.dirty_rects.is_empty() {
+                super::cef_trace!(&format!(
+                    "CEF_PAINT {}x{} dirty_rects={}",
+                    paint.width,
+                    paint.height,
+                    paint.dirty_rects.len()
+                ));
+            }
+            let (width, height) = (paint.width, paint.height);
             let Some(length) = (width as usize).checked_mul(height as usize).and_then(|pixels| pixels.checked_mul(4)) else {
                 return;
             };
@@ -630,19 +706,19 @@ wrap_find_handler! {
         fn on_find_result(
             &self,
             _browser: Option<&mut Browser>,
-            _identifier: i32,
+            identifier: i32,
             count: i32,
             _selection_rect: Option<&Rect>,
             _active_match_ordinal: i32,
             final_update: i32,
         ) {
-            if final_update == 0 {
-                return;
-            }
-            if let Some(reply) = self.replies.borrow_mut().pop_front() {
-                let mut result = zgx::web_view::FindResult::default();
-                result.found = count > 0;
-                result.matches = (!cfg!(target_os = "macos")).then_some(count.max(0) as u32);
+            let outcome = take_find_reply(
+                &mut self.replies.borrow_mut(),
+                identifier,
+                count,
+                final_update,
+            );
+            if let Some((reply, result)) = outcome {
                 zgx::native_view::post(move || reply(result));
             }
         }
@@ -1002,7 +1078,7 @@ fn navigation_kind_raw(raw: u32) -> zgx::web_view::NavigationKind {
 }
 
 wrap_request_handler! {
-    struct CEFRequestHandler { html_documents: HtmlDocuments, handlers: HtmlHandlerKeepAlive, web: zgx::web_view::WeakWebView }
+    struct CEFRequestHandler { html_documents: HtmlDocuments, handlers: HtmlHandlerKeepAlive, web: zgx::web_view::WeakWebView, render_terminated: Rc<dyn Fn(i32, String)> }
     impl RequestHandler {
         fn on_before_browse(
             &self,
@@ -1028,6 +1104,24 @@ wrap_request_handler! {
                 source_url: CefString::from(&frame.url()).to_string(),
             };
             i32::from(!web.allows(&navigation))
+        }
+
+        fn on_render_process_terminated(
+            &self,
+            browser: Option<&mut Browser>,
+            status: TerminationStatus,
+            error_code: ::std::os::raw::c_int,
+            error_string: Option<&CefString>,
+        ) {
+            let browser_id = browser.as_ref().map(|browser| browser.identifier()).unwrap_or(-1);
+            let detail = error_string.map(ToString::to_string).unwrap_or_default();
+            super::cef_trace!(&format!(
+                "RENDER_PROCESS_TERMINATED browser={browser_id} status={status:?} code={error_code} {detail}"
+            ));
+            (self.render_terminated)(
+                browser_id,
+                format!("{status:?} (error {error_code}): {detail}"),
+            );
         }
 
         fn resource_request_handler(
@@ -1290,6 +1384,7 @@ pub(super) fn client(
     let render = CEFRenderHandler::new(state, drag_start);
     let find_replies = callbacks.find_replies.clone();
     let navigation_started = callbacks.navigation_started.clone();
+    let render_terminated = callbacks.render_terminated.clone();
     let life = CEFLifeSpanHandler::new(
         callbacks,
         profile.clone(),
@@ -1334,6 +1429,7 @@ pub(super) fn client(
             html_documents,
             Arc::new(Mutex::new(HashMap::new())),
             web.clone(),
+            render_terminated,
         ),
         web,
     )
@@ -1384,8 +1480,9 @@ mod tests {
     use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
     use super::{
-        DownloadUpdate, file_dialog_selection, is_user_cancelled_load, navigation_kind,
-        navigation_kind_raw, next_document_chunk, normalize_document_url, update_download_status,
+        DownloadUpdate, FindRepliesState, file_dialog_selection, is_user_cancelled_load,
+        navigation_kind, navigation_kind_raw, next_document_chunk, normalize_document_url,
+        take_find_reply, update_download_status,
     };
     use cef::{FileDialogMode, TransitionType};
     use zgx::web_view::{DownloadStatus, NavigationKind};
@@ -1604,5 +1701,74 @@ mod tests {
     fn intentional_navigation_abort_is_not_a_page_failure() {
         assert!(is_user_cancelled_load(cef::Errorcode::ABORTED));
         assert!(!is_user_cancelled_load(cef::Errorcode::FAILED));
+    }
+
+    #[test]
+    fn find_replies_are_matched_to_their_cef_identifier_not_fifo_blindly() {
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let mut state = FindRepliesState::default();
+        // Two searches started before any result: their replies wait
+        // unassigned, in request order.
+        for label in ["first", "second"] {
+            let seen = seen.clone();
+            state.unassigned.push_back(Box::new(move |result| {
+                seen.borrow_mut().push((label.to_owned(), result));
+            }));
+        }
+        // CEF reports incremental identifiers per active search; the first
+        // result for an unknown identifier adopts the oldest unassigned reply.
+        assert!(
+            take_find_reply(&mut state, 1, 5, 0).is_none(),
+            "not final yet"
+        );
+        assert_eq!(state.by_id.len(), 1);
+        assert_eq!(state.unassigned.len(), 1);
+        // An intermediate update for the other search adopts the second reply.
+        assert!(take_find_reply(&mut state, 2, 3, 0).is_none());
+        assert_eq!(state.by_id.len(), 2);
+        assert!(state.unassigned.is_empty());
+        // Final updates deliver each reply under its own identifier.
+        let (reply, result) = take_find_reply(&mut state, 2, 3, 1).expect("final result");
+        assert!(result.found);
+        assert_eq!(result.matches, (!cfg!(target_os = "macos")).then_some(3));
+        reply(result);
+        let (reply, result) = take_find_reply(&mut state, 1, 5, 1).expect("final result");
+        assert!(result.found);
+        assert_eq!(result.matches, (!cfg!(target_os = "macos")).then_some(5));
+        reply(result);
+        assert!(state.by_id.is_empty());
+        // Delivered in identifier order, not reply order.
+        let labels: Vec<String> = seen
+            .borrow()
+            .iter()
+            .map(|(label, _)| label.to_string())
+            .collect();
+        assert_eq!(labels, ["second".to_owned(), "first".to_owned()]);
+        // A repeated find (same text re-issued, so the same identifier) gets
+        // its own reply, not a stale one.
+        let seen_again = seen.clone();
+        state.unassigned.push_back(Box::new(move |result| {
+            seen_again.borrow_mut().push(("again".to_owned(), result))
+        }));
+        let (reply, result) = take_find_reply(&mut state, 1, 5, 1).expect("final result");
+        assert!(result.found);
+        reply(result);
+        assert_eq!(
+            seen.borrow().last().map(|(label, _)| label.as_str()),
+            Some("again")
+        );
+        // Results for unknown identifiers without pending replies are dropped.
+        assert!(take_find_reply(&mut state, 99, 1, 1).is_none());
+        // A not-found final update still replies, with found = false.
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let mut state = FindRepliesState::default();
+        let seen2 = seen.clone();
+        state
+            .unassigned
+            .push_back(Box::new(move |result| seen2.borrow_mut().push(result)));
+        let (reply, result) = take_find_reply(&mut state, 7, 0, 1).expect("final result");
+        assert!(!result.found);
+        reply(result);
+        assert_eq!(seen.borrow().len(), 1);
     }
 }

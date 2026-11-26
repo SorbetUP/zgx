@@ -41,11 +41,16 @@ pub(super) struct Page {
     browser: Rc<RefCell<Option<Browser>>>,
     html_documents: client::HtmlDocuments,
     pending: RefCell<Vec<WebViewCommand>>,
-    evaluations: Rc<RefCell<HashMap<i32, (u64, EvaluationReply)>>>,
+    evaluations: Rc<RefCell<HashMap<i32, (u64, Instant, EvaluationReply)>>>,
     navigation_generation: Rc<Cell<u64>>,
     site_data: Rc<RefCell<HashMap<i32, SiteDataReply>>>,
     pending_site_data: RefCell<Vec<(String, SiteDataReply)>>,
     find_replies: client::FindReplies,
+    /// The last find request issued (`text`, `case_sensitive`), so asking
+    /// again with the same text steps to the next match instead of restarting
+    /// the search.
+    find_last: RefCell<Option<(String, bool)>>,
+    tasks: crate::TaskSpawner,
     next_evaluation: Cell<i32>,
     devtools_registration: RefCell<Option<Registration>>,
     lifecycle: Cell<BrowserLifecycle>,
@@ -91,9 +96,55 @@ struct LastClick {
 type EvaluationReply = Box<dyn FnOnce(Result<String, String>)>;
 type SiteDataReply = Box<dyn FnOnce(Result<usize, String>)>;
 
+/// How long a JavaScript evaluation may stay pending before it is failed
+/// with a timeout. The renderer normally answers over DevTools in
+/// milliseconds; a hung renderer (or a lost reply) must not leave the
+/// caller waiting forever.
+pub(super) const EVALUATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Remove the pending evaluation `id` once its deadline has passed, returning
+/// its reply so the caller can fail it. Returns `None` while the evaluation is
+/// still pending and not yet expired — this is also what cancels the timeout
+/// when the real result arrived first (the entry is gone by then).
+fn expire_evaluation(
+    evaluations: &Rc<RefCell<HashMap<i32, (u64, Instant, EvaluationReply)>>>,
+    id: i32,
+    now: Instant,
+) -> Option<EvaluationReply> {
+    let expired = evaluations
+        .borrow()
+        .get(&id)
+        .is_some_and(|(_, deadline, _)| now >= *deadline);
+    if expired {
+        evaluations
+            .borrow_mut()
+            .remove(&id)
+            .map(|(_, _, reply)| reply)
+    } else {
+        None
+    }
+}
+
+/// Arm the timeout for a freshly registered evaluation: after
+/// [`EVALUATION_TIMEOUT`] the pending entry is removed and its reply failed
+/// with an error. If the DevTools result arrives first it removes the entry,
+/// so the timer finds nothing and does nothing.
+fn spawn_evaluation_timeout(
+    tasks: &crate::TaskSpawner,
+    evaluations: Rc<RefCell<HashMap<i32, (u64, Instant, EvaluationReply)>>>,
+    id: i32,
+) {
+    tasks.spawn(async move {
+        zgx::timer::sleep(EVALUATION_TIMEOUT).await;
+        if let Some(reply) = expire_evaluation(&evaluations, id, Instant::now()) {
+            zgx::native_view::post(move || reply(Err("JavaScript evaluation timed out".into())));
+        }
+    });
+}
+
 wrap_dev_tools_message_observer! {
     struct CEFScriptObserver {
-        evaluations: Rc<RefCell<HashMap<i32, (u64, EvaluationReply)>>>,
+        evaluations: Rc<RefCell<HashMap<i32, (u64, Instant, EvaluationReply)>>>,
         site_data: Rc<RefCell<HashMap<i32, SiteDataReply>>>,
         navigation_generation: Rc<Cell<u64>>,
     }
@@ -107,7 +158,7 @@ wrap_dev_tools_message_observer! {
             result: Option<&[u8]>,
         ) {
             let evaluation = self.evaluations.borrow_mut().remove(&message_id);
-            if let Some((generation, reply)) = evaluation {
+            if let Some((generation, _, reply)) = evaluation {
                 let result = parse_evaluation_for_generation(
                     generation,
                     self.navigation_generation.get(),
@@ -233,21 +284,35 @@ impl WebViewBackend for CefWebView {
             reply(FindResult::default());
             return;
         };
-        self.0.find_replies.borrow_mut().push_back(reply);
-        let query: CefString = text.into();
-        if let Some(host) = browser.host() {
-            host.find(
-                Some(&query),
-                (!options.backwards) as i32,
-                options.case_sensitive as i32,
-                0,
-            );
-        } else if let Some(reply) = self.0.find_replies.borrow_mut().pop_back() {
+        let Some(host) = browser.host() else {
             reply(FindResult::default());
-        }
+            return;
+        };
+        // Asking again with the same text and case steps to the next (or,
+        // backwards, the previous) match: CEF continues the active search
+        // when findNext is set and the search text or case did not change.
+        // A different text restarts the search (findNext = 0).
+        let find_next = self
+            .0
+            .find_last
+            .borrow()
+            .as_ref()
+            .is_some_and(|(last_text, last_case)| {
+                *last_text == text && *last_case == options.case_sensitive
+            });
+        *self.0.find_last.borrow_mut() = Some((text.to_owned(), options.case_sensitive));
+        self.0.find_replies.borrow_mut().unassigned.push_back(reply);
+        let query: CefString = text.into();
+        host.find(
+            Some(&query),
+            (!options.backwards) as i32,
+            options.case_sensitive as i32,
+            find_next as i32,
+        );
     }
 
     fn clear_find(&self) {
+        self.0.find_last.borrow_mut().take();
         if let Some(browser) = self.0.browser.borrow().as_ref()
             && let Some(host) = browser.host()
         {
@@ -328,7 +393,8 @@ fn fail_pending(page: &Page, reason: &str) {
         && evaluations.is_empty()
         && site_data.is_empty()
         && pending_site_data.is_empty()
-        && find_replies.is_empty()
+        && find_replies.by_id.is_empty()
+        && find_replies.unassigned.is_empty()
     {
         return;
     }
@@ -342,7 +408,7 @@ fn fail_pending(page: &Page, reason: &str) {
                 reply(Err(reason.clone()));
             }
         }
-        for (_, (_, reply)) in evaluations {
+        for (_, (_, _, reply)) in evaluations {
             reply(Err(reason.clone()));
         }
         for (_, reply) in site_data {
@@ -351,18 +417,22 @@ fn fail_pending(page: &Page, reason: &str) {
         for (_, reply) in pending_site_data {
             reply(Err(reason.clone()));
         }
-        for reply in find_replies {
+        for reply in find_replies
+            .by_id
+            .into_values()
+            .chain(find_replies.unassigned)
+        {
             reply(FindResult::default());
         }
     });
 }
 
 fn cancel_pending_evaluations(
-    evaluations: &Rc<RefCell<HashMap<i32, (u64, EvaluationReply)>>>,
+    evaluations: &Rc<RefCell<HashMap<i32, (u64, Instant, EvaluationReply)>>>,
 ) -> Vec<EvaluationReply> {
     std::mem::take(&mut *evaluations.borrow_mut())
         .into_values()
-        .map(|(_, reply)| reply)
+        .map(|(_, _, reply)| reply)
         .collect()
 }
 
@@ -457,10 +527,18 @@ fn start_clear_site_data(page: &Page, browser: &Browser, url: &str, done: SiteDa
         });
         page.site_data.borrow_mut().insert(id, reply);
         let method: CefString = "Storage.clearDataForOrigin".into();
-        if host.execute_dev_tools_method(id, Some(&method), Some(&mut params)) == 0
-            && let Some(reply) = page.site_data.borrow_mut().remove(&id)
-        {
-            reply(Err("CEF rejected Storage.clearDataForOrigin".into()));
+        // CEF returns the message id it actually assigned; re-key the pending
+        // reply under it so the observer's result finds it.
+        let assigned = host.execute_dev_tools_method(id, Some(&method), Some(&mut params));
+        if assigned == 0 {
+            if let Some(reply) = page.site_data.borrow_mut().remove(&id) {
+                reply(Err("CEF rejected Storage.clearDataForOrigin".into()));
+            }
+        } else if assigned != id {
+            if let Some(entry) = page.site_data.borrow_mut().remove(&id) {
+                page.site_data.borrow_mut().insert(assigned, entry);
+            }
+            page.next_evaluation.set(assigned);
         }
     }
 }
@@ -541,10 +619,11 @@ fn apply(page: &Page, browser: &Browser, command: WebViewCommand) {
                     return;
                 };
                 let mut id = page.next_evaluation.get().wrapping_add(1).max(1);
-                while page.evaluations.borrow().contains_key(&id) {
+                while page.evaluations.borrow().contains_key(&id)
+                    || page.site_data.borrow().contains_key(&id)
+                {
                     id = id.wrapping_add(1).max(1);
                 }
-                page.next_evaluation.set(id);
                 let Some(mut params) = dictionary_value_create() else {
                     reply(Err("CEF could not allocate evaluation parameters".into()));
                     return;
@@ -556,16 +635,25 @@ fn apply(page: &Page, browser: &Browser, command: WebViewCommand) {
                 let _ = params.set_string(Some(&expression_key), Some(&expression));
                 let _ = params.set_bool(Some(&by_value_key), 1);
                 let _ = params.set_bool(Some(&await_key), 1);
-                page.evaluations
-                    .borrow_mut()
-                    .insert(id, (page.navigation_generation.get(), reply));
                 let method: CefString = "Runtime.evaluate".into();
-                let accepted = host.execute_dev_tools_method(id, Some(&method), Some(&mut params));
-                if accepted == 0
-                    && let Some((_, reply)) = page.evaluations.borrow_mut().remove(&id)
-                {
+                // CEF returns the message id it actually assigned (it bumps
+                // past ids it already used, e.g. after another DevTools
+                // call), so register the reply under the returned id.
+                let assigned = host.execute_dev_tools_method(id, Some(&method), Some(&mut params));
+                if assigned == 0 {
                     reply(Err("CEF rejected Runtime.evaluate".into()));
+                    return;
                 }
+                page.next_evaluation.set(assigned);
+                page.evaluations.borrow_mut().insert(
+                    assigned,
+                    (
+                        page.navigation_generation.get(),
+                        Instant::now() + EVALUATION_TIMEOUT,
+                        reply,
+                    ),
+                );
+                spawn_evaluation_timeout(&page.tasks, page.evaluations.clone(), assigned);
             } else if let Some(frame) = browser.main_frame() {
                 let script: CefString = script.as_str().into();
                 let source: CefString = "polyscale://evaluate".into();
@@ -590,6 +678,12 @@ fn apply(page: &Page, browser: &Browser, command: WebViewCommand) {
             }
         }
     }
+}
+
+/// Whether the automated crash fixture asked this backend to kill a page's
+/// renderer (see [`Page::fixture_crash_renderer`]).
+fn crash_fixture_enabled() -> bool {
+    std::env::var_os("ZGX_CEF_CRASH_RESULT").is_some()
 }
 
 pub(super) fn backend(
@@ -636,7 +730,9 @@ pub(super) fn backend(
         navigation_generation: Rc::new(Cell::new(0)),
         site_data: Rc::new(RefCell::new(HashMap::new())),
         pending_site_data: RefCell::new(Vec::new()),
-        find_replies: Rc::new(RefCell::new(std::collections::VecDeque::new())),
+        find_replies: Rc::new(RefCell::new(client::FindRepliesState::default())),
+        find_last: RefCell::new(None),
+        tasks: tasks.clone(),
         next_evaluation: Cell::new(0),
         devtools_registration: RefCell::new(None),
         lifecycle: Cell::new(BrowserLifecycle::Creating),
@@ -662,6 +758,8 @@ pub(super) fn backend(
     let weak = Rc::downgrade(&page);
     let created_weak = weak.clone();
     let closed_weak = weak;
+    let terminated_weak = Rc::downgrade(&page);
+    let created_tasks = tasks.clone();
     let closed_frame = page.frame.clone();
     let closed_popup = page.popup.clone();
     let navigation_weak = Rc::downgrade(&page);
@@ -674,6 +772,11 @@ pub(super) fn backend(
         navigation_started: Rc::new(move || {
             if let Some(page) = navigation_weak.upgrade() {
                 page.note_navigation();
+            }
+        }),
+        render_terminated: Rc::new(move |browser_id, reason| {
+            if let Some(page) = terminated_weak.upgrade() {
+                page.on_render_process_terminated(browser_id, &reason);
             }
         }),
         created: Rc::new(move |browser| {
@@ -724,6 +827,16 @@ pub(super) fn backend(
             let pending = std::mem::take(&mut *page.pending.borrow_mut());
             for command in pending {
                 apply(&page, &browser, command);
+            }
+            if crash_fixture_enabled() {
+                // Fixture only (ZGX_CEF_CRASH_RESULT set): crash this page's
+                // renderer once the browser is up, to exercise the
+                // on_render_process_terminated path end to end.
+                let crash_page = page.clone();
+                created_tasks.spawn(async move {
+                    zgx::timer::sleep(std::time::Duration::from_secs(2)).await;
+                    crash_page.fixture_crash_renderer();
+                });
             }
             runtime::schedule_work(0);
             let _ = page.web.upgrade();
@@ -870,7 +983,9 @@ pub(super) fn prepare_popup(
         navigation_generation: Rc::new(Cell::new(0)),
         site_data: Rc::new(RefCell::new(HashMap::new())),
         pending_site_data: RefCell::new(Vec::new()),
-        find_replies: Rc::new(RefCell::new(std::collections::VecDeque::new())),
+        find_replies: Rc::new(RefCell::new(client::FindRepliesState::default())),
+        find_last: RefCell::new(None),
+        tasks: tasks.clone(),
         next_evaluation: Cell::new(0),
         devtools_registration: RefCell::new(None),
         lifecycle: Cell::new(BrowserLifecycle::Creating),
@@ -902,6 +1017,7 @@ pub(super) fn prepare_popup(
     let created_map = pending_popups.clone();
     let created_child = child_weak.clone();
     let closed_creation = creation_id;
+    let terminated_weak = Rc::downgrade(&page);
     let diagnostic_url = popup_url;
     let callbacks = BrowserCallbacks {
         find_replies: page.find_replies.clone(),
@@ -913,6 +1029,11 @@ pub(super) fn prepare_popup(
                 if let Some(page) = weak.upgrade() {
                     page.note_navigation();
                 }
+            }
+        }),
+        render_terminated: Rc::new(move |browser_id, reason| {
+            if let Some(page) = terminated_weak.upgrade() {
+                page.on_render_process_terminated(browser_id, &reason);
             }
         }),
         created: Rc::new(move |browser| {
@@ -1141,8 +1262,9 @@ impl Page {
     /// `on_load_start` and when a navigation command is applied, so the
     /// generation moves even if CEF's load-start callback is delayed (data:
     /// URLs) — an evaluation requested before the navigation must never
-    /// resolve against the new document.
-    fn note_navigation(&self) {
+    /// resolve against the new document. Also called when the renderer
+    /// process terminates, so stale results are never delivered afterwards.
+    pub(super) fn note_navigation(&self) {
         self.navigation_generation
             .set(self.navigation_generation.get().wrapping_add(1));
         let replies = cancel_pending_evaluations(&self.evaluations);
@@ -1154,6 +1276,72 @@ impl Page {
                     ));
                 }
             });
+        }
+    }
+
+    /// The renderer process of this page's browser terminated (crashed or
+    /// was killed). Invalidate the document generation, fail pending
+    /// evaluations and site-data removals, and tell the app through
+    /// [`zgx::web_view::WebViewEvent::ProcessTerminated`] so it can reload.
+    /// Only this page is affected: other profiles' browsers stay open.
+    pub(super) fn on_render_process_terminated(&self, browser_id: i32, reason: &str) {
+        let owns = self
+            .browser
+            .borrow()
+            .as_ref()
+            .is_some_and(|browser| browser.identifier() == browser_id);
+        if !owns {
+            return;
+        }
+        super::cef_trace!(&format!(
+            "RENDER_PROCESS_TERMINATED_HANDLED browser={browser_id} {reason}"
+        ));
+        // Bump the generation and fail pending evaluations as superseded.
+        self.note_navigation();
+        // Fail pending site-data removals with the crash error.
+        let site_data = std::mem::take(&mut *self.site_data.borrow_mut());
+        let pending_site_data = std::mem::take(&mut *self.pending_site_data.borrow_mut());
+        let web = self.web.clone();
+        let reason = reason.to_owned();
+        zgx::native_view::post(move || {
+            for (_, reply) in site_data {
+                reply(Err(format!("renderer process terminated: {reason}")));
+            }
+            for (_, reply) in pending_site_data {
+                reply(Err(format!("renderer process terminated: {reason}")));
+            }
+            if let Some(web) = web.upgrade() {
+                web.emit(zgx::web_view::WebViewEvent::ProcessTerminated);
+            }
+        });
+    }
+
+    /// Fixture only ([`crash_fixture_enabled`]): crash this page's renderer
+    /// through CDP `Page.crash` on the DevTools channel the evaluations
+    /// already use, so the `on_render_process_terminated` path can be
+    /// exercised end to end. The message id is negative, so its reply can
+    /// never collide with the positive evaluation/site-data ids and is
+    /// ignored by the observer. If the method is rejected, fall back to
+    /// navigating to `chrome://crash`.
+    fn fixture_crash_renderer(&self) {
+        if !crash_fixture_enabled() {
+            return;
+        }
+        let browser = self.browser.borrow().as_ref().cloned();
+        let Some(browser) = browser else { return };
+        super::cef_trace!("FIXTURE_CRASH_RENDERER");
+        if let Some(host) = browser.host() {
+            let method: CefString = "Page.crash".into();
+            // Pass 0 so CEF auto-assigns the message id; the reply is ignored
+            // by the observer (it matches no pending evaluation/site-data id).
+            let accepted = host.execute_dev_tools_method(0, Some(&method), None);
+            if accepted != 0 {
+                return;
+            }
+        }
+        if let Some(frame) = browser.main_frame() {
+            let url: CefString = "chrome://crash".into();
+            frame.load_url(Some(&url));
         }
     }
 
@@ -1986,10 +2174,10 @@ fn percent_encode(value: &str) -> String {
 #[cfg(test)]
 mod evaluation_tests {
     use super::{
-        EvaluationReply, cancel_pending_evaluations, parse_evaluation_for_generation,
-        parse_evaluation_result, parse_site_data_result,
+        EVALUATION_TIMEOUT, EvaluationReply, cancel_pending_evaluations, expire_evaluation,
+        parse_evaluation_for_generation, parse_evaluation_result, parse_site_data_result,
     };
-    use std::{cell::RefCell, collections::HashMap, rc::Rc};
+    use std::{cell::RefCell, collections::HashMap, rc::Rc, time::Instant};
 
     #[test]
     fn devtools_values_are_returned_as_json() {
@@ -2055,12 +2243,16 @@ mod evaluation_tests {
     #[test]
     fn navigation_cancels_all_pending_evaluations_once() {
         let seen = Rc::new(RefCell::new(Vec::new()));
-        let mut evaluations: HashMap<i32, (u64, EvaluationReply)> = HashMap::new();
+        let mut evaluations: HashMap<i32, (u64, Instant, EvaluationReply)> = HashMap::new();
         for id in [7, 8] {
             let seen = seen.clone();
             evaluations.insert(
                 id,
-                (2, Box::new(move |result| seen.borrow_mut().push(result))),
+                (
+                    2,
+                    Instant::now() + EVALUATION_TIMEOUT,
+                    Box::new(move |result| seen.borrow_mut().push(result)),
+                ),
             );
         }
         let evaluations = Rc::new(RefCell::new(evaluations));
@@ -2074,6 +2266,67 @@ mod evaluation_tests {
         }
         assert_eq!(seen.borrow().len(), 2);
         assert!(seen.borrow().iter().all(|result| result.is_err()));
+    }
+
+    #[test]
+    fn evaluation_timeout_expires_only_past_the_deadline_and_only_once() {
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let mut map: HashMap<i32, (u64, Instant, EvaluationReply)> = HashMap::new();
+        let now = Instant::now();
+        let seen_a = seen.clone();
+        map.insert(
+            1,
+            (
+                0,
+                now + EVALUATION_TIMEOUT,
+                Box::new(move |result| seen_a.borrow_mut().push(("a", result))),
+            ),
+        );
+        let seen_b = seen.clone();
+        map.insert(
+            2,
+            (
+                0,
+                now - std::time::Duration::from_secs(1),
+                Box::new(move |result| seen_b.borrow_mut().push(("b", result))),
+            ),
+        );
+        let evaluations = Rc::new(RefCell::new(map));
+
+        // Before the deadline the entry stays pending: the timer is a no-op.
+        assert!(expire_evaluation(&evaluations, 1, now).is_none());
+        assert!(evaluations.borrow().contains_key(&1));
+        // Past the deadline the reply is taken out and failed exactly once.
+        let reply = expire_evaluation(&evaluations, 2, now).expect("expired entry");
+        reply(Err("JavaScript evaluation timed out".into()));
+        assert!(expire_evaluation(&evaluations, 2, now).is_none());
+        assert!(!evaluations.borrow().contains_key(&2));
+        // An unknown id (already answered by DevTools) is a no-op: this is
+        // what cancels the timer when the real result arrives first.
+        assert!(expire_evaluation(&evaluations, 99, now).is_none());
+        // At the exact deadline the evaluation is expired.
+        let deadline = now + EVALUATION_TIMEOUT;
+        let seen_c = seen.clone();
+        evaluations.borrow_mut().insert(
+            3,
+            (
+                0,
+                deadline,
+                Box::new(move |result| seen_c.borrow_mut().push(("c", result))),
+            ),
+        );
+        let reply = expire_evaluation(&evaluations, 3, deadline).expect("expired at deadline");
+        reply(Err("JavaScript evaluation timed out".into()));
+
+        let labels: Vec<String> = seen
+            .borrow()
+            .iter()
+            .map(|(label, result)| {
+                assert!(result.is_err());
+                label.to_string()
+            })
+            .collect();
+        assert_eq!(labels, ["b".to_owned(), "c".to_owned()]);
     }
 
     #[test]

@@ -42,7 +42,8 @@ pub(super) fn trace_close_race_impl(message: &str) {
     let result = std::env::var_os("ZGX_CEF_STRESS_RESULT")
         .or_else(|| std::env::var_os("ZGX_CEF_CLOSE_RACE_RESULT"))
         .or_else(|| std::env::var_os("ZGX_CEF_DRAG_RESULT"))
-        .or_else(|| std::env::var_os("ZGX_CEF_INPUT_RESULT"));
+        .or_else(|| std::env::var_os("ZGX_CEF_INPUT_RESULT"))
+        .or_else(|| std::env::var_os("ZGX_CEF_CRASH_RESULT"));
     let Some(path) = result.map(PathBuf::from) else {
         return;
     };
@@ -59,7 +60,8 @@ pub(super) fn trace_close_race_impl(message: &str) {
         std::env::var_os("ZGX_CEF_CLOSE_RACE_RESULT").is_some()
             || std::env::var_os("ZGX_CEF_STRESS_RESULT").is_some()
             || std::env::var_os("ZGX_CEF_DRAG_RESULT").is_some()
-            || std::env::var_os("ZGX_CEF_INPUT_RESULT").is_some(),
+            || std::env::var_os("ZGX_CEF_INPUT_RESULT").is_some()
+            || std::env::var_os("ZGX_CEF_CRASH_RESULT").is_some(),
     ) {
         return;
     }
