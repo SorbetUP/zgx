@@ -15,7 +15,10 @@ use super::{
 };
 
 pub(super) fn trace_popup_fixture(message: &str) {
-    if let Some(path) = std::env::var_os("ZGX_CEF_POPUP_RESULT").map(std::path::PathBuf::from) {
+    let path = std::env::var_os("ZGX_CEF_POPUP_RESULT")
+        .or_else(|| std::env::var_os("ZGX_CEF_POPUP_CLOSE_RACE_RESULT"))
+        .map(std::path::PathBuf::from);
+    if let Some(path) = path {
         let _ = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -47,6 +50,10 @@ pub(super) struct BrowserCallbacks {
     pub web: zgx::web_view::WeakWebView,
     pub new_windows: bool,
     pub navigation_started: Rc<dyn Fn()>,
+    /// The popups this page opened, keyed by CEF's popup ID. Entries stay here
+    /// until the popup reaches a terminal state (aborted or closed), so a
+    /// closing opener can still find and cancel them.
+    pub pending_popups: Rc<RefCell<HashMap<i32, PopupPending>>>,
 }
 
 wrap_download_handler! {
@@ -346,12 +353,20 @@ wrap_life_span_handler! {
                 url.clone(),
                 self.pending_popups.clone(),
             ) else {
-                runtime::browser_creation_failed(creation_id);
+                // CEF is on the stack here; the failure bookkeeping drops the
+                // child controller, so run it on ZGX's next event-loop turn.
+                zgx::native_view::post(move || {
+                    runtime::browser_creation_failed(creation_id);
+                });
                 return 1;
             };
             self.pending_popups.borrow_mut().insert(
                 popup_id,
-                PopupPending { creation_id, window: prepared.window },
+                PopupPending {
+                    creation_id,
+                    window: prepared.window,
+                    created: std::cell::Cell::new(false),
+                },
             );
             *window_info = prepared.window_info;
             *client = Some(prepared.client);
@@ -359,11 +374,27 @@ wrap_life_span_handler! {
         }
 
         fn on_before_popup_aborted(&self, _browser: Option<&mut Browser>, popup_id: i32) {
-            if let Some(pending) = self.pending_popups.borrow_mut().remove(&popup_id) {
-                runtime::browser_creation_failed(pending.creation_id);
-                runtime::release_child_web(pending.creation_id);
-                pending.window.close();
-            }
+            let Some(pending) = self.pending_popups.borrow_mut().remove(&popup_id) else {
+                return;
+            };
+            // CEF calls this with its callback on the stack. Dropping the
+            // child controller here could re-enter CEF (the controller's Drop
+            // asks CEF to close the browser), and closing the window runs the
+            // popup's on_closed, so run the whole cleanup on ZGX's next
+            // event-loop turn instead.
+            zgx::native_view::post(move || {
+                if pending.created.get() {
+                    // The browser already exists; closing its window drives the
+                    // popup's own on_closed -> before_close teardown.
+                    pending.window.close();
+                } else {
+                    runtime::browser_creation_failed(pending.creation_id);
+                    // Safe now: this runs on ZGX's event loop, not inside a CEF
+                    // callback, so the controller's Drop cannot re-enter CEF.
+                    runtime::release_child_web(pending.creation_id);
+                    pending.window.close();
+                }
+            });
         }
 
         fn on_after_created(&self, browser: Option<&mut Browser>) {
@@ -494,14 +525,26 @@ wrap_render_handler! {
 }
 
 wrap_load_handler! {
-    pub(super) struct CEFLoadHandler { web: zgx::web_view::WeakWebView, navigation_started: Rc<dyn Fn()>, origins: OriginStoreHandle }
+    pub(super) struct CEFLoadHandler {
+        web: zgx::web_view::WeakWebView,
+        navigation_started: Rc<dyn Fn()>,
+        origins: OriginStoreHandle,
+        // Native chrome hook: called with the main frame's URL on every
+        // navigation, so a popup window's title bar can show the origin it
+        // displays (never the page's own title).
+        origin_title: Option<Rc<dyn Fn(&str)>>,
+    }
     impl LoadHandler {
         fn on_load_start(&self, _browser: Option<&mut Browser>, frame: Option<&mut cef::Frame>, _transition: TransitionType) {
             let Some(frame) = frame.filter(|frame| frame.is_main() != 0) else { return };
             (self.navigation_started)();
             let url = CefString::from(&frame.url()).to_string();
             let web = self.web.clone();
+            let origin_title = self.origin_title.clone();
             zgx::native_view::post(move || {
+                if let Some(sink) = origin_title.as_ref() {
+                    sink(&url);
+                }
                 if let Some(web) = web.upgrade() {
                     web.update_state(|state| {
                         state.url = url.clone();
@@ -585,7 +628,11 @@ fn is_user_cancelled_load(code: Errorcode) -> bool {
 }
 
 wrap_display_handler! {
-    pub(super) struct CEFDisplayHandler { web: zgx::web_view::WeakWebView }
+    pub(super) struct CEFDisplayHandler {
+        web: zgx::web_view::WeakWebView,
+        // See CEFLoadHandler's origin_title.
+        origin_title: Option<Rc<dyn Fn(&str)>>,
+    }
     impl DisplayHandler {
         fn on_loading_progress_change(&self, _browser: Option<&mut Browser>, progress: f64) {
             let web = self.web.clone();
@@ -610,7 +657,11 @@ wrap_display_handler! {
             let Some(frame) = frame.filter(|frame| frame.is_main() != 0) else { return };
             let url = url.map(ToString::to_string).unwrap_or_else(|| CefString::from(&frame.url()).to_string());
             let web = self.web.clone();
+            let origin_title = self.origin_title.clone();
             zgx::native_view::post(move || {
+                if let Some(sink) = origin_title.as_ref() {
+                    sink(&url);
+                }
                 if let Some(web) = web.upgrade() {
                     web.update_state(|state| state.url = url.clone());
                     web.emit(zgx::web_view::WebViewEvent::UrlChanged { url });
@@ -1446,6 +1497,7 @@ pub(super) fn client(
     windows: crate::WindowFactory,
     drag_start: Rc<dyn Fn(&DragData, i32, i32) -> bool>,
     html_documents: HtmlDocuments,
+    origin_title: Option<Rc<dyn Fn(&str)>>,
 ) -> Client {
     let state = RenderState {
         frame,
@@ -1457,6 +1509,7 @@ pub(super) fn client(
     let render = CEFRenderHandler::new(state, drag_start);
     let find_replies = callbacks.find_replies.clone();
     let navigation_started = callbacks.navigation_started.clone();
+    let pending_popups = callbacks.pending_popups.clone();
     let life = CEFLifeSpanHandler::new(
         callbacks,
         profile.clone(),
@@ -1465,10 +1518,10 @@ pub(super) fn client(
         dialogs.clone(),
         tasks.clone(),
         windows,
-        Rc::new(RefCell::new(HashMap::new())),
+        pending_popups,
     );
-    let load = CEFLoadHandler::new(web.clone(), navigation_started, origins);
-    let display = CEFDisplayHandler::new(web.clone());
+    let load = CEFLoadHandler::new(web.clone(), navigation_started, origins, origin_title.clone());
+    let display = CEFDisplayHandler::new(web.clone(), origin_title);
     let download = CEFDownloadHandler::new(
         web.clone(),
         download_owner,
@@ -1507,9 +1560,14 @@ pub(super) fn client(
     )
 }
 
+#[derive(Clone)]
 pub(super) struct PopupPending {
     pub(super) creation_id: u64,
     pub(super) window: crate::WindowHandle,
+    /// Whether CEF has confirmed this popup's browser creation. The entry
+    /// stays in the opener's map until the popup is aborted or closed, so a
+    /// closing opener can still find it.
+    pub(super) created: std::cell::Cell<bool>,
 }
 
 /// A security origin exactly as the browser serializes one: either the

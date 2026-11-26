@@ -754,10 +754,16 @@ pub(super) fn backend(
     let navigation_weak = Rc::downgrade(&page);
     let creation_id = runtime::browser_creation_started();
     page.creation_id.set(Some(creation_id));
+    // Popups this page opens, tracked until each popup is aborted or closed so
+    // a closing opener can cancel or close them.
+    let pending_popups: Rc<RefCell<HashMap<i32, client::PopupPending>>> =
+        Rc::new(RefCell::new(HashMap::new()));
+    let closed_popups = pending_popups.clone();
     let callbacks = BrowserCallbacks {
         find_replies: page.find_replies.clone(),
         web: web.downgrade(),
         new_windows: web.options().new_windows,
+        pending_popups,
         navigation_started: Rc::new(move || {
             if let Some(page) = navigation_weak.upgrade() {
                 page.note_navigation();
@@ -822,7 +828,33 @@ pub(super) fn backend(
             if let Some(page) = closed_weak.upgrade() {
                 page.lifecycle.set(BrowserLifecycle::Closed);
                 fail_pending(&page, "CEF browser closed before the operation completed");
-                page.browser.borrow_mut().take();
+                if let Ok(mut slot) = page.browser.try_borrow_mut() {
+                    slot.take();
+                }
+            }
+            // This page's popups must not outlive it: cancel creations CEF has
+            // not confirmed yet (a late confirmation is closed through the
+            // "popup_late_create" path) and close the windows of popups CEF
+            // already made. This runs inside a CEF callback, and dropping a
+            // child controller or closing a window here could re-enter CEF's
+            // close path, so defer it to ZGX's next event-loop turn.
+            let popups: Vec<client::PopupPending> =
+                closed_popups.borrow().values().cloned().collect();
+            if !popups.is_empty() {
+                zgx::native_view::post(move || {
+                    for pending in popups {
+                        if pending.created.get() {
+                            // The popup browser exists; closing its window
+                            // drives the popup's own on_closed -> before_close
+                            // teardown.
+                            pending.window.close();
+                        } else {
+                            runtime::browser_creation_cancelled(pending.creation_id);
+                            runtime::release_child_web(pending.creation_id);
+                            pending.window.close();
+                        }
+                    }
+                });
             }
         }),
     };
@@ -854,6 +886,8 @@ pub(super) fn backend(
         windows,
         drag_start,
         page.html_documents.clone(),
+        // A main page's window title belongs to the app, not to the page.
+        None,
     );
     let info = WindowInfo {
         windowless_rendering_enabled: 1,
@@ -896,6 +930,28 @@ pub(super) struct PreparedPopup {
     pub client: Client,
     pub window_info: WindowInfo,
     pub window: crate::WindowHandle,
+}
+
+/// The fixed part of a popup window's native title; the displayed origin is
+/// appended to it (see [`popup_window_title`]).
+const POPUP_WINDOW_BASE_TITLE: &str = "Sign in";
+
+/// The native title of a popup window: the fixed popup label plus the host the
+/// popup currently displays, with a lock marker for a secure (HTTPS) origin.
+/// The page's own title never takes part — a page must not be able to disguise
+/// its window as something else.
+fn popup_window_title(base: &str, url: &str) -> String {
+    let host = zgx::web_view::site_host(url).unwrap_or_default();
+    let label = if host.is_empty() {
+        base.to_owned()
+    } else {
+        format!("{base} — {host}")
+    };
+    if url.starts_with("https://") {
+        format!("🔒 {label}")
+    } else {
+        label
+    }
 }
 
 pub(super) fn prepare_popup(
@@ -988,14 +1044,32 @@ pub(super) fn prepare_popup(
     let popup_opened = web.clone();
     let popup_closed = web.clone();
     let closed_handle = handle_slot.clone();
+    let closed_map = pending_popups.clone();
+    let closed_popup_id = popup_id;
     let created_map = pending_popups.clone();
     let created_child = child_weak.clone();
     let closed_creation = creation_id;
-    let diagnostic_url = popup_url;
+    let diagnostic_url = popup_url.clone();
+    // Native origin indicator for the popup's window title: whenever the
+    // child's main frame navigates (UrlChanged / NavigationCommitted), the
+    // window title is recomputed from the URL — never from the page title.
+    let title_handle = handle_slot.clone();
+    let origin_title: Rc<dyn Fn(&str)> = Rc::new(move |url: &str| {
+        let title = popup_window_title(POPUP_WINDOW_BASE_TITLE, url);
+        client::trace_popup_fixture(&format!("POPUP_WINDOW_TITLE:{title}"));
+        if let Some(window) = title_handle.borrow().as_ref() {
+            window.set_title(title);
+        }
+    });
+    // The popup's own client tracks popups of the popup (a fresh, empty map);
+    // `pending_popups` here is the opener's map this popup is registered in.
+    let own_popups: Rc<RefCell<HashMap<i32, client::PopupPending>>> =
+        Rc::new(RefCell::new(HashMap::new()));
     let callbacks = BrowserCallbacks {
         find_replies: page.find_replies.clone(),
         web: web.clone(),
         new_windows: web.upgrade().is_some_and(|web| web.options().new_windows),
+        pending_popups: own_popups,
         navigation_started: Rc::new({
             let weak = Rc::downgrade(&page);
             move || {
@@ -1031,7 +1105,11 @@ pub(super) fn prepare_popup(
                 return;
             };
             *page.browser.borrow_mut() = Some(browser.clone());
-            created_map.borrow_mut().remove(&popup_id);
+            // Keep the opener's registry entry until the popup closes, so a
+            // closing opener can still find this popup; just mark it created.
+            if let Some(pending) = created_map.borrow().get(&popup_id) {
+                pending.created.set(true);
+            }
             if page.lifecycle.get() != BrowserLifecycle::Creating {
                 page.lifecycle.set(BrowserLifecycle::Closing);
                 runtime::defer_browser_close(browser.clone(), "popup_lifecycle_mismatch");
@@ -1063,16 +1141,28 @@ pub(super) fn prepare_popup(
         before_close: Rc::new(move |identifier| {
             client::trace_popup_fixture(&format!("CEF_POPUP_CLOSED:{identifier}"));
             client::emit_native_activity(&popup_closed, format!("popup:{identifier}"), false);
-            runtime::release_child_web(closed_creation);
+            // Finalize the CEF-side state first, while this callback is on the
+            // stack: once the browser slot is cleared, nothing below can ask
+            // CEF to close anything again.
             runtime::browser_closed(identifier);
             if let Some(page) = closed_page.upgrade() {
                 page.lifecycle.set(BrowserLifecycle::Closed);
                 fail_pending(&page, "CEF popup closed before the operation completed");
-                page.browser.borrow_mut().take();
+                // Clear the browser slot; never hold the borrow across a CEF
+                // call (a re-entrant close would find it borrowed).
+                if let Ok(mut slot) = page.browser.try_borrow_mut() {
+                    slot.take();
+                }
             }
+            closed_map.borrow_mut().remove(&closed_popup_id);
             if let Some(window) = closed_handle.borrow().as_ref() {
                 window.close();
             }
+            // Release the child controller LAST, on a later event-loop turn:
+            // dropping the last strong WebView runs CefWebView's Drop, which
+            // asks CEF to close the browser — re-entering this very callback
+            // (and tripping the already-closed assertion) if done here.
+            runtime::release_child_web_deferred(closed_creation);
         }),
     };
     let invalidator = page.gpu.clone();
@@ -1103,6 +1193,7 @@ pub(super) fn prepare_popup(
         windows.clone(),
         drag_start,
         page.html_documents.clone(),
+        Some(origin_title),
     );
     let content = view(page.clone());
     // Automated CEF fixtures keep the parent window off-screen so they do not
@@ -1110,10 +1201,13 @@ pub(super) fn prepare_popup(
     // popup test should exercise the real child browser without displaying a
     // sign-in window on the machine running the test.
     let popup_bounds = std::env::var_os("ZGX_CEF_POPUP_RESULT")
+        .or_else(|| std::env::var_os("ZGX_CEF_POPUP_CLOSE_RACE_RESULT"))
         .map(|_| crate::WindowBounds::new(800, 640).at(-10_000, -10_000));
     let window = windows.open(
         crate::WindowOptions {
-            title: "Sign in".into(),
+            // Native origin indicator from the start: the requested popup URL
+            // decides the title, not the page that loads in it.
+            title: popup_window_title(POPUP_WINDOW_BASE_TITLE, &popup_url),
             width: 800.,
             height: 640.,
             min_size: Some((360., 280.)),
@@ -1128,11 +1222,14 @@ pub(super) fn prepare_popup(
                 if let Some(creation_id) = closing_page.creation_id.take() {
                     runtime::browser_creation_cancelled(creation_id);
                 }
-                if let Some(browser) = closing_page.browser.borrow().as_ref()
-                    && let Some(host) = browser.host()
-                {
-                    host.close_browser(1);
-                }
+                // `close_browser` can synchronously enter on_before_close,
+                // which borrows the same slot: never hold the borrow across
+                // the CEF call.
+                close_after_releasing_slot(&closing_page.browser, |browser| {
+                    if let Some(host) = browser.host() {
+                        host.close_browser(1);
+                    }
+                });
             });
             cx.render(content);
         },

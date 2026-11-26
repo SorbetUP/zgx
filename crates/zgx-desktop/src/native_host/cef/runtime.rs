@@ -41,6 +41,7 @@ static CLOSE_RACE_DIAGNOSTIC_LOCK: Mutex<()> = Mutex::new(());
 pub(super) fn trace_close_race_impl(message: &str) {
     let result = std::env::var_os("ZGX_CEF_STRESS_RESULT")
         .or_else(|| std::env::var_os("ZGX_CEF_CLOSE_RACE_RESULT"))
+        .or_else(|| std::env::var_os("ZGX_CEF_POPUP_CLOSE_RACE_RESULT"))
         .or_else(|| std::env::var_os("ZGX_CEF_DRAG_RESULT"))
         .or_else(|| std::env::var_os("ZGX_CEF_INPUT_RESULT"));
     let Some(path) = result.map(PathBuf::from) else {
@@ -57,6 +58,7 @@ pub(super) fn trace_close_race_impl(message: &str) {
         path.parent(),
         &std::env::temp_dir(),
         std::env::var_os("ZGX_CEF_CLOSE_RACE_RESULT").is_some()
+            || std::env::var_os("ZGX_CEF_POPUP_CLOSE_RACE_RESULT").is_some()
             || std::env::var_os("ZGX_CEF_STRESS_RESULT").is_some()
             || std::env::var_os("ZGX_CEF_DRAG_RESULT").is_some()
             || std::env::var_os("ZGX_CEF_INPUT_RESULT").is_some(),
@@ -534,6 +536,7 @@ fn mock_keychain_requested(mut present: impl FnMut(&str) -> bool) -> bool {
         "ZGX_CEF_SITE_DATA_RESULT",
         "ZGX_CEF_LATE_LOAD_RESULT",
         "ZGX_CEF_CLOSE_RACE_RESULT",
+        "ZGX_CEF_POPUP_CLOSE_RACE_RESULT",
         "ZGX_CEF_STRESS_RESULT",
         "ZGX_CEF_NAV_EVAL_RACE_RESULT",
         "ZGX_CEF_POPUP_RESULT",
@@ -735,6 +738,14 @@ pub(super) fn release_child_web(creation_id: u64) {
     CHILD_WEBS.with(|webs| {
         webs.borrow_mut().remove(&creation_id);
     });
+}
+
+/// Drops a popup's child controller on a later event-loop turn. Dropping the
+/// last strong `WebView` can run `CefWebView`'s Drop, which asks CEF to close
+/// the browser — so it must never run while a CEF callback (on_before_close,
+/// on_before_popup_aborted, ...) is still on the stack.
+pub(super) fn release_child_web_deferred(creation_id: u64) {
+    zgx::native_view::post(move || release_child_web(creation_id));
 }
 
 pub(super) fn browser_creation_failed(creation_id: u64) -> bool {

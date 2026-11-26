@@ -716,6 +716,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let navigation_eval_race_test = navigation_eval_race_result_path.is_some();
     let popup_result_path = std::env::var_os("ZGX_CEF_POPUP_RESULT").map(std::path::PathBuf::from);
     let popup_test = popup_result_path.is_some();
+    let popup_close_race_result_path =
+        std::env::var_os("ZGX_CEF_POPUP_CLOSE_RACE_RESULT").map(std::path::PathBuf::from);
+    let popup_close_race_test = popup_close_race_result_path.is_some();
     let policy_result_path =
         std::env::var_os("ZGX_CEF_POLICY_RESULT").map(std::path::PathBuf::from);
     let policy_test = policy_result_path.is_some();
@@ -738,6 +741,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         || stress_test
         || navigation_eval_race_test
         || popup_test
+        || popup_close_race_test
         || drag_test
         || policy_test;
     if let Some(result_path) = download_result_path.as_ref() {
@@ -775,6 +779,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(result_path) = popup_result_path.as_ref() {
         fs::write(result_path, "START\n")?;
     }
+    if let Some(result_path) = popup_close_race_result_path.as_ref() {
+        fs::write(result_path, "START\n")?;
+        trace_close_race(Some(result_path), "POPUP_CLOSE_RACE_FIXTURE_START");
+    }
     if let Some(result_path) = drag_result_path.as_ref() {
         fs::write(result_path, "START\n")?;
     }
@@ -800,7 +808,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         download_test,
         site_data_test || late_load_test,
         site_data_test && site_data_phase == "record",
-        popup_test,
+        popup_test || popup_close_race_test,
         drag_test,
         sandbox_origin_test,
         html_base_result_path.clone(),
@@ -852,7 +860,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &cx.ui.runtime,
                 WebViewOptions {
                     profile,
-                    new_windows: popup_test,
+                    new_windows: popup_test || popup_close_race_test,
                     // The event fixture asserts page messages from both the
                     // main frame and a srcdoc iframe, so its bridge must be on.
                     // The sandbox fixture asserts the sandboxed iframe's
@@ -1726,6 +1734,161 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let _ = fs::write(&result_path, status);
                     window.close();
                 });
+            } else if popup_close_race_test {
+                // Close the PARENT controller while a popup creation is still
+                // pending, then assert the backend survives: no panic, no
+                // double close, and the browser counts return to baseline.
+                let result = popup_close_race_result_path
+                    .clone()
+                    .expect("popup close-race fixture has a result path");
+                let diagnostic = result.with_extension("diagnostic");
+                // The shared diagnostic fills up with pump traces and the
+                // shared tracer stops early, so the race task keeps its own
+                // log beside it.
+                let race_log = result.with_extension("race");
+                let race_note: Arc<dyn Fn(String)> = Arc::new(move |message| {
+                    let _ = fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&race_log)
+                        .and_then(|mut file| writeln!(file, "{message}"));
+                });
+                let window = cx.window.clone();
+                let race_web = web.clone();
+                let race_scene = cx.ui.scene.clone();
+                let race_input = cx.ui.input.clone();
+                web.load_url(format!("{origin}/popup-parent"));
+                cx.tasks.spawn(async move {
+                    let mut ready = false;
+                    for _ in 0..200 {
+                        if race_web.title() == "popup parent"
+                            && !race_web.state().with_untracked(|state| state.loading)
+                        {
+                            ready = true;
+                            break;
+                        }
+                        zgx::timer::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                    if !ready {
+                        let _ = fs::write(&result, "FAIL:popup-close-race-parent-load");
+                        window.close();
+                        return;
+                    }
+                    race_note(format!(
+                        "RACE_READY title={:?} url={:?} new_windows={}",
+                        race_web.title(),
+                        race_web.url(),
+                        race_web.options().new_windows
+                    ));
+                    // Click the popup button with real pointer input first: a
+                    // synthetic JS click has no user gesture, so Chromium
+                    // would block window.open.
+                    let scene = race_scene.clone();
+                    let input = race_input.clone();
+                    let note = race_note.clone();
+                    let click_web = race_web.clone();
+                    race_web.evaluate_js(
+                        "(()=>{const r=document.querySelector('#open-popup').getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2}})()",
+                        move |bounds| {
+                            let position = bounds
+                                .ok()
+                                .and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok())
+                                .and_then(|value| {
+                                    Some((value["x"].as_f64()? as f32, value["y"].as_f64()? as f32))
+                                });
+                            let Some((x, y)) = position else {
+                                note("CLICK_BOUNDS_MISSING".to_owned());
+                                return;
+                            };
+                            let _ = input.dispatch(&scene, InputEvent::PointerMove { x, y });
+                            let _ = input.dispatch(&scene, InputEvent::PointerDown {
+                                x,
+                                y,
+                                button: PointerButton::Primary,
+                            });
+                            let _ = input.dispatch(&scene, InputEvent::PointerUp {
+                                x,
+                                y,
+                                button: PointerButton::Primary,
+                            });
+                            note(format!("POINTER_CLICK_DISPATCHED:{x}:{y}"));
+                            // Fall back to a direct JS click if the pointer
+                            // input missed (the page may not be laid out yet).
+                            let clicked_web = click_web.clone();
+                            clicked_web.evaluate_js("window.__popupClicked||0", move |clicked| {
+                                let clicked = clicked
+                                    .ok()
+                                    .and_then(|value| value.parse::<u64>().ok())
+                                    .unwrap_or(0);
+                                note(format!("CLICKED_STATE:{clicked}"));
+                                if clicked == 0 {
+                                    click_web.evaluate_js(
+                                        "document.querySelector('#open-popup').click(); 'clicked'",
+                                        |_| {},
+                                    );
+                                }
+                            });
+                        },
+                    );
+                    // Wait until CEF reports the pending popup creation.
+                    let mut pending = false;
+                    for _ in 0..400 {
+                        if fs::read_to_string(&diagnostic)
+                            .is_ok_and(|log| log.contains("CEF_BEFORE_POPUP:"))
+                        {
+                            pending = true;
+                            break;
+                        }
+                        zgx::timer::sleep(std::time::Duration::from_millis(25)).await;
+                    }
+                    race_note(format!("PENDING={pending}"));
+                    if !pending {
+                        let _ = fs::write(&result, "FAIL:popup-close-race-no-pending-popup");
+                        window.close();
+                        return;
+                    }
+                    trace_close_race(
+                        Some(&result),
+                        "FIXTURE_CLOSE_PARENT_WITH_PENDING_POPUP",
+                    );
+                    // The race: drop the parent controller mid-creation.
+                    race_web.close();
+                    // Browser counts must return to baseline: every browser CEF
+                    // created (the parent and, if it still completes, the
+                    // popup) must close exactly once, and the pending popup
+                    // creation must reach a terminal state (aborted, or
+                    // created then closed).
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                    loop {
+                        let log = fs::read_to_string(&diagnostic).unwrap_or_default();
+                        let created = log
+                            .lines()
+                            .filter(|line| line.starts_with("ON_AFTER_CREATED id="))
+                            .count();
+                        let closed = log
+                            .lines()
+                            .filter(|line| line.starts_with("ON_BEFORE_CLOSE browser="))
+                            .count();
+                        let popup_terminal = created >= 2
+                            || log.lines().any(|line| line.starts_with("CREATE_REJECTED id="));
+                        if created >= 1 && created == closed && popup_terminal {
+                            trace_close_race(Some(&result), "FIXTURE_BROWSER_COUNTS_BASELINE");
+                            break;
+                        }
+                        if std::time::Instant::now() >= deadline {
+                            let _ = fs::write(
+                                &result,
+                                format!(
+                                    "FAIL:popup-close-race-counts:created={created}:closed={closed}"
+                                ),
+                            );
+                            window.close();
+                            return;
+                        }
+                        zgx::timer::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                    window.close();
+                });
             } else if popup_test {
                 let result = popup_result_path
                     .clone()
@@ -2158,7 +2321,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         download_window.close();
                     }
                 });
-            } else if !close_race_test && !navigation_eval_race_test {
+            } else if !close_race_test && !navigation_eval_race_test && !popup_close_race_test {
                 let fixture = FIXTURE.to_owned();
                 web.load_html(&fixture, Some(&origin));
             }
@@ -2307,7 +2470,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .child(source_view)
                     .child(drag_file_source.grow())
                     .child(target_view)
-            } else if download_test || input_test || popup_test || html_base_test {
+            } else if download_test || input_test || popup_test || popup_close_race_test || html_base_test {
                 zgx::web_view::web_view(&web)
                     .grow()
                     .w_full()
@@ -2412,6 +2575,64 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?;
         if !pass {
             return Err("CEF stress fixture did not close all created browsers cleanly".into());
+        }
+    }
+    if let Some(result_path) = popup_close_race_result_path {
+        trace_close_race(
+            Some(&result_path),
+            if run_result.is_ok() {
+                "APPLICATION_RETURNED_OK"
+            } else {
+                "APPLICATION_RETURNED_ERROR"
+            },
+        );
+        let already_failed =
+            fs::read_to_string(&result_path).is_ok_and(|content| content.starts_with("FAIL"));
+        if already_failed {
+            return Err("popup close-race fixture reported a failure during the run".into());
+        }
+        // Reuse the close-race assertions: every browser CEF created closed
+        // exactly once, and shutdown found no pending creation or open
+        // browser (the runtime's own browser_created/browser_closed asserts
+        // make a double close or an unknown close panic, which fails the run).
+        let diagnostic = fs::read_to_string(result_path.with_extension("diagnostic"))?;
+        let created_browsers: std::collections::HashSet<String> = diagnostic
+            .lines()
+            .filter_map(|line| line.strip_prefix("ON_AFTER_CREATED id="))
+            .filter_map(|rest| {
+                rest.split_whitespace()
+                    .find_map(|word| word.strip_prefix("browser="))
+                    .map(str::to_owned)
+            })
+            .collect();
+        let closed_browsers: std::collections::HashSet<String> = diagnostic
+            .lines()
+            .filter_map(|line| line.strip_prefix("ON_BEFORE_CLOSE browser="))
+            .filter_map(|rest| rest.split_whitespace().next().map(str::to_owned))
+            .collect();
+        let counts_baseline = !created_browsers.is_empty() && created_browsers == closed_browsers;
+        let shutdown_empty = diagnostic
+            .lines()
+            .any(|line| line == "SHUTDOWN_BEGIN pending=0 open=0");
+        let popup_was_exercised = diagnostic
+            .lines()
+            .any(|line| line.starts_with("CEF_BEFORE_POPUP:"));
+        let pass = run_result.is_ok() && counts_baseline && shutdown_empty && popup_was_exercised;
+        fs::write(
+            &result_path,
+            format!(
+                "{}:created={}:closed={}:shutdown_empty={}:popup_seen={}",
+                if pass { "PASS" } else { "FAIL" },
+                created_browsers.len(),
+                closed_browsers.len(),
+                shutdown_empty,
+                popup_was_exercised,
+            ),
+        )?;
+        if !pass {
+            return Err(
+                "popup close-race fixture did not return browser counts to baseline".into(),
+            );
         }
     }
     if external_data_dir.is_none() {
