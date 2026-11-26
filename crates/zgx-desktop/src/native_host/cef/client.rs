@@ -134,7 +134,11 @@ wrap_download_handler! {
         ) {
             let Some(item) = item else { return };
             let id = item.id();
-            if let Some(path) = self.cancel_paths.borrow().get(&id).cloned() {
+            // Bind the lookup before the block: an `if let` scrutinee
+            // temporary would keep the `Ref` alive into the block and panic
+            // on the `borrow_mut` below.
+            let cancelled = self.cancel_paths.borrow().get(&id).cloned();
+            if let Some(path) = cancelled {
                 if let Some(callback) = callback {
                     callback.cancel();
                 }
@@ -651,7 +655,81 @@ pub(super) enum PendingPermission {
     Media(MediaAccessCallback),
 }
 
-pub(super) type PendingPermissions = Rc<RefCell<HashMap<u64, PendingPermission>>>;
+/// One-shot settlement state for a pending permission request:
+/// `Pending -> Settled` happens exactly once. `settle` yields the payload
+/// only on the first call, so a CEF callback can never be invoked twice.
+pub(super) struct SettleOnce<T> {
+    payload: Option<T>,
+}
+
+impl<T> SettleOnce<T> {
+    pub(super) fn new(payload: T) -> Self {
+        Self {
+            payload: Some(payload),
+        }
+    }
+
+    /// Transitions Pending -> Settled, returning the payload only the first
+    /// time. Every later call returns None.
+    pub(super) fn settle(&mut self) -> Option<T> {
+        self.payload.take()
+    }
+
+    pub(super) fn is_pending(&self) -> bool {
+        self.payload.is_some()
+    }
+}
+
+pub(super) type PendingPermissions = Rc<RefCell<HashMap<u64, SettleOnce<PendingPermission>>>>;
+
+/// The registry is keyed by u64, but two kinds of requests share it: CEF
+/// permission prompt ids and locally minted media-access tokens. Keep them
+/// in disjoint key spaces — prompt ids in `[0, MEDIA_KEY_OFFSET]`, media
+/// tokens in `(MEDIA_KEY_OFFSET, u64::MAX]` — so a prompt id can never alias
+/// a media token.
+const MEDIA_KEY_OFFSET: u64 = u64::MAX / 2;
+
+/// Maps a CEF prompt id to its registry key, or None if it falls into the
+/// media key space (defensive; CEF prompt ids are small in practice).
+fn prompt_key(prompt_id: u64) -> Option<u64> {
+    (prompt_id <= MEDIA_KEY_OFFSET).then_some(prompt_id)
+}
+
+/// Maps a local media token (>= 1) to a registry key in the upper half, or
+/// None if it would wrap back into the prompt key space.
+fn media_key(token: u64) -> Option<u64> {
+    MEDIA_KEY_OFFSET
+        .checked_add(token.max(1))
+        .filter(|key| *key > MEDIA_KEY_OFFSET)
+}
+
+/// True while the request's browser is still open. A missing browser id
+/// cannot be checked and is treated as open.
+fn browser_still_open(browser_id: Option<i32>) -> bool {
+    browser_id.is_none_or(super::runtime::browser_is_open)
+}
+
+/// True while the key still holds a pending (unsettled) entry.
+fn is_registered_pending<T>(registry: &Rc<RefCell<HashMap<u64, SettleOnce<T>>>>, key: u64) -> bool {
+    registry
+        .borrow()
+        .get(&key)
+        .is_some_and(|entry| entry.is_pending())
+}
+
+/// A pending request is actionable only while it is still registered (not
+/// dismissed or settled) AND its browser is still open.
+fn pending_is_actionable(pending: &PendingPermissions, key: u64, browser_id: Option<i32>) -> bool {
+    browser_still_open(browser_id) && is_registered_pending(pending, key)
+}
+
+/// Settles a pending request exactly once: removes the entry from the
+/// registry and takes its callback. The first caller wins; every later
+/// caller (dialog task, dismissal, close) gets None.
+fn take_settled<T>(registry: &Rc<RefCell<HashMap<u64, SettleOnce<T>>>>, key: u64) -> Option<T> {
+    let mut entry = registry.borrow_mut().remove(&key)?;
+    entry.settle()
+}
 
 wrap_permission_handler! {
     pub(super) struct CEFPermissionHandler {
@@ -697,34 +775,70 @@ wrap_permission_handler! {
             let browser_id = _browser.as_ref().map(|browser| browser.identifier());
             let token = self.next_media_token.get().wrapping_add(1).max(1);
             self.next_media_token.set(token);
+            // Media tokens live in their own key space, disjoint from prompt ids.
+            let Some(key) = media_key(token) else {
+                callback.cancel();
+                return 1;
+            };
+            // The registry entry stays in place for the whole await loop; it
+            // is taken out exactly once, at decision time, below.
             self.pending
                 .borrow_mut()
-                .insert(token, PendingPermission::Media(callback.clone()));
+                .insert(key, SettleOnce::new(PendingPermission::Media(callback.clone())));
             let pending = self.pending.clone();
             let profile = self.profile.clone();
             let store = self.store.clone();
             let dialogs = self.dialogs.clone();
             self.tasks.spawn(async move {
-                // One-shot: take the callback out of the registry; if it is
-                // gone (dismissed) or its browser closed, do not call into CEF.
-                let Some(PendingPermission::Media(callback)) = pending.borrow_mut().remove(&token)
-                else {
-                    return;
-                };
-                if browser_id.is_some_and(|id| !super::runtime::browser_is_open(id)) {
-                    callback.cancel();
-                    return;
-                }
                 let mut granted = 0;
+                let mut denied = false;
                 for (flag, permission, label) in requests {
-                    if request_permission(&profile, &store, &dialogs, &origin, permission, label).await {
-                        granted |= flag;
-                    } else {
-                        callback.cancel();
-                        return;
+                    // The dialog is an await point: the browser may close or
+                    // the page may navigate while it is up. Ask WITHOUT
+                    // persisting yet; persistence happens only at decision
+                    // time, once the request is known to still be valid.
+                    let decision =
+                        ask_permission(&profile, &store, &dialogs, &origin, permission, label)
+                            .await;
+                    // Re-check validity after EACH await: browser still open
+                    // and the pending entry still present. An obsolete request
+                    // is never persisted and never settled with a CEF call.
+                    if !pending_is_actionable(&pending, key, browser_id) {
+                        denied = true;
+                        break;
+                    }
+                    match decision {
+                        Some(true) => {
+                            remember_decision(&store, &origin, permission, true);
+                            granted |= flag;
+                        }
+                        Some(false) => {
+                            remember_decision(&store, &origin, permission, false);
+                            denied = true;
+                            break;
+                        }
+                        // Dialog dismissed/cancelled: no decision, nothing persisted.
+                        None => {
+                            denied = true;
+                            break;
+                        }
                     }
                 }
-                callback.cont(granted);
+                // Decision time: take the callback out of the registry exactly
+                // once; if it was already settled (dismissed/closed) there is
+                // nothing left to call.
+                if let Some(PendingPermission::Media(callback)) = take_settled(&pending, key) {
+                    // Only call into CEF while the browser is still open;
+                    // otherwise drop the callback (CEF treats an unanswered
+                    // media request as denied).
+                    if browser_still_open(browser_id) {
+                        if denied {
+                            callback.cancel();
+                        } else {
+                            callback.cont(granted);
+                        }
+                    }
+                }
             });
             1
         }
@@ -746,10 +860,6 @@ wrap_permission_handler! {
                 callback.cont(PermissionRequestResult::DENY);
                 return 1;
             };
-            // Register the callback so a dismissal settles it exactly once.
-            self.pending
-                .borrow_mut()
-                .insert(prompt_id, PendingPermission::Prompt(callback.clone()));
             let kinds = [
                 (
                     PermissionRequestTypes::CAMERA_PAN_TILT_ZOOM.get_raw(),
@@ -770,6 +880,16 @@ wrap_permission_handler! {
                 .into_iter()
                 .filter(|(flag, _, _)| requested_permissions & flag != 0)
                 .collect();
+            // Prompt ids live in their own key space, disjoint from media tokens.
+            let Some(key) = prompt_key(prompt_id) else {
+                callback.cont(PermissionRequestResult::DENY);
+                return 1;
+            };
+            let browser_id = _browser.as_ref().map(|browser| browser.identifier());
+            // Register the callback so a dismissal settles it exactly once.
+            self.pending
+                .borrow_mut()
+                .insert(key, SettleOnce::new(PendingPermission::Prompt(callback.clone())));
             let pending = self.pending.clone();
             let profile = self.profile.clone();
             let store = self.store.clone();
@@ -777,20 +897,44 @@ wrap_permission_handler! {
             self.tasks.spawn(async move {
                 let mut accepted = true;
                 for (_, permission, label) in requests {
-                    if !request_permission(&profile, &store, &dialogs, &origin, permission, label).await {
+                    // Ask WITHOUT persisting yet; the decision is remembered
+                    // only if the prompt is still valid at decision time.
+                    let decision =
+                        ask_permission(&profile, &store, &dialogs, &origin, permission, label)
+                            .await;
+                    // Re-check after each await: navigation, dismissal or a
+                    // browser close may have made this prompt obsolete while
+                    // the dialog was up — then nothing is persisted and the
+                    // callback is not settled here.
+                    if !pending_is_actionable(&pending, key, browser_id) {
                         accepted = false;
                         break;
                     }
+                    match decision {
+                        Some(true) => {}
+                        Some(false) => {
+                            remember_decision(&store, &origin, permission, false);
+                            accepted = false;
+                            break;
+                        }
+                        // Dialog dismissed/cancelled: no decision, nothing persisted.
+                        None => {
+                            accepted = false;
+                            break;
+                        }
+                    }
                 }
-                // One-shot: only settle the prompt if it is still pending.
-                if let Some(PendingPermission::Prompt(callback)) =
-                    pending.borrow_mut().remove(&prompt_id)
-                {
-                    callback.cont(if accepted {
-                        PermissionRequestResult::ACCEPT
-                    } else {
-                        PermissionRequestResult::DENY
-                    });
+                // One-shot: only settle the prompt if it is still pending; a
+                // dismissal already removed the entry, so this gets None and
+                // never calls cont twice.
+                if let Some(PendingPermission::Prompt(callback)) = take_settled(&pending, key) {
+                    if browser_still_open(browser_id) {
+                        callback.cont(if accepted {
+                            PermissionRequestResult::ACCEPT
+                        } else {
+                            PermissionRequestResult::DENY
+                        });
+                    }
                 }
             });
             1
@@ -803,47 +947,51 @@ wrap_permission_handler! {
             result: PermissionRequestResult,
         ) {
             // The page went away before deciding: settle the callback once
-            // with CEF's dismissal result so it cannot fire later.
-            if let Some(PendingPermission::Prompt(callback)) =
-                self.pending.borrow_mut().remove(&prompt_id)
-            {
+            // with CEF's dismissal result so it cannot fire later. The key
+            // stays in the prompt key space, so a dismissal can never resolve
+            // a media request, and remove-then-settle guarantees the dialog
+            // task cannot call cont a second time for this prompt.
+            let Some(key) = prompt_key(prompt_id) else { return };
+            if let Some(PendingPermission::Prompt(callback)) = take_settled(&self.pending, key) {
                 callback.cont(result);
             }
         }
     }
 }
 
-async fn request_permission(
+/// Asks the store (or the user, via a dialog) for a permission decision
+/// WITHOUT persisting it. Persistence happens only at decision time, when
+/// the request is known to still be valid. Returns None when the dialog was
+/// dismissed or cancelled — no decision, so nothing may be remembered.
+async fn ask_permission(
     profile: &str,
     store: &PermissionStoreHandle,
     dialogs: &crate::FileDialogs,
     origin: &str,
     permission: &str,
     label: &str,
-) -> bool {
+) -> Option<bool> {
     if let Some(decision) = store.borrow().decision(origin, permission) {
-        return decision;
+        return Some(decision);
     }
     let prompt = crate::PromptOptions::new(
         format!("Allow {label}?"),
         format!("{origin} is requesting access to your {label} ({profile} profile)."),
     )
     .buttons(crate::PromptButtons::YesNo);
-    let result = dialogs.prompt(prompt).await;
-    match result {
-        Ok(crate::PromptResponse::Yes) => {
-            if let Err(error) = store.borrow_mut().remember(origin, permission, true) {
-                eprintln!("cannot save CEF site permission: {error}");
-            }
-            true
-        }
-        Ok(crate::PromptResponse::No) => {
-            if let Err(error) = store.borrow_mut().remember(origin, permission, false) {
-                eprintln!("cannot save CEF site permission: {error}");
-            }
-            false
-        }
-        _ => false,
+    match dialogs.prompt(prompt).await {
+        Ok(crate::PromptResponse::Yes) => Some(true),
+        Ok(crate::PromptResponse::No) => Some(false),
+        _ => None,
+    }
+}
+
+/// Persists a permission decision. Only call this when the request is still
+/// valid at decision time; a request that became obsolete (cancelled,
+/// dismissed, navigated away, browser closed) must NOT be remembered.
+fn remember_decision(store: &PermissionStoreHandle, origin: &str, permission: &str, allowed: bool) {
+    if let Err(error) = store.borrow_mut().remember(origin, permission, allowed) {
+        eprintln!("cannot save CEF site permission: {error}");
     }
 }
 
@@ -1423,8 +1571,10 @@ mod tests {
     use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
     use super::{
-        DownloadUpdate, file_dialog_selection, is_user_cancelled_load, navigation_kind,
-        navigation_kind_raw, next_document_chunk, normalize_document_url, update_download_status,
+        DownloadUpdate, MEDIA_KEY_OFFSET, SettleOnce, file_dialog_selection, is_registered_pending,
+        is_user_cancelled_load, media_key, navigation_kind, navigation_kind_raw,
+        next_document_chunk, normalize_document_url, prompt_key, take_settled,
+        update_download_status,
     };
     use cef::{FileDialogMode, TransitionType};
     use zgx::web_view::{DownloadStatus, NavigationKind};
@@ -1668,5 +1818,64 @@ mod tests {
     fn intentional_navigation_abort_is_not_a_page_failure() {
         assert!(is_user_cancelled_load(cef::Errorcode::ABORTED));
         assert!(!is_user_cancelled_load(cef::Errorcode::FAILED));
+    }
+
+    #[test]
+    fn settle_once_yields_the_payload_exactly_once() {
+        let mut entry = SettleOnce::new(42u32);
+        assert!(entry.is_pending());
+        assert_eq!(entry.settle(), Some(42));
+        assert!(!entry.is_pending());
+        assert_eq!(entry.settle(), None);
+        assert_eq!(entry.settle(), None);
+    }
+
+    #[test]
+    fn registry_settles_each_key_exactly_once_so_a_callback_cannot_fire_twice() {
+        let registry: Rc<RefCell<HashMap<u64, SettleOnce<u32>>>> =
+            Rc::new(RefCell::new(HashMap::new()));
+        registry.borrow_mut().insert(7, SettleOnce::new(100));
+        assert!(is_registered_pending(&registry, 7));
+        // First settle wins (e.g. the dismissal path in on_dismiss_permission_prompt).
+        assert_eq!(take_settled(&registry, 7), Some(100));
+        assert!(!is_registered_pending(&registry, 7));
+        // The dialog task settling afterwards must not get the callback again.
+        assert_eq!(take_settled(&registry, 7), None);
+        // A brand-new request registered on the same key is a fresh entry and
+        // settles exactly once itself.
+        registry.borrow_mut().insert(7, SettleOnce::new(200));
+        assert!(is_registered_pending(&registry, 7));
+        assert_eq!(take_settled(&registry, 7), Some(200));
+        assert_eq!(take_settled(&registry, 7), None);
+    }
+
+    #[test]
+    fn prompt_and_media_key_spaces_are_disjoint() {
+        assert_eq!(prompt_key(0), Some(0));
+        assert_eq!(prompt_key(1), Some(1));
+        assert_eq!(prompt_key(MEDIA_KEY_OFFSET), Some(MEDIA_KEY_OFFSET));
+        // Past the offset a prompt id is refused instead of aliasing a media key.
+        assert_eq!(prompt_key(MEDIA_KEY_OFFSET + 1), None);
+        assert!(media_key(1).is_some_and(|key| key > MEDIA_KEY_OFFSET));
+        // A token that would wrap back into the prompt space is refused.
+        assert!(media_key(u64::MAX).is_none());
+        for prompt_id in [0u64, 1, 42, 1_000_000, MEDIA_KEY_OFFSET] {
+            let prompt = prompt_key(prompt_id).unwrap();
+            for token in [1u64, 2, 1_000, u64::MAX / 4] {
+                if let Some(media) = media_key(token) {
+                    assert_ne!(
+                        prompt, media,
+                        "prompt id {prompt_id} collides with media token {token}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_browser_id_is_treated_as_open_for_validity_checks() {
+        // A missing browser handle cannot be checked; only a known-closed
+        // browser makes a pending request obsolete.
+        assert!(super::browser_still_open(None));
     }
 }
