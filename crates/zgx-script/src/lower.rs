@@ -3017,8 +3017,36 @@ fn web_view_of(spec: &crate::node::WebSpec, vm: &Rc<Vm>, low: &Rc<Lowering>) -> 
                 } => {
                     if let Some(f) = &message {
                         let value = crate::node::json_value(body);
-                        // Who sent it: check before acting on it.
+                        // Who sent it: the browser-computed security origin
+                        // ("null" = opaque, e.g. a sandboxed iframe — never
+                        // act privileged on it). Check before acting on it.
                         if let Err(e) = vm.call::<()>(f, (value, origin.as_str(), *main_frame)) {
+                            vm.report(e);
+                        }
+                    }
+                }
+                WebViewEvent::ActivityChanged { active, reason } => {
+                    // Native-only activity (audio, popups). Pages cannot
+                    // produce this event — it never comes from the page
+                    // message channel — so it needs no origin check. It is
+                    // mapped onto the message callback with the reserved
+                    // origin "native://cef" and the same
+                    // {polyscale:"native-activity",...} body as before, so
+                    // existing Luau consumers (e.g. polyscale's app.luau,
+                    // which checks `origin == "native://cef"`) keep working
+                    // unchanged. Page messages can no longer carry that
+                    // origin: theirs is the browser-computed security origin
+                    // ("null" or scheme://authority), which never equals
+                    // "native://cef" for a real document origin.
+                    if let Some(f) = &message {
+                        let body = serde_json::json!({
+                            "polyscale": "native-activity",
+                            "reason": reason,
+                            "active": active,
+                        })
+                        .to_string();
+                        let value = crate::node::json_value(&body);
+                        if let Err(e) = vm.call::<()>(f, (value, "native://cef", true)) {
                             vm.report(e);
                         }
                     }

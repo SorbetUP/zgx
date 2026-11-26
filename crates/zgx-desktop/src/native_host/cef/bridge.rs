@@ -50,8 +50,14 @@ struct RendererBrowserConfig {
     scripts: Vec<(String, bool)>,
 }
 
+/// Renderer-internal map of (browser id, frame id) to the security origin the
+/// browser computed for that frame's current document. Captured from
+/// `globalThis.origin` at context creation (see `on_context_created`); the
+/// page cannot forge it, and it is never derived from the frame's URL.
+type FrameOrigins = Arc<Mutex<HashMap<(i32, String), String>>>;
+
 wrap_v8_handler! {
-    struct PostMessageHandler { frame: Frame }
+    struct PostMessageHandler { frame: Frame, browser_id: i32, frame_origins: FrameOrigins }
     impl V8Handler {
         fn execute(
             &self,
@@ -80,6 +86,21 @@ wrap_v8_handler! {
                 bridge_trace("v8-execute reject=body");
                 return 1;
             }
+            // SECURITY: attach the browser-computed security origin of this
+            // frame's document as a second argument. It comes from the
+            // renderer-internal map (captured from `globalThis.origin` when
+            // the context was created), so the page cannot forge it. A missing
+            // entry fails safe to "null" (opaque origin = untrusted): e.g. a
+            // sandboxed iframe with an http(s) URL must NOT be attributed that
+            // http origin.
+            let frame_id = CefString::from(&self.frame.identifier()).to_string();
+            let origin = self
+                .frame_origins
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .get(&(self.browser_id, frame_id))
+                .cloned()
+                .unwrap_or_else(|| "null".to_owned());
             let name: CefString = MESSAGE_NAME.into();
             let Some(mut message) = process_message_create(Some(&name)) else {
                 bridge_trace("v8-execute reject=create-message");
@@ -89,13 +110,18 @@ wrap_v8_handler! {
                 bridge_trace("v8-execute reject=arg-list");
                 return 1;
             };
-            if arguments.set_size(1) == 0 {
+            if arguments.set_size(2) == 0 {
                 bridge_trace("v8-execute reject=set-size");
                 return 1;
             }
             let body: CefString = body.as_str().into();
             if arguments.set_string(0, Some(&body)) == 0 {
                 bridge_trace("v8-execute reject=set-string");
+                return 1;
+            }
+            let origin: CefString = origin.as_str().into();
+            if arguments.set_string(1, Some(&origin)) == 0 {
+                bridge_trace("v8-execute reject=set-origin");
                 return 1;
             }
             self.frame
@@ -107,7 +133,7 @@ wrap_v8_handler! {
 }
 
 wrap_render_process_handler! {
-    struct CEFRenderProcessHandler { browser_configs: Arc<Mutex<HashMap<i32, RendererBrowserConfig>>> }
+    struct CEFRenderProcessHandler { browser_configs: Arc<Mutex<HashMap<i32, RendererBrowserConfig>>>, frame_origins: FrameOrigins }
     impl RenderProcessHandler {
         fn on_browser_created(
             &self,
@@ -145,10 +171,15 @@ wrap_render_process_handler! {
 
         fn on_browser_destroyed(&self, browser: Option<&mut Browser>) {
             let Some(browser) = browser else { return };
+            let browser_id = browser.identifier();
             self.browser_configs
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner())
-                .remove(&browser.identifier());
+                .remove(&browser_id);
+            self.frame_origins
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .retain(|(id, _), _| *id != browser_id);
         }
 
         fn on_context_created(
@@ -162,7 +193,48 @@ wrap_render_process_handler! {
                 return;
             };
             let browser_id = browser.identifier();
+            let frame_id = CefString::from(&frame.identifier()).to_string();
             let main_frame = frame.is_main() != 0;
+            // SECURITY: capture the security origin of this frame's document
+            // as computed by the browser itself. `globalThis.origin` is the
+            // serialized origin of the document's origin — unforgeable from
+            // page JS — and is "null" for opaque origins (sandboxed iframes,
+            // data:/about: documents). This is deliberately NOT derived from
+            // frame.url(): about:srcdoc/about:blank inherit the parent origin,
+            // a sandboxed iframe has an opaque origin even with an http(s)
+            // URL, and blob: carries its creator's origin. The value is stored
+            // renderer-side and attached to page messages by
+            // PostMessageHandler, so the page cannot claim another origin.
+            if context.enter() != 0 {
+                let code: CefString = "String(globalThis.origin)".into();
+                let code_url: CefString = "zgx://bridge/origin".into();
+                let mut result = None;
+                let mut exception = None;
+                context.eval(
+                    Some(&code),
+                    Some(&code_url),
+                    1,
+                    Some(&mut result),
+                    Some(&mut exception),
+                );
+                context.exit();
+                let origin = result
+                    .as_ref()
+                    .filter(|value| value.is_string() != 0)
+                    .map(|value| CefString::from(&value.string_value()).to_string())
+                    .filter(|origin| super::client::is_valid_security_origin(origin))
+                    .unwrap_or_else(|| "null".to_owned());
+                self.frame_origins
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .insert((browser_id, frame_id.clone()), origin.clone());
+                bridge_trace(&format!(
+                    "on-context-created origin id={browser_id} frame={frame_id} main={main_frame} opaque={}",
+                    origin == "null"
+                ));
+            } else {
+                bridge_trace(&format!("on-context-created origin-enter-failed id={browser_id} frame={frame_id}"));
+            }
             let Some(config) = self
                 .browser_configs
                 .lock()
@@ -183,7 +255,8 @@ wrap_render_process_handler! {
                     bridge_trace("on-context-created no-global");
                     return;
                 };
-                let mut handler = PostMessageHandler::new(frame.clone());
+                let mut handler =
+                    PostMessageHandler::new(frame.clone(), browser_id, self.frame_origins.clone());
                 let native_name: CefString = "__zgxNativePostMessage".into();
                 let mut native = match v8_value_create_function(Some(&native_name), Some(&mut handler)) {
                     Some(native) => native,
@@ -255,11 +328,31 @@ wrap_render_process_handler! {
                 }
             }
         }
+
+        fn on_context_released(
+            &self,
+            browser: Option<&mut Browser>,
+            frame: Option<&mut Frame>,
+            _context: Option<&mut V8Context>,
+        ) {
+            // Contexts are per document: drop the origin entry with the
+            // context so a stale origin is never attached to a later document
+            // in the same frame.
+            let (Some(browser), Some(frame)) = (browser, frame) else { return };
+            let frame_id = CefString::from(&frame.identifier()).to_string();
+            self.frame_origins
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .remove(&(browser.identifier(), frame_id));
+        }
     }
 }
 
 pub(super) fn render_process_handler() -> RenderProcessHandler {
-    CEFRenderProcessHandler::new(Arc::new(Mutex::new(HashMap::new())))
+    CEFRenderProcessHandler::new(
+        Arc::new(Mutex::new(HashMap::new())),
+        Arc::new(Mutex::new(HashMap::new())),
+    )
 }
 
 pub(super) fn extra_info(options: &zgx::web_view::WebViewOptions) -> Option<DictionaryValue> {

@@ -316,7 +316,10 @@ pub struct WebViewOptions {
     /// The user agent string pages see; `None` keeps the platform's.
     pub user_agent: Option<String>,
     /// Pages may post to the app: `window.webkit.messageHandlers.zgx
-    /// .postMessage(value)` arrives as [`WebViewEvent::Message`] (JSON).
+    /// .postMessage(value)` arrives as [`WebViewEvent::Message`] (JSON) with
+    /// the browser-computed security origin of the sending frame (`"null"`
+    /// for opaque origins such as sandboxed iframes — never trust those for
+    /// privileged operations).
     pub messages: bool,
     /// Pages may open windows (`window.open`, target=_blank). Requests arrive
     /// as [`WebViewEvent::NewWindowRequested`]; the CEF backend presents a
@@ -438,11 +441,26 @@ pub enum WebViewEvent {
     Message {
         /// The message, as JSON.
         body: String,
-        /// The sending frame's origin: `https://example.com`,
-        /// `myapp://settings` (a port only when it is not the scheme's own).
+        /// The sending frame's security origin as computed by the browser
+        /// (never by parsing the frame's URL): `https://example.com`,
+        /// `myapp://settings` (a port only when it is not the scheme's own),
+        /// or `"null"` for an opaque origin — a sandboxed iframe, a
+        /// `data:`/`about:` document, a `blob:` URL's creator-less case.
+        /// SECURITY: a message whose origin is `"null"` must never trigger
+        /// privileged native operations; treat it as untrusted.
         origin: String,
         /// Sent by the top frame, not an iframe.
         main_frame: bool,
+    },
+    /// A native-only activity state changed: audio started/stopped, a popup
+    /// window opened/closed. Unlike [`WebViewEvent::Message`] this never
+    /// originates from page content (the page message channel cannot produce
+    /// it), so it carries no origin and needs no origin check.
+    ActivityChanged {
+        /// Whether the activity is now active.
+        active: bool,
+        /// What changed: `"native-audio"`, `"popup:<id>"`, ...
+        reason: String,
     },
     /// A page asked to open a window (see [`WebViewOptions::new_windows`]).
     /// CEF also opens this as a linked child browser when enabled.

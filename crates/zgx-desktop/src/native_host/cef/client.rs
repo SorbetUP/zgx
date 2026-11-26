@@ -238,16 +238,11 @@ pub(super) fn emit_native_activity(web: &zgx::web_view::WeakWebView, reason: Str
     let web = web.clone();
     zgx::native_view::post(move || {
         if let Some(web) = web.upgrade() {
-            web.emit(zgx::web_view::WebViewEvent::Message {
-                body: serde_json::json!({
-                    "polyscale": "native-activity",
-                    "reason": reason,
-                    "active": active,
-                })
-                .to_string(),
-                origin: "native://cef".into(),
-                main_frame: true,
-            });
+            // Typed native-only event instead of a fake-origin Message: this
+            // never comes from the page message channel, so the page cannot
+            // forge it. zgx-script maps it onto the Luau `on_message` callback
+            // with the reserved "native://cef" origin for compatibility.
+            web.emit(zgx::web_view::WebViewEvent::ActivityChanged { active, reason });
         }
     });
 }
@@ -1242,15 +1237,30 @@ pub(super) struct CEFClient { render: RenderHandler, life: LifeSpanHandler, load
                 return 0;
             }
             let Some(arguments) = message.argument_list() else { return 1 };
-            if arguments.size() != 1 {
+            // The renderer sends [body, security-origin]: the origin is
+            // captured from the browser-computed `globalThis.origin` of the
+            // sending frame's document and stored renderer-side, so the page
+            // cannot forge it.
+            if arguments.size() != 2 {
+                super::bridge::bridge_trace("browser-process-message reject=arg-count");
                 return 1;
             }
             let body = CefString::from(&arguments.string(0)).to_string();
             if body.len() > 1_048_576 || serde_json::from_str::<serde_json::Value>(&body).is_err() {
                 return 1;
             }
-            let url = CefString::from(&frame.url()).to_string();
-            let Some(origin) = origin_from_url(&url) else { return 1 };
+            let origin = CefString::from(&arguments.string(1)).to_string();
+            if !is_valid_security_origin(&origin) {
+                super::bridge::bridge_trace("browser-process-message reject=origin");
+                return 1;
+            }
+            // SECURITY: never derive a message's origin from frame.url().
+            // about:srcdoc/about:blank inherit the parent origin, a sandboxed
+            // iframe has an opaque origin even with an http(s) URL, and
+            // blob: carries its creator's origin — url parsing gets all three
+            // wrong and would let a sandboxed iframe pose as a trusted http
+            // origin. An origin of "null" here means an opaque origin: such
+            // messages must never trigger privileged native operations.
             let main_frame = frame.is_main() != 0;
             let web = self.web.clone();
             zgx::native_view::post(move || {
@@ -1344,6 +1354,35 @@ pub(super) struct PopupPending {
     pub(super) window: crate::WindowHandle,
 }
 
+/// A security origin exactly as the browser serializes one: either the
+/// opaque origin `"null"`, or `scheme://authority` (scheme starts with an
+/// ASCII letter, then letters/digits/`+`/`-`/`.`; authority non-empty and
+/// containing no path/query/fragment/userinfo). Used to validate the origin
+/// the renderer attaches to page messages — anything else is rejected.
+pub(super) fn is_valid_security_origin(origin: &str) -> bool {
+    if origin == "null" {
+        return true;
+    }
+    let Some((scheme, authority)) = origin.split_once("://") else {
+        return false;
+    };
+    let mut bytes = scheme.bytes();
+    if !bytes.next().is_some_and(|byte| byte.is_ascii_alphabetic()) {
+        return false;
+    }
+    if !bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.')) {
+        return false;
+    }
+    !authority.is_empty() && !authority.contains(['/', '?', '#', '@'])
+}
+
+/// Derives an origin-looking string from a URL. SECURITY: do NOT use this for
+/// page-message origins — it cannot express opaque origins correctly
+/// (about:srcdoc/about:blank inherit the parent, sandboxed iframes are opaque
+/// despite http(s) URLs, blob: has the creator's origin). Page messages carry
+/// the browser-computed origin instead (see `on_process_message_received`).
+/// This remains only for CEF-supplied security origins (permission requests)
+/// and visited-site bookkeeping, where CEF already hands us the real thing.
 pub(super) fn origin_from_url(url: &str) -> Option<String> {
     if url.starts_with("data:") || url.starts_with("about:blank") || url.starts_with("about:srcdoc")
     {
@@ -1544,7 +1583,7 @@ mod tests {
     }
 
     #[test]
-    fn frame_origin_is_derived_from_native_frame_url() {
+    fn origin_from_url_is_only_for_cef_supplied_origins() {
         assert_eq!(
             super::origin_from_url("HTTPS://Example.COM:443/path?q=1"),
             Some("https://example.com".into())
@@ -1566,6 +1605,31 @@ mod tests {
             Some("null".into())
         );
         assert_eq!(super::origin_from_url("https:///missing-host"), None);
+    }
+
+    #[test]
+    fn security_origins_are_null_or_scheme_authority() {
+        use super::is_valid_security_origin;
+        // Opaque origins (sandboxed iframes, data:/about: documents).
+        assert!(is_valid_security_origin("null"));
+        assert!(is_valid_security_origin("https://example.com"));
+        assert!(is_valid_security_origin("http://127.0.0.1:4312"));
+        assert!(is_valid_security_origin("http://[::1]:8080"));
+        assert!(is_valid_security_origin("myapp://settings"));
+        assert!(is_valid_security_origin("chrome-extension://abc123"));
+        // Not origins: URLs with paths/userinfo, bare hosts, junk.
+        assert!(!is_valid_security_origin("https://example.com/path"));
+        assert!(!is_valid_security_origin("https://user@example.com"));
+        assert!(!is_valid_security_origin("https://example.com?q=1"));
+        assert!(!is_valid_security_origin("example.com"));
+        assert!(!is_valid_security_origin("https://"));
+        assert!(!is_valid_security_origin("1https://example.com"));
+        assert!(!is_valid_security_origin("javascript:alert(1)"));
+        assert!(!is_valid_security_origin(""));
+        // Well-formed scheme://authority — the string shape alone proves
+        // nothing; trust comes from the renderer-side origin map, which the
+        // page cannot write to.
+        assert!(is_valid_security_origin("native://cef"));
     }
 
     #[test]
