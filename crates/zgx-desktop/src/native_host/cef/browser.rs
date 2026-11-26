@@ -709,6 +709,7 @@ pub(super) fn backend(
         Rc::new(move || invalidator.invalidate()),
         callbacks,
         web.downgrade(),
+        None,
         profile.clone(),
         permissions,
         dialogs,
@@ -773,6 +774,19 @@ pub(super) fn prepare_popup(
     pending_popups: Rc<RefCell<HashMap<i32, client::PopupPending>>>,
 ) -> Option<PreparedPopup> {
     runtime::ensure_accepting_browsers().ok()?;
+    // The popup gets its own controller — same reactive runtime as the opener,
+    // options copied from it — so its title, URL, messages and evaluations
+    // never touch the parent's state. The runtime keeps the strong reference
+    // (the Page only holds a weak one, avoiding a reference cycle) until the
+    // child browser closes.
+    let child = web
+        .upgrade()
+        .map(|parent| parent.new_related(parent.options().clone()));
+    if let Some(child) = &child {
+        runtime::retain_child_web(creation_id, child.clone());
+    }
+    let child_weak = child.as_ref().map(|child| child.downgrade());
+    let page_web = child_weak.clone().unwrap_or_else(|| web.clone());
     let frame = Arc::new(Mutex::default());
     let popup = Arc::new(Mutex::default());
     let size = Arc::new(Mutex::new((800, 640)));
@@ -786,7 +800,7 @@ pub(super) fn prepare_popup(
         browser.clone(),
     ));
     let page = Rc::new(Page {
-        web: web.clone(),
+        web: page_web.clone(),
         creation_id: Cell::new(Some(creation_id)),
         permissions: permissions.clone(),
         browser: browser.clone(),
@@ -826,6 +840,8 @@ pub(super) fn prepare_popup(
     let popup_closed = web.clone();
     let closed_handle = handle_slot.clone();
     let created_map = pending_popups.clone();
+    let created_child = child_weak.clone();
+    let closed_creation = creation_id;
     let diagnostic_url = popup_url;
     let callbacks = BrowserCallbacks {
         find_replies: page.find_replies.clone(),
@@ -873,6 +889,11 @@ pub(super) fn prepare_popup(
                 return;
             }
             page.lifecycle.set(BrowserLifecycle::Ready);
+            // Attach the child controller to the browser CEF just made, so
+            // commands and events route to it instead of the parent.
+            if let Some(child) = created_child.as_ref().and_then(|weak| weak.upgrade()) {
+                child.attach(Rc::new(CefWebView(page.clone())));
+            }
             client::emit_native_activity(
                 &popup_opened,
                 format!("popup:{}", browser.identifier()),
@@ -893,6 +914,7 @@ pub(super) fn prepare_popup(
         before_close: Rc::new(move |identifier| {
             client::trace_popup_fixture(&format!("CEF_POPUP_CLOSED:{identifier}"));
             client::emit_native_activity(&popup_closed, format!("popup:{identifier}"), false);
+            runtime::release_child_web(closed_creation);
             runtime::browser_closed(identifier);
             if let Some(page) = closed_page.upgrade() {
                 page.lifecycle.set(BrowserLifecycle::Closed);
@@ -922,7 +944,8 @@ pub(super) fn prepare_popup(
         page.scale.clone(),
         Rc::new(move || invalidator.invalidate()),
         callbacks,
-        web,
+        page_web,
+        Some(web),
         profile,
         permissions,
         dialogs,

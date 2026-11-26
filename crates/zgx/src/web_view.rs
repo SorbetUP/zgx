@@ -610,6 +610,7 @@ type DownloadHandler = Rc<dyn Fn(DownloadRequest, DownloadResponder)>;
 struct Inner {
     id: u64,
     options: WebViewOptions,
+    runtime: Runtime,
     state: Signal<WebViewState>,
     /// The pointer over the page, in points from its top left.
     pointer: Signal<Option<(f32, f32)>>,
@@ -694,17 +695,32 @@ impl WebView {
     /// A controller for a page made with `options`. Commands queue until a
     /// platform page attaches (`attach`).
     pub fn new(runtime: &Runtime, options: WebViewOptions) -> Self {
+        Self::make(runtime.clone(), options)
+    }
+    /// A related controller — a child window of this one, made with its own
+    /// `options` but this controller's reactive runtime. It gets no platform
+    /// page of its own until one is attached (`attach`): the CEF backend uses
+    /// this for popup browsers, so the child's events and state never touch
+    /// the parent's.
+    pub fn new_related(&self, options: WebViewOptions) -> Self {
+        Self::make(self.0.runtime.clone(), options)
+    }
+    fn make(runtime: Runtime, options: WebViewOptions) -> Self {
         let id = NEXT_ID.with(|next| {
             let id = next.get() + 1;
             next.set(id);
             id
         });
+        let state = runtime.signal(WebViewState::default());
+        let pointer = runtime.signal(None);
+        let attached = runtime.signal(false);
         Self(Rc::new(Inner {
             id,
             options,
-            state: runtime.signal(WebViewState::default()),
-            pointer: runtime.signal(None),
-            attached: runtime.signal(false),
+            runtime,
+            state,
+            pointer,
+            attached,
             backend: RefCell::new(None),
             closed: Cell::new(false),
             queued: RefCell::new(Vec::new()),
@@ -1003,6 +1019,11 @@ impl WebView {
         handler: impl Fn(DownloadRequest, DownloadResponder) + 'static,
     ) {
         *self.0.downloads.borrow_mut() = Some(Rc::new(handler));
+    }
+    /// Whether a download handler is set (a popup's child controller relays
+    /// its downloads to the window that opened it when it has none of its own).
+    pub fn has_download_handler(&self) -> bool {
+        self.0.downloads.borrow().is_some()
     }
     /// A download the page started, for the app's handler (for hosts):
     /// cancelled at once without one.

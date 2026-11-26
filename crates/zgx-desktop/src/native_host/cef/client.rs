@@ -52,6 +52,9 @@ pub(super) struct BrowserCallbacks {
 wrap_download_handler! {
     pub(super) struct CEFDownloadHandler {
         web: zgx::web_view::WeakWebView,
+        // The window that opened this one (popups): a child page with no
+        // download handler of its own relays to it, keeping provenance.
+        owner: Option<zgx::web_view::WeakWebView>,
         statuses: Rc<RefCell<HashMap<u32, zgx::web_view::DownloadStatusFn>>>,
         cancel_paths: Rc<RefCell<HashMap<u32, std::path::PathBuf>>>,
     }
@@ -82,7 +85,17 @@ wrap_download_handler! {
                 .map(ToString::to_string)
                 .filter(|name| !name.is_empty())
                 .unwrap_or_else(|| CefString::from(&item.suggested_file_name()).to_string());
-            let Some(web) = self.web.upgrade() else {
+            let web = self.web.upgrade().filter(|web| web.has_download_handler());
+            // A popup child has no handler of its own (nothing mounts it);
+            // relay the download to the window that opened it so the person
+            // still decides where the file goes.
+            let web = web.or_else(|| {
+                self.owner
+                    .as_ref()
+                    .and_then(|owner| owner.upgrade())
+                    .filter(|owner| owner.has_download_handler())
+            });
+            let Some(web) = web else {
                 // CEF 156's BeforeDownloadCallback has no cancel method and an
                 // empty path means its default temp directory. Give the
                 // download a private, disposable path and cancel it from the
@@ -347,6 +360,7 @@ wrap_life_span_handler! {
         fn on_before_popup_aborted(&self, _browser: Option<&mut Browser>, popup_id: i32) {
             if let Some(pending) = self.pending_popups.borrow_mut().remove(&popup_id) {
                 runtime::browser_creation_failed(pending.creation_id);
+                runtime::release_child_web(pending.creation_id);
                 pending.window.close();
             }
         }
@@ -1139,6 +1153,7 @@ pub(super) fn client(
     invalidate: Rc<dyn Fn()>,
     callbacks: BrowserCallbacks,
     web: zgx::web_view::WeakWebView,
+    download_owner: Option<zgx::web_view::WeakWebView>,
     profile: String,
     store: PermissionStoreHandle,
     dialogs: crate::FileDialogs,
@@ -1170,6 +1185,7 @@ pub(super) fn client(
     let display = CEFDisplayHandler::new(web.clone());
     let download = CEFDownloadHandler::new(
         web.clone(),
+        download_owner,
         Rc::new(RefCell::new(HashMap::new())),
         Rc::new(RefCell::new(HashMap::new())),
     );

@@ -24,6 +24,15 @@ struct BrowserTracker {
     open_ids: HashSet<i32>,
 }
 
+// Strong controllers for popup child pages, keyed by creation ID. The popup's
+// Page only holds a weak reference (no reference cycle), so the child
+// controller lives here until its browser closes. WebView is !Send: the CEF
+// callbacks that touch it all run on the UI thread.
+thread_local! {
+    static CHILD_WEBS: std::cell::RefCell<HashMap<u64, zgx::web_view::WebView>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
 static BROWSERS: OnceLock<Mutex<BrowserTracker>> = OnceLock::new();
 #[cfg(debug_assertions)]
 static CLOSE_RACE_DIAGNOSTIC_LOCK: Mutex<()> = Mutex::new(());
@@ -695,7 +704,20 @@ pub(super) fn browser_creation_started() -> u64 {
     id
 }
 
+/// Keeps a popup's child controller alive until the child browser closes.
+pub(super) fn retain_child_web(creation_id: u64, web: zgx::web_view::WebView) {
+    CHILD_WEBS.with(|webs| webs.borrow_mut().insert(creation_id, web));
+}
+
+/// Drops a popup's child controller (creation aborted or browser closed).
+pub(super) fn release_child_web(creation_id: u64) {
+    CHILD_WEBS.with(|webs| {
+        webs.borrow_mut().remove(&creation_id);
+    });
+}
+
 pub(super) fn browser_creation_failed(creation_id: u64) -> bool {
+    release_child_web(creation_id);
     let mut tracker = browsers()
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());

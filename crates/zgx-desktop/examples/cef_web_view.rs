@@ -1237,7 +1237,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let timeout_web = web.clone();
                 let diagnostics = result.clone();
                 let callback_result = result.clone();
+                // The popup child has its own controller: none of its events
+                // may reach the parent's listeners.
+                let leaked = Arc::new(AtomicBool::new(false));
+                let leaked_in_callback = leaked.clone();
                 let subscription = web.on_event(move |event| {
+                    match &event {
+                        zgx::web_view::WebViewEvent::TitleChanged { title }
+                            if title == "popup child" =>
+                        {
+                            leaked.store(true, Ordering::Release);
+                        }
+                        zgx::web_view::WebViewEvent::UrlChanged { url }
+                        | zgx::web_view::WebViewEvent::NavigationStarted { url }
+                        | zgx::web_view::WebViewEvent::NavigationCommitted { url }
+                        | zgx::web_view::WebViewEvent::NavigationFinished { url }
+                            if url.contains("/popup-child") =>
+                        {
+                            leaked.store(true, Ordering::Release);
+                        }
+                        _ => {}
+                    }
                     if let zgx::web_view::WebViewEvent::NewWindowRequested { url } = &event {
                         let _ = fs::OpenOptions::new()
                             .create(true)
@@ -1269,7 +1289,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         return;
                     }
                     if !callback_done.swap(true, Ordering::AcqRel) {
-                        let result = if message["ok"] == true {
+                        let result = if leaked_in_callback.load(Ordering::Acquire) {
+                            "FAIL:popup-events-leaked-into-parent".to_owned()
+                        } else if message["ok"] == true {
                             "PASS".to_owned()
                         } else {
                             format!("FAIL:popup-message:{message}")
