@@ -939,6 +939,51 @@ wrap_permission_handler! {
             let profile = self.profile.clone();
             let store = self.store.clone();
             let dialogs = self.dialogs.clone();
+            // Also list the request in the programmatic directory, so an
+            // embedding app can see it and answer it without a dialog.
+            {
+                let dir_pending = pending.clone();
+                let dir_pending_settle = pending.clone();
+                let dir_key = key;
+                let dir_browser = browser_id;
+                let dir_store = store.clone();
+                let dir_origin = origin.clone();
+                let dir_permissions: Vec<String> = requests
+                    .iter()
+                    .map(|(_, permission, _)| permission.to_string())
+                    .collect();
+                let dir_permission = dir_permissions.join(", ");
+                let dir_flags: u32 = requests.iter().fold(0, |mask, (flag, _, _)| mask | flag);
+                super::permissions::register_pending(
+                    super::permissions::PendingPromptInfo {
+                        id: 0,
+                        kind: "media".into(),
+                        origin: origin.clone(),
+                        permission: dir_permission,
+                        browser_id,
+                    },
+                    move || is_registered_pending(&dir_pending, dir_key),
+                    move |allow| {
+                        if !browser_still_open(dir_browser) {
+                            return false;
+                        }
+                        let Some(PendingPermission::Media(callback)) =
+                            take_settled(&dir_pending_settle, dir_key)
+                        else {
+                            return false;
+                        };
+                        for permission in &dir_permissions {
+                            remember_decision(&dir_store, &dir_origin, permission, allow);
+                        }
+                        if allow {
+                            callback.cont(dir_flags);
+                        } else {
+                            callback.cancel();
+                        }
+                        true
+                    },
+                );
+            }
             self.tasks.spawn(async move {
                 let mut granted = 0;
                 let mut denied = false;
@@ -1044,6 +1089,50 @@ wrap_permission_handler! {
             let profile = self.profile.clone();
             let store = self.store.clone();
             let dialogs = self.dialogs.clone();
+            // Also list the prompt in the programmatic directory, so an
+            // embedding app can see it and answer it without a dialog.
+            {
+                let dir_pending = pending.clone();
+                let dir_pending_settle = pending.clone();
+                let dir_key = key;
+                let dir_browser = browser_id;
+                let dir_store = store.clone();
+                let dir_origin = origin.clone();
+                let dir_permissions: Vec<String> = requests
+                    .iter()
+                    .map(|(_, permission, _)| permission.to_string())
+                    .collect();
+                let dir_permission = dir_permissions.join(", ");
+                super::permissions::register_pending(
+                    super::permissions::PendingPromptInfo {
+                        id: 0,
+                        kind: "prompt".into(),
+                        origin: origin.clone(),
+                        permission: dir_permission,
+                        browser_id,
+                    },
+                    move || is_registered_pending(&dir_pending, dir_key),
+                    move |allow| {
+                        if !browser_still_open(dir_browser) {
+                            return false;
+                        }
+                        let Some(PendingPermission::Prompt(callback)) =
+                            take_settled(&dir_pending_settle, dir_key)
+                        else {
+                            return false;
+                        };
+                        for permission in &dir_permissions {
+                            remember_decision(&dir_store, &dir_origin, permission, allow);
+                        }
+                        callback.cont(if allow {
+                            PermissionRequestResult::ACCEPT
+                        } else {
+                            PermissionRequestResult::DENY
+                        });
+                        true
+                    },
+                );
+            }
             self.tasks.spawn(async move {
                 let mut accepted = true;
                 for (_, permission, label) in requests {
@@ -1109,10 +1198,12 @@ wrap_permission_handler! {
     }
 }
 
-/// Asks the store (or the user, via a dialog) for a permission decision
-/// WITHOUT persisting it. Persistence happens only at decision time, when
-/// the request is known to still be valid. Returns None when the dialog was
-/// dismissed or cancelled — no decision, so nothing may be remembered.
+/// Asks the auto-decision policy (or the store, or the user via a dialog)
+/// for a permission decision WITHOUT persisting it. Persistence happens only
+/// at decision time, when the request is known to still be valid. Returns
+/// None when the dialog was dismissed or cancelled — no decision, so nothing
+/// may be remembered. A programmatic auto-decision wins over the persisted
+/// store, so automation gets a deterministic answer.
 async fn ask_permission(
     profile: &str,
     store: &PermissionStoreHandle,
@@ -1121,6 +1212,9 @@ async fn ask_permission(
     permission: &str,
     label: &str,
 ) -> Option<bool> {
+    if let Some(decision) = super::permissions::auto_decision(origin, permission) {
+        return Some(decision);
+    }
     if let Some(decision) = store.borrow().decision(origin, permission) {
         return Some(decision);
     }

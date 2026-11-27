@@ -198,6 +198,11 @@ pub fn execute_cef_process_with_windows_context(
 }
 #[cfg(any(windows, test))]
 mod windows_caption;
+#[cfg(feature = "cef")]
+pub use native_host::cef::permissions::{
+    PendingPromptInfo, auto_decision, clear_auto_permissions, decide_pending, list_pending,
+    set_auto_permission,
+};
 #[cfg(target_os = "macos")]
 pub use native_host::{BackdropReport, NativeDiagnostics, NativeViewReport};
 pub use zgx::web_view::{WebProfile, WebView, WebViewEvent, WebViewOptions, WebViewState};

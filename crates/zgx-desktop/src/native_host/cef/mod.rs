@@ -1,6 +1,7 @@
 mod bridge;
 mod browser;
 mod client;
+pub(crate) mod permissions;
 mod rendering;
 mod runtime;
 
