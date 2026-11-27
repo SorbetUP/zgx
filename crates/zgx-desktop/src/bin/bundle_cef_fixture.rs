@@ -13,7 +13,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // after a previous fixture crash. That modal recovery prompt blocks the
     // offscreen event loop before the fixture can run. Keep each packaged test
     // app isolated from that persisted state; CEF data persistence is still
-    // controlled separately through POLYSCALE_CEF_DATA_DIR.
+    // controlled separately through ZGX_CEF_DATA_DIR.
     let bundle_id = std::env::var("ZGX_CEF_FIXTURE_BUNDLE_ID").unwrap_or_else(|_| {
         let run_id = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

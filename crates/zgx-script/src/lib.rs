@@ -5365,7 +5365,7 @@ mod tests {
         h.frames(2);
         assert!(h.find("page").is_none(), "the node went");
         web.emit(WebViewEvent::Message {
-            body: r#"{"polyscale":"page-activity"}"#.into(),
+            body: r#"{"zgx":"page-activity"}"#.into(),
             origin: "https://a.test".into(),
             main_frame: true,
         });

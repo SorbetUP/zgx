@@ -3036,8 +3036,8 @@ fn web_view_of(spec: &crate::node::WebSpec, vm: &Rc<Vm>, low: &Rc<Lowering>) -> 
                     // message channel — so it needs no origin check. It is
                     // mapped onto the message callback with the reserved
                     // origin "native://cef" and the same
-                    // {polyscale:"native-activity",...} body as before, so
-                    // existing Luau consumers (e.g. polyscale's app.luau,
+                    // {zgx:"native-activity",...} body as before, so
+                    // existing Luau consumers (e.g. the embedding app's Luau UI,
                     // which checks `origin == "native://cef"`) keep working
                     // unchanged. Page messages can no longer carry that
                     // origin: theirs is the browser-computed security origin
@@ -3045,7 +3045,7 @@ fn web_view_of(spec: &crate::node::WebSpec, vm: &Rc<Vm>, low: &Rc<Lowering>) -> 
                     // "native://cef" for a real document origin.
                     if let Some(f) = &message {
                         let body = serde_json::json!({
-                            "polyscale": "native-activity",
+                            "zgx": "native-activity",
                             "reason": reason,
                             "active": active,
                         })

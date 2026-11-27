@@ -246,7 +246,7 @@ fn continue_to_cancelled_path(
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |duration| duration.as_nanos());
     let path = std::env::temp_dir().join(format!(
-        "polyscale-cancelled-{}-{id}-{nonce}.part",
+        "zgx-cancelled-{}-{id}-{nonce}.part",
         std::process::id()
     ));
     cancel_paths.borrow_mut().insert(id, path.clone());

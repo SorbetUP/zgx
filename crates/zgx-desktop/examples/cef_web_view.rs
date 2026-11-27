@@ -324,8 +324,8 @@ fn run_evaluation_test(
         ("document.title", Ok("\"CEF event changed\"")),
         ("'result'", Ok("\"result\"")),
         (
-            "({name:'polyscale',value:42})",
-            Ok("{\"name\":\"polyscale\",\"value\":42}"),
+            "({name:'zgx',value:42})",
+            Ok("{\"name\":\"zgx\",\"value\":42}"),
         ),
         ("[1,2,3]", Ok("[1,2,3]")),
         ("undefined", Ok("null")),
@@ -548,13 +548,13 @@ fn start_fixture_server(
                         };
                         (
                             format!(
-                                "<!doctype html><meta charset=utf-8><title>site-data</title><script>localStorage.setItem('polyscale-site-data','present')</script>{frame}"
+                                "<!doctype html><meta charset=utf-8><title>site-data</title><script>localStorage.setItem('zgx-site-data','present')</script>{frame}"
                             ),
                             String::new(),
                         )
                     } else if path == "/site-data-frame" {
                         (
-                            "<!doctype html><meta charset=utf-8><title>site-data frame</title><script>localStorage.setItem('polyscale-site-data','present')</script>".to_owned(),
+                            "<!doctype html><meta charset=utf-8><title>site-data frame</title><script>localStorage.setItem('zgx-site-data','present')</script>".to_owned(),
                             String::new(),
                         )
                     } else if path == "/cookie-check-all" {
@@ -575,7 +575,7 @@ fn start_fixture_server(
                         (format!("fixture={fixture};domain={domain}"), String::new())
                     } else {
                         (
-                            "<!doctype html><meta charset=utf-8><title>verify</title><script>(async()=>{const c=await fetch('/cookie-check-all').then(r=>r.text());document.title='cookie:'+c+'|local:'+localStorage.getItem('polyscale-site-data');})()</script>".to_owned(),
+                            "<!doctype html><meta charset=utf-8><title>verify</title><script>(async()=>{const c=await fetch('/cookie-check-all').then(r=>r.text());document.title='cookie:'+c+'|local:'+localStorage.getItem('zgx-site-data');})()</script>".to_owned(),
                             String::new(),
                         )
                     };
@@ -717,7 +717,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // launches do not prompt for "Chromium Safe Storage" access. A data dir
     // set from outside is kept (and not removed on exit), so a "restart"
     // scenario can run two fixture processes over the same profile directory.
-    let external_data_dir = std::env::var_os("POLYSCALE_CEF_DATA_DIR");
+    let external_data_dir = std::env::var_os("ZGX_CEF_DATA_DIR");
     let fixture_data_dir = external_data_dir
         .clone()
         .map(std::path::PathBuf::from)
@@ -726,7 +726,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     unsafe {
         std::env::set_var("ZGX_CEF_TEST_FIXTURE", "1");
-        std::env::set_var("POLYSCALE_CEF_DATA_DIR", &fixture_data_dir);
+        std::env::set_var("ZGX_CEF_DATA_DIR", &fixture_data_dir);
     }
     if external_data_dir.is_some() {
         // Create it up front so the mock-keychain fixture check (which
@@ -770,7 +770,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::env::var_os("ZGX_CEF_SITE_DATA_RESULT").map(std::path::PathBuf::from);
     let site_data_test = site_data_result_path.is_some();
     // "record" and "verify" run the site-data fixture as two processes over
-    // the same POLYSCALE_CEF_DATA_DIR: a simulated restart that must still
+    // the same ZGX_CEF_DATA_DIR: a simulated restart that must still
     // let clear_site_data find the site's origins (and clear a
     // subdomain-style sibling origin) from the persisted registry.
     let site_data_phase = std::env::var("ZGX_CEF_SITE_DATA_PHASE").unwrap_or_default();
@@ -1551,7 +1551,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // its hosts — the sibling only through a subframe, which
                     // is what records its origin — then exit, leaving the
                     // profile's origin registry persisted in
-                    // POLYSCALE_CEF_DATA_DIR.
+                    // ZGX_CEF_DATA_DIR.
                     let result_path = site_data_result_path
                         .clone()
                         .expect("site-data test has a result path");
@@ -1604,7 +1604,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         zgx::timer::sleep(std::time::Duration::from_millis(300)).await;
                         // The registry persisted by the record process names
                         // both same-site origins.
-                        let registry_ok = std::env::var_os("POLYSCALE_CEF_DATA_DIR")
+                        let registry_ok = std::env::var_os("ZGX_CEF_DATA_DIR")
                             .map(std::path::PathBuf::from)
                             .and_then(|dir| {
                                 let component = format!(
@@ -1703,7 +1703,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let before_path = result_path.clone();
                     let before_window = window.clone();
                     site_web.evaluate_js(
-                        "(async()=>({local:localStorage.getItem('polyscale-site-data'),cookie:await fetch('/cookie-check').then(r=>r.text())}))()",
+                        "(async()=>({local:localStorage.getItem('zgx-site-data'),cookie:await fetch('/cookie-check').then(r=>r.text())}))()",
                         move |before| {
                             let _ = fs::OpenOptions::new()
                                 .create(true)
@@ -1733,7 +1733,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     return;
                                 }
                                 verify_web.evaluate_js(
-                                    "(async()=>({local:localStorage.getItem('polyscale-site-data'),cookie:await fetch('/cookie-check').then(r=>r.text())}))()",
+                                    "(async()=>({local:localStorage.getItem('zgx-site-data'),cookie:await fetch('/cookie-check').then(r=>r.text())}))()",
                                     move |after| {
                                         let _ = fs::OpenOptions::new()
                                             .create(true)

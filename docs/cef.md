@@ -1,6 +1,6 @@
 # CEF backend
 
-Polyscale's Chromium backend is an optional ZGX desktop feature (`cef`). It
+This Chromium backend is an optional ZGX desktop feature (`cef`). It
 uses CEF 156.7.0 with windowless `OnPaint` rendering and keeps wgpu 29. The
 CEF runtime, helper processes, resources, and sandbox files must be bundled
 beside the app using the platform-specific layout documented by
@@ -18,7 +18,7 @@ The `cef_web_view` fixture automatically enables CEF's mock keychain through
 the test-only `use-mock-keychain` switch and uses a per-run temporary data
 directory. It does not need access to the developer's login keychain, so its
 launch should not require entering the keychain password. This only applies to
-the fixture executable; production Polyscale does not set the switch.
+the fixture executable; a production app signed with a Developer ID does not set the switch (ad-hoc/unsigned builds use the mock keychain so they never prompt for the login-keychain password).
 
 To exercise closing a controller while its browser is still being created,
 set `ZGX_CEF_CLOSE_RACE_RESULT` to a result-file path before launching the

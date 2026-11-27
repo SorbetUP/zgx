@@ -37,6 +37,25 @@ static BROWSERS: OnceLock<Mutex<BrowserTracker>> = OnceLock::new();
 #[cfg(debug_assertions)]
 static CLOSE_RACE_DIAGNOSTIC_LOCK: Mutex<()> = Mutex::new(());
 
+/// Read a CEF tuning variable under its generic `ZGX_CEF_*` name, falling
+/// back to the legacy app-specific `POLYSCALE_CEF_*` name so existing
+/// deployments keep working across the rename. The fork stays generic: new
+/// code must only use the `ZGX_CEF_*` names.
+fn cef_env(new: &str, legacy: &str) -> Option<std::ffi::OsString> {
+    std::env::var_os(new).or_else(|| std::env::var_os(legacy))
+}
+
+/// The embedding app's name, derived from the executable (bundle executables
+/// are named after the app) instead of any hardcoded product name, so this
+/// backend stays app-agnostic and cheap to rebase onto upstream ZGX.
+fn app_name() -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.file_stem().map(|stem| stem.to_string_lossy().into_owned()))
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or_else(|| "app".into())
+}
+
 #[cfg(debug_assertions)]
 pub(super) fn trace_close_race_impl(message: &str) {
     let result = std::env::var_os("ZGX_CEF_STRESS_RESULT")
@@ -52,7 +71,7 @@ pub(super) fn trace_close_race_impl(message: &str) {
         path.file_stem()
             .map(|stem| stem.to_string_lossy().into_owned())
     });
-    let data_dir = std::env::var_os("POLYSCALE_CEF_DATA_DIR").map(PathBuf::from);
+    let data_dir = cef_env("ZGX_CEF_DATA_DIR", "POLYSCALE_CEF_DATA_DIR").map(PathBuf::from);
     if !close_race_trace_allowed(
         executable.as_deref(),
         data_dir.as_deref(),
@@ -93,7 +112,7 @@ pub(super) fn close_race_fixture_enabled() -> bool {
         path.file_stem()
             .map(|stem| stem.to_string_lossy().into_owned())
     });
-    let data_dir = std::env::var_os("POLYSCALE_CEF_DATA_DIR").map(PathBuf::from);
+    let data_dir = cef_env("ZGX_CEF_DATA_DIR", "POLYSCALE_CEF_DATA_DIR").map(PathBuf::from);
     close_race_trace_allowed(
         executable.as_deref(),
         data_dir.as_deref(),
@@ -385,7 +404,7 @@ pub(super) fn execute_helper_process() -> Result<Option<i32>, String> {
 }
 
 fn runtime_dir() -> Result<PathBuf, String> {
-    if let Some(path) = std::env::var_os("POLYSCALE_CEF_DIR") {
+    if let Some(path) = cef_env("ZGX_CEF_DIR", "POLYSCALE_CEF_DIR") {
         return Ok(PathBuf::from(path));
     }
     std::env::current_exe()
@@ -408,16 +427,11 @@ fn initialize_inner() -> Result<Runtime, String> {
     #[cfg(not(target_os = "windows"))]
     let args = Args::new();
     let root = runtime_dir()?;
-    let app_name = std::env::current_exe()
-        .ok()
-        .and_then(|path| {
-            path.file_stem()
-                .map(|stem| stem.to_string_lossy().into_owned())
-        })
-        .unwrap_or_else(|| "Polyscale".into());
+    let app_name = app_name();
     #[cfg(not(target_os = "windows"))]
-    let helper_name =
-        std::env::var("POLYSCALE_CEF_HELPER_APP").unwrap_or_else(|_| format!("{app_name} Helper"));
+    let helper_name = cef_env("ZGX_CEF_HELPER_APP", "POLYSCALE_CEF_HELPER_APP")
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_else(|| format!("{app_name} Helper"));
     #[cfg(target_os = "macos")]
     let framework = root.join("../Frameworks/Chromium Embedded Framework.framework");
     #[cfg(target_os = "macos")]
@@ -437,7 +451,7 @@ fn initialize_inner() -> Result<Runtime, String> {
     let cache_root = data_root()?;
     std::fs::create_dir_all(&cache_root)
         .map_err(|error| format!("cannot create CEF cache root: {error}"))?;
-    let log_file = std::env::var_os("POLYSCALE_CEF_LOG").map(PathBuf::from);
+    let log_file = cef_env("ZGX_CEF_LOG", "POLYSCALE_CEF_LOG").map(PathBuf::from);
     let settings = Settings {
         windowless_rendering_enabled: 1,
         external_message_pump: 1,
@@ -491,15 +505,15 @@ fn initialize_inner() -> Result<Runtime, String> {
 }
 
 fn use_mock_keychain() -> bool {
-    // Explicit override wins: POLYSCALE_CEF_KEYCHAIN=mock|system.
-    if let Some(mode) = std::env::var_os("POLYSCALE_CEF_KEYCHAIN") {
+    // Explicit override wins: ZGX_CEF_KEYCHAIN=mock|system (legacy POLYSCALE_CEF_KEYCHAIN still honored).
+    if let Some(mode) = cef_env("ZGX_CEF_KEYCHAIN", "POLYSCALE_CEF_KEYCHAIN") {
         return mode.to_string_lossy().eq_ignore_ascii_case("mock");
     }
     let executable = std::env::current_exe().ok().and_then(|path| {
         path.file_stem()
             .map(|stem| stem.to_string_lossy().into_owned())
     });
-    let data_dir = std::env::var_os("POLYSCALE_CEF_DATA_DIR").map(PathBuf::from);
+    let data_dir = cef_env("ZGX_CEF_DATA_DIR", "POLYSCALE_CEF_DATA_DIR").map(PathBuf::from);
     if mock_keychain_allowed(
         executable.as_deref(),
         data_dir.as_deref(),
@@ -673,25 +687,26 @@ pub(super) fn permission_store(
 }
 
 fn data_root() -> Result<PathBuf, String> {
-    if let Some(path) = std::env::var_os("POLYSCALE_CEF_DATA_DIR") {
+    if let Some(path) = cef_env("ZGX_CEF_DATA_DIR", "POLYSCALE_CEF_DATA_DIR") {
         return Ok(PathBuf::from(path));
     }
+    let app_dir = app_name();
     #[cfg(target_os = "macos")]
     let base = std::env::var_os("HOME")
         .map(PathBuf::from)
         .ok_or("HOME is not set")?
-        .join("Library/Application Support/Polyscale/Chromium");
+        .join(format!("Library/Application Support/{app_dir}/Chromium"));
     #[cfg(target_os = "windows")]
     let base = std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .ok_or("LOCALAPPDATA is not set")?
-        .join("Polyscale/Chromium");
+        .join(format!("{app_dir}/Chromium"));
     #[cfg(target_os = "linux")]
     let base = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")))
         .ok_or("no user data directory is set")?
-        .join("polyscale/chromium");
+        .join(format!("{}/chromium", app_dir.to_lowercase()));
     Ok(base)
 }
 
@@ -1418,7 +1433,7 @@ mod tests {
             true,
         ));
         assert!(!mock_keychain_allowed(
-            Some("Polyscale"),
+            Some("some_app"),
             Some(&profile),
             &temp_root,
             true,
@@ -1463,7 +1478,7 @@ mod tests {
             true,
         ));
         assert!(!close_race_trace_allowed(
-            Some("Polyscale"),
+            Some("some_app"),
             Some(&data_dir),
             Some(&output_dir),
             &temp_root,

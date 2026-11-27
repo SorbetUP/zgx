@@ -742,7 +742,7 @@ fn apply(page: &Page, browser: &Browser, command: WebViewCommand) {
                 spawn_evaluation_timeout(&page.tasks, page.evaluations.clone(), assigned);
             } else if let Some(frame) = browser.main_frame() {
                 let script: CefString = script.as_str().into();
-                let source: CefString = "polyscale://evaluate".into();
+                let source: CefString = "zgx://evaluate".into();
                 frame.execute_java_script(Some(&script), Some(&source), 1);
             }
         }
@@ -2382,8 +2382,8 @@ mod evaluation_tests {
                 r#""hello""#,
             ),
             (
-                r#"{"result":{"result":{"type":"object","value":{"name":"polyscale","value":42}}}}"#,
-                r#"{"name":"polyscale","value":42}"#,
+                r#"{"result":{"result":{"type":"object","value":{"name":"zgx","value":42}}}}"#,
+                r#"{"name":"zgx","value":42}"#,
             ),
             (r#"{"result":{"result":{"type":"undefined"}}}"#, "null"),
         ] {
