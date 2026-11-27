@@ -2933,6 +2933,14 @@ fn web_view_of(spec: &crate::node::WebSpec, vm: &Rc<Vm>, low: &Rc<Lowering>) -> 
         }
         (None, None) => web_view(&web),
     };
+    // A trackpad's swipe between pages over the view steps through the page's
+    // history, as in a browser: the view takes navigation gestures and goes
+    // back or forward on the shared controller.
+    let nav_web = web.clone();
+    let view = view.on_navigate(move |navigation| match navigation {
+        zgx::input::Navigation::Back => nav_web.go_back(),
+        zgx::input::Navigation::Forward => nav_web.go_forward(),
+    });
     // The page's downloads, the script's to save or not; none saved without
     // it (`WebView::set_download_handler`).
     let view = match spec.on_download.clone() {

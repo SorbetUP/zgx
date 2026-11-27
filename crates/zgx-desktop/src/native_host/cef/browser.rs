@@ -1789,6 +1789,21 @@ fn input(page: &Page, event: &mut zgx::input::EventContext) {
             if button == PointerButton::Primary {
                 page.pressed.set((!mouse_up).then_some((x, y)));
             }
+            // A mouse's back/forward buttons step through the page's history,
+            // as in a browser; the page never sees them as clicks.
+            if !mouse_up
+                && let Some(step) = back_forward_step(button)
+            {
+                page.note_navigation();
+                match step {
+                    WebViewCommand::GoBack => browser.go_back(),
+                    WebViewCommand::GoForward => browser.go_forward(),
+                    _ => {}
+                }
+                event.prevent_default();
+                event.stop_propagation();
+                return;
+            }
             let (button_type, button_id, cef_flag) = match button {
                 PointerButton::Primary => (
                     MouseButtonType::LEFT,
@@ -2103,6 +2118,18 @@ fn local_to_window(
         (shown_x + x * shown_width / device_width.max(0.001)) as f32,
         (shown_y + y * shown_height / device_height.max(0.001)) as f32,
     )
+}
+
+/// The history step a pointer button asks for, if any. zgx maps winit's
+/// `MouseButton::Back`/`Forward` to `Other(4)`/`Other(5)` on every platform
+/// (macOS button numbers 3/4, X11 buttons 8/9, Windows XBUTTON1/2), so those
+/// two numbers are the back/forward buttons everywhere.
+fn back_forward_step(button: PointerButton) -> Option<WebViewCommand> {
+    match button {
+        PointerButton::Other(4) => Some(WebViewCommand::GoBack),
+        PointerButton::Other(5) => Some(WebViewCommand::GoForward),
+        _ => None,
+    }
 }
 
 fn update_mouse_button_flags(current: u32, button: u32, pressed: bool) -> u32 {
@@ -2538,12 +2565,32 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        cef_key_code, cef_modifiers, cef_native_key_code, click_count, close_after_releasing_slot,
-        local_to_window, page_drag_fields, page_drag_fields_with_files, text_key_events,
-        utf16_offset, window_to_local,
+        back_forward_step, cef_key_code, cef_modifiers, cef_native_key_code, click_count,
+        close_after_releasing_slot, local_to_window, page_drag_fields, page_drag_fields_with_files,
+        text_key_events, utf16_offset, window_to_local,
     };
     use cef::KeyEventType;
-    use zgx::input::{DraggedText, Key, Modifiers};
+    use zgx::input::{DraggedText, Key, Modifiers, PointerButton};
+    use zgx::web_view::WebViewCommand;
+
+    #[test]
+    fn back_forward_mouse_buttons_step_through_history() {
+        // winit maps macOS buttonNumber 3/4, X11 8/9 and Windows XBUTTON1/2
+        // to MouseButton::Back/Forward, which zgx normalizes to Other(4)/Other(5).
+        assert!(matches!(
+            back_forward_step(PointerButton::Other(4)),
+            Some(WebViewCommand::GoBack)
+        ));
+        assert!(matches!(
+            back_forward_step(PointerButton::Other(5)),
+            Some(WebViewCommand::GoForward)
+        ));
+        assert!(back_forward_step(PointerButton::Primary).is_none());
+        assert!(back_forward_step(PointerButton::Secondary).is_none());
+        assert!(back_forward_step(PointerButton::Middle).is_none());
+        assert!(back_forward_step(PointerButton::Other(6)).is_none());
+        assert!(back_forward_step(PointerButton::Other(3)).is_none());
+    }
 
     #[test]
     fn browser_keys_map_to_chromium_virtual_keys() {

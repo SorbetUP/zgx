@@ -3957,6 +3957,33 @@ fn web_views_load_their_source_and_report_page_events() {
 }
 
 #[test]
+fn a_swipe_over_a_web_view_steps_through_its_history() {
+    use zgx::input::Navigation;
+    use zgx::native_view::NativeContent;
+    let mut h = Harness::inline(
+        r##"local web = ui.web { profile = "ephemeral" }
+        return ui.webview { id = "page", web = web, w = 200, h = 100 }"##,
+    );
+    h.frames(1);
+    let page = h.find("page").unwrap();
+    let Some(NativeContent::Web(web)) = h.natives.content(page) else {
+        panic!("no page")
+    };
+    let backend = Rc::new(Page(RefCell::new(Vec::new())));
+    web.attach(backend.clone());
+    let b = h.bounds("page");
+    let (x, y) = (b.x + b.width / 2., b.y + b.height / 2.);
+    // The web view takes navigation gestures: a swipe over it goes back or
+    // forward on the shared controller, without any script handler.
+    assert!(h.ui.input.navigate(&h.ui.scene, x, y, Navigation::Back));
+    assert!(h.ui.input.navigate(&h.ui.scene, x, y, Navigation::Forward));
+    assert_eq!(
+        *backend.0.borrow(),
+        vec!["GoBack".to_string(), "GoForward".to_string()]
+    );
+}
+
+#[test]
 fn longhand_properties_refine_their_shorthand_in_any_table_order() {
     // Lua tables have no order: `p = 0, px = 20` must pad the sides
     // whatever order the keys come out in, so vary the keys around them.
