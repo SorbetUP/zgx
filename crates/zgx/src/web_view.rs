@@ -396,6 +396,10 @@ pub struct WebViewState {
     /// over the screen; on Windows and Linux it fills the page's box, which
     /// an app grows (or makes its window full screen) to show it so.
     pub full_screen: bool,
+    /// The favicon URLs the browser discovered for the current page
+    /// (CEF `OnFaviconURLChange`), best candidate first. Empty until the
+    /// page declares one.
+    pub favicons: Vec<String>,
 }
 
 /// What happened in a page, as the platform reports it (see
@@ -467,6 +471,14 @@ pub enum WebViewEvent {
     NewWindowRequested {
         /// What it asked to open.
         url: String,
+    },
+    /// The browser discovered favicon URLs for the page (CEF
+    /// `OnFaviconURLChange`); the list is replaced wholesale, best
+    /// candidate first.
+    FaviconChanged {
+        /// The icon URLs, resolved by the browser (redirects and relative
+        /// paths already handled).
+        urls: Vec<String>,
     },
     /// The page's process ended (crashed or was killed); reload to recover.
     ProcessTerminated,

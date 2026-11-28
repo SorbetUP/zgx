@@ -1524,6 +1524,9 @@ declare extern type Web with
 	-- macOS in WebKit's window over the screen, elsewhere filling the page's
 	-- node, which an app grows to show it so.
 	full_screen: boolean
+	-- The favicon URLs the browser discovered for the current page (CEF
+	-- OnFaviconURLChange), best candidate first; empty until it declares one.
+	favicons: { string }
 	-- The pointer over the page, in points from its top left; nil outside.
 	-- (Over a page zgx hears no pointer moves: its nodes had their leave.)
 	pointer: { x: number, y: number }?
@@ -1581,7 +1584,9 @@ export type WebOptions = {
 export type WebEvent = { kind: "started" | "committed" | "finished" | "failed" | "changed", url: string }
 -- `web:subscribe`'s event: what happened in the page, as one table.
 export type WebControllerEvent = {
-	kind: "started" | "committed" | "finished" | "failed" | "changed" | "title" | "message" | "new_window" | "process_terminated",
+	kind: "started" | "committed" | "finished" | "failed" | "changed" | "title" | "message" | "new_window" | "process_terminated" | "favicon" | "activity",
+	-- "favicon" only: the icon URLs, best candidate first.
+	favicons: { string }?,
 	-- The navigation events ("started" … "changed") and "new_window": where.
 	url: string?,
 	-- "failed" only: why the navigation failed.

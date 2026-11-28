@@ -2895,6 +2895,14 @@ pub(crate) fn web_event_table(
             table.set("active", *active)?;
             table.set("reason", reason.as_str())?;
         }
+        WebViewEvent::FaviconChanged { urls } => {
+            table.set("kind", "favicon")?;
+            let list = lua.create_table()?;
+            for (i, url) in urls.iter().enumerate() {
+                list.set(i + 1, url.as_str())?;
+            }
+            table.set("favicons", list)?;
+        }
     }
     Ok(table)
 }

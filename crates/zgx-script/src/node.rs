@@ -295,6 +295,15 @@ impl UserData for WebUd {
         fields.add_field_method_get("full_screen", |_, w| {
             Ok(w.0.state().with(|state| state.full_screen))
         });
+        // The favicon URLs the browser discovered for the page, best first.
+        fields.add_field_method_get("favicons", |lua, w| {
+            let urls = w.0.state().with(|state| state.favicons.clone());
+            let list = lua.create_table()?;
+            for (i, url) in urls.iter().enumerate() {
+                list.set(i + 1, url.as_str())?;
+            }
+            Ok(list)
+        });
         // `{ x, y }` in points from the page's top left, or nil outside it.
         fields.add_field_method_get("pointer", |lua, w| {
             w.0.pointer()

@@ -768,6 +768,27 @@ wrap_display_handler! {
                 }
             });
         }
+
+        fn on_favicon_urlchange(
+            &self,
+            _browser: Option<&mut Browser>,
+            icon_urls: Option<&mut CefStringList>,
+        ) {
+            // Chromium resolved the icon URLs itself (redirects, relative
+            // paths): forward them as-is instead of re-fetching page HTML
+            // to scrape <link> tags. The list is borrowed from CEF: clone it
+            // (a no-op wrapper) and iterate, which copies each string before
+            // the callback returns.
+            let Some(list) = icon_urls else { return };
+            let urls: Vec<String> = list.clone().into_iter().collect();
+            let web = self.web.clone();
+            zgx::native_view::post(move || {
+                if let Some(web) = web.upgrade() {
+                    web.update_state(|state| state.favicons = urls.clone());
+                    web.emit(zgx::web_view::WebViewEvent::FaviconChanged { urls });
+                }
+            });
+        }
     }
 }
 
