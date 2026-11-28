@@ -2,15 +2,18 @@
 //!
 //! Two things an embedding app can drive from outside the CEF callbacks:
 //!
-//! * an **auto-decision policy**: `(origin, permission) -> allow`, consulted
-//!   before the persisted store and before any native dialog, so automation
-//!   (tests, kiosk, the control API) gets a deterministic answer with no
-//!   prompt on screen. Either side of the pair may be `"*"`.
+//! * an **auto-decision policy**: `(profile, origin, permission) -> allow`,
+//!   consulted before the persisted store and before any native dialog, so
+//!   automation (tests, kiosk, the control API) gets a deterministic answer
+//!   with no prompt on screen. Every decision is bound to a profile: there is
+//!   no cross-profile wildcard, so a rule set for one profile (typically an
+//!   isolated test profile) can never answer for another. Origin and
+//!   permission may be `"*"` within their profile.
 //! * a **directory of pending requests**: every prompt/media request the
-//!   permission handler registered is listed here with a stable id, so an
-//!   already-showing prompt can be answered programmatically. Settling goes
-//!   through the handler's own one-shot registry, so a decision can never
-//!   race the dialog task into calling a CEF callback twice.
+//!   permission handler registered is listed here with a stable id and its
+//!   profile, so an already-showing prompt can be answered programmatically.
+//!   Settling goes through the handler's own one-shot registry, so a decision
+//!   can never race the dialog task into calling a CEF callback twice.
 //!
 //! All state is thread-local: CEF callbacks and `ui.call_sync` host functions
 //! both run on the main thread, and the registries hold `Rc`s.
@@ -18,9 +21,9 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
-/// What an auto-decision policy entry matches: origin and permission, either
-/// possibly `"*"`.
-type PolicyKey = (String, String);
+/// What an auto-decision policy entry matches: the CEF profile name, plus
+/// origin and permission (either possibly `"*"`).
+type PolicyKey = (String, String, String);
 
 #[derive(Default)]
 struct AutoPolicy {
@@ -33,34 +36,50 @@ thread_local! {
     static NEXT_PENDING_ID: Cell<u64> = const { Cell::new(1) };
 }
 
-/// Sets an auto-decision: requests for `permission` from `origin` are answered
-/// with `allow` without consulting the store or showing a dialog. Use `"*"`
-/// on either side to match anything. An explicit programmatic policy wins
-/// over persisted decisions, so automation stays deterministic.
-pub fn set_auto_permission(origin: &str, permission: &str, allow: bool) {
-    let key = (normalize_match(origin), normalize_match(permission));
+/// Sets an auto-decision for one profile: requests for `permission` from
+/// `origin` in that profile are answered with `allow` without consulting the
+/// store or showing a dialog. `origin` or `permission` may be `"*"` within
+/// the profile; the profile itself is always explicit (no cross-profile
+/// rule). An explicit programmatic policy wins over persisted decisions, so
+/// automation stays deterministic.
+pub fn set_auto_permission(profile: &str, origin: &str, permission: &str, allow: bool) {
+    let key = (
+        normalize_match(profile),
+        normalize_match(origin),
+        normalize_match(permission),
+    );
     AUTO.with(|auto| {
         auto.borrow_mut().entries.insert(key, allow);
     });
 }
 
-/// Removes every auto-decision entry.
-pub fn clear_auto_permissions() {
-    AUTO.with(|auto| auto.borrow_mut().entries.clear());
+/// Removes auto-decision entries: those of `profile` only, or every profile
+/// when `None`.
+pub fn clear_auto_permissions(profile: Option<&str>) {
+    let profile = profile.map(normalize_match);
+    AUTO.with(|auto| {
+        let mut auto = auto.borrow_mut();
+        match profile {
+            Some(profile) => auto.entries.retain(|key, _value| key.0 != profile),
+            None => auto.entries.clear(),
+        }
+    });
 }
 
-/// The policy's decision for `(origin, permission)`, most specific key first:
-/// exact, then `(origin, "*")`, then `("*", permission)`, then `("*", "*")`.
-pub fn auto_decision(origin: &str, permission: &str) -> Option<bool> {
+/// The policy's decision for `(profile, origin, permission)`, most specific
+/// key first within that profile: exact, then `(profile, origin, "*")`, then
+/// `(profile, "*", permission)`, then `(profile, "*", "*")`.
+pub fn auto_decision(profile: &str, origin: &str, permission: &str) -> Option<bool> {
+    let profile = normalize_match(profile);
     let origin = normalize_match(origin);
     let permission = normalize_match(permission);
     AUTO.with(|auto| {
         let entries = &auto.borrow().entries;
         entries
-            .get(&(origin.clone(), permission.clone()))
-            .or_else(|| entries.get(&(origin.clone(), "*".to_string())))
-            .or_else(|| entries.get(&("*".to_string(), permission.clone())))
-            .or_else(|| entries.get(&("*".to_string(), "*".to_string())))
+            .get(&(profile.clone(), origin.clone(), permission.clone()))
+            .or_else(|| entries.get(&(profile.clone(), origin.clone(), "*".to_string())))
+            .or_else(|| entries.get(&(profile.clone(), "*".to_string(), permission.clone())))
+            .or_else(|| entries.get(&(profile.clone(), "*".to_string(), "*".to_string())))
             .copied()
     })
 }
@@ -79,6 +98,8 @@ pub struct PendingPromptInfo {
     pub id: u64,
     /// `"prompt"` (on_show_permission_prompt) or `"media"` (media access).
     pub kind: String,
+    /// The CEF profile the request belongs to.
+    pub profile: String,
     /// The requesting origin, e.g. `https://example.site`.
     pub origin: String,
     /// The permission label(s), e.g. `notifications` or `camera, microphone`.
@@ -158,26 +179,52 @@ mod tests {
     use super::*;
 
     #[test]
-    fn auto_policy_specificity() {
-        clear_auto_permissions();
-        assert_eq!(auto_decision("https://a.site", "notifications"), None);
-        set_auto_permission("*", "*", true);
-        assert_eq!(auto_decision("https://a.site", "notifications"), Some(true));
-        set_auto_permission("https://a.site", "*", false);
+    fn auto_policy_specificity_and_profile_scoping() {
+        clear_auto_permissions(None);
+        // No cross-profile rule: a policy for profile A never answers for B.
+        set_auto_permission("profile-a", "*", "*", true);
         assert_eq!(
-            auto_decision("https://a.site", "notifications"),
-            Some(false)
+            auto_decision("profile-b", "https://a.site", "notifications"),
+            None
         );
-        assert_eq!(auto_decision("https://b.site", "camera"), Some(true));
-        set_auto_permission("https://a.site", "notifications", true);
-        assert_eq!(auto_decision("https://a.site", "notifications"), Some(true));
-        // Case and trailing slash do not matter.
         assert_eq!(
-            auto_decision("HTTPS://A.site/", "notifications"),
+            auto_decision("profile-a", "https://a.site", "notifications"),
             Some(true)
         );
-        clear_auto_permissions();
-        assert_eq!(auto_decision("https://a.site", "notifications"), None);
+        // Within the profile: exact beats (origin, "*"), then ("*", perm),
+        // then ("*", "*").
+        set_auto_permission("profile-a", "https://a.site", "*", false);
+        assert_eq!(
+            auto_decision("profile-a", "https://a.site", "notifications"),
+            Some(false)
+        );
+        assert_eq!(
+            auto_decision("profile-a", "https://b.site", "camera"),
+            Some(true)
+        );
+        set_auto_permission("profile-a", "https://a.site", "notifications", true);
+        assert_eq!(
+            auto_decision("profile-a", "https://a.site", "notifications"),
+            Some(true)
+        );
+        // Case and trailing slash do not matter.
+        assert_eq!(
+            auto_decision("PROFILE-A", "HTTPS://A.site/", "Notifications"),
+            Some(true)
+        );
+        // Clearing one profile leaves the others alone.
+        set_auto_permission("profile-b", "https://b.site", "camera", false);
+        clear_auto_permissions(Some("profile-a"));
+        assert_eq!(
+            auto_decision("profile-a", "https://a.site", "notifications"),
+            None
+        );
+        assert_eq!(
+            auto_decision("profile-b", "https://b.site", "camera"),
+            Some(false)
+        );
+        clear_auto_permissions(None);
+        assert_eq!(auto_decision("profile-b", "https://b.site", "camera"), None);
     }
 
     #[test]
@@ -189,6 +236,7 @@ mod tests {
             PendingPromptInfo {
                 id: 0,
                 kind: "prompt".into(),
+                profile: "profile-a".into(),
                 origin: "https://a.site".into(),
                 permission: "notifications".into(),
                 browser_id: Some(1),

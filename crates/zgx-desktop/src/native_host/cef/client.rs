@@ -958,6 +958,7 @@ wrap_permission_handler! {
                     super::permissions::PendingPromptInfo {
                         id: 0,
                         kind: "media".into(),
+                        profile: self.profile.clone(),
                         origin: origin.clone(),
                         permission: dir_permission,
                         browser_id,
@@ -1107,6 +1108,7 @@ wrap_permission_handler! {
                     super::permissions::PendingPromptInfo {
                         id: 0,
                         kind: "prompt".into(),
+                        profile: self.profile.clone(),
                         origin: origin.clone(),
                         permission: dir_permission,
                         browser_id,
@@ -1212,7 +1214,7 @@ async fn ask_permission(
     permission: &str,
     label: &str,
 ) -> Option<bool> {
-    if let Some(decision) = super::permissions::auto_decision(origin, permission) {
+    if let Some(decision) = super::permissions::auto_decision(profile, origin, permission) {
         return Some(decision);
     }
     if let Some(decision) = store.borrow().decision(origin, permission) {
