@@ -63,6 +63,10 @@ pub(super) struct Page {
     drag_export: RefCell<Option<Vec<zgx::input::DragItem>>>,
     drag_source_active: Cell<bool>,
     pressed: Cell<Option<(f32, f32)>>,
+    /// Fractional scroll deltas not yet delivered to CEF, accumulated so
+    /// fine trackpad movements are never truncated away (`as i32` would
+    /// drop every sub-pixel delta).
+    scroll_remainder: Cell<(f32, f32)>,
     node: Cell<Option<NodeId>>,
     scene: RefCell<Weak<RefCell<Scene>>>,
     last_click: RefCell<Option<LastClick>>,
@@ -834,6 +838,7 @@ pub(super) fn backend(
         drag_export: RefCell::new(None),
         drag_source_active: Cell::new(false),
         pressed: Cell::new(None),
+        scroll_remainder: Cell::new((0., 0.)),
         node: Cell::new(None),
         scene: RefCell::new(Weak::new()),
         last_click: RefCell::new(None),
@@ -1012,7 +1017,11 @@ pub(super) fn backend(
         ..Default::default()
     };
     let settings = BrowserSettings {
-        windowless_frame_rate: 30,
+        // CEF caps the windowless frame rate at 60; Chromium still only
+        // calls OnPaint when something is damaged, so this raises the
+        // ceiling for scroll/animations without producing frames when
+        // nothing changes.
+        windowless_frame_rate: 60,
         ..Default::default()
     };
     let url: CefString = "about:blank".into();
@@ -1148,6 +1157,7 @@ pub(super) fn prepare_popup(
         drag_export: RefCell::new(None),
         drag_source_active: Cell::new(false),
         pressed: Cell::new(None),
+        scroll_remainder: Cell::new((0., 0.)),
         node: Cell::new(None),
         scene: RefCell::new(Weak::new()),
         last_click: RefCell::new(None),
@@ -1791,9 +1801,7 @@ fn input(page: &Page, event: &mut zgx::input::EventContext) {
             }
             // A mouse's back/forward buttons step through the page's history,
             // as in a browser; the page never sees them as clicks.
-            if !mouse_up
-                && let Some(step) = back_forward_step(button)
-            {
+            if !mouse_up && let Some(step) = back_forward_step(button) {
                 page.note_navigation();
                 match step {
                     WebViewCommand::GoBack => browser.go_back(),
@@ -1873,11 +1881,17 @@ fn input(page: &Page, event: &mut zgx::input::EventContext) {
             y,
             delta_x,
             delta_y,
-        } => host.send_mouse_wheel_event(
-            window_mouse_event(page, x, y).as_ref(),
-            delta_x as i32,
-            delta_y as i32,
-        ),
+        } => {
+            // Accumulate fractional deltas and only send whole pixels:
+            // truncating each event (`delta as i32`) would silently drop
+            // fine trackpad movements (0.3 + 0.5 + … all become 0).
+            let (remainder, (dx, dy)) =
+                accumulate_scroll(page.scroll_remainder.get(), (delta_x, delta_y));
+            page.scroll_remainder.set(remainder);
+            if dx != 0 || dy != 0 {
+                host.send_mouse_wheel_event(window_mouse_event(page, x, y).as_ref(), dx, dy);
+            }
+        }
         InputEvent::Focus => {
             host.set_focus(1);
         }
@@ -2085,6 +2099,18 @@ fn mouse_event(page: &Page, x: f32, y: f32) -> MouseEvent {
 fn window_mouse_event(page: &Page, x: f32, y: f32) -> Option<MouseEvent> {
     let (x, y) = page.local(x, y)?;
     Some(mouse_event(page, x, y))
+}
+
+/// Adds a fractional scroll delta to the pending remainder and returns the
+/// new remainder plus the whole-pixel delta to send to CEF (zeros when less
+/// than one pixel accumulated). Fine trackpad movements are never lost:
+/// 0.3 + 0.5 + 0.8 + 0.7 + 0.4 yields one 2px event, not zero.
+fn accumulate_scroll(remainder: (f32, f32), delta: (f32, f32)) -> ((f32, f32), (i32, i32)) {
+    let rem_x = remainder.0 + delta.0;
+    let rem_y = remainder.1 + delta.1;
+    let dx = rem_x.trunc();
+    let dy = rem_y.trunc();
+    ((rem_x - dx, rem_y - dy), (dx as i32, dy as i32))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2389,6 +2415,46 @@ fn percent_encode(value: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod scroll_tests {
+    use super::accumulate_scroll;
+
+    #[test]
+    fn fine_trackpad_deltas_are_not_lost() {
+        // The user's example: 0.3 + 0.5 + 0.8 + 0.7 + 0.4 = 2.7px total.
+        let mut rem = (0., 0.);
+        let mut sent = (0, 0);
+        for d in [0.3f32, 0.5, 0.8, 0.7, 0.4] {
+            let (r, (dx, dy)) = accumulate_scroll(rem, (d, 0.));
+            rem = r;
+            sent = (sent.0 + dx, sent.1 + dy);
+        }
+        assert_eq!(
+            sent,
+            (2, 0),
+            "fractional deltas must accumulate to whole pixels"
+        );
+        assert!(
+            (rem.0 - 0.7).abs() < 1e-6,
+            "remainder keeps the fraction: {rem:?}"
+        );
+    }
+
+    #[test]
+    fn both_axes_and_negative_deltas() {
+        let (rem, (dx, dy)) = accumulate_scroll((0., 0.), (-1.5, 2.25));
+        assert_eq!((dx, dy), (-1, 2));
+        assert!((rem.0 - -0.5).abs() < 1e-6 && (rem.1 - 0.25).abs() < 1e-6);
+        // Sub-pixel only: nothing sent, remainder kept.
+        let (rem, (dx, dy)) = accumulate_scroll((0., 0.), (0.4, -0.4));
+        assert_eq!((dx, dy), (0, 0));
+        assert!((rem.0 - 0.4).abs() < 1e-6 && (rem.1 - -0.4).abs() < 1e-6);
+        // Continuing with the remainder: 0.4 + 0.7 = 1.1 -> one pixel.
+        let (_rem, (dx, _dy)) = accumulate_scroll(rem, (0.7, 0.));
+        assert_eq!(dx, 1);
+    }
 }
 
 #[cfg(test)]

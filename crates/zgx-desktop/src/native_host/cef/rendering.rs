@@ -1,6 +1,9 @@
 use cef::{Browser, ImplBrowser, ImplBrowserHost, Rect};
 use std::sync::{Arc, Mutex};
-use std::{cell::{Cell, RefCell}, rc::Rc};
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+};
 
 use zgx_gpu::viewport::{Viewport, ViewportFrame};
 
@@ -19,6 +22,56 @@ pub(super) struct Frame {
 }
 
 pub(super) type SharedFrame = Arc<Mutex<Frame>>;
+
+impl Frame {
+    /// Copy a CEF paint buffer into the staging frame. When the size is
+    /// unchanged, only the dirty rects CEF reported are copied row by row,
+    /// so a small damage (a blinking caret, a scroll) costs a fraction of
+    /// the full-frame memcpy. A size change reallocates the staging buffer
+    /// and copies everything once. An empty dirty list means the whole
+    /// frame changed.
+    pub(super) fn blit(&mut self, src: &[u8], width: u32, height: u32, dirty: &[Rect]) {
+        let Some(length) = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|pixels| pixels.checked_mul(4))
+        else {
+            return;
+        };
+        if src.len() < length {
+            return;
+        }
+        self.width = width;
+        self.height = height;
+        if self.pixels.len() != length {
+            self.pixels.clear();
+            self.pixels.extend_from_slice(&src[..length]);
+            return;
+        }
+        let full = Rect {
+            x: 0,
+            y: 0,
+            width: width as i32,
+            height: height as i32,
+        };
+        let rects = if dirty.is_empty() { &[full] } else { dirty };
+        let row_bytes = width as usize * 4;
+        for rect in rects {
+            let x = rect.x.clamp(0, width as i32);
+            let y = rect.y.clamp(0, height as i32);
+            let right = (rect.x + rect.width).clamp(0, width as i32);
+            let bottom = (rect.y + rect.height).clamp(0, height as i32);
+            let (w, h) = (right - x, bottom - y);
+            if w <= 0 || h <= 0 {
+                continue;
+            }
+            for row in 0..h as usize {
+                let offset = (y as usize + row) * row_bytes + x as usize * 4;
+                let len = w as usize * 4;
+                self.pixels[offset..offset + len].copy_from_slice(&src[offset..offset + len]);
+            }
+        }
+    }
+}
 
 #[derive(Default)]
 pub(super) struct PopupFrame {
@@ -599,7 +652,7 @@ mod tests {
 
     #[test]
     fn closing_browser_releases_view_and_popup_cpu_frames() {
-        let frame = Arc::new(Mutex::new( Frame {
+        let frame = Arc::new(Mutex::new(Frame {
             width: 32,
             height: 32,
             pixels: vec![255; 32 * 32 * 4],
@@ -608,7 +661,7 @@ mod tests {
             dirty: Vec::new(),
         }));
         let popup = Arc::new(Mutex::new(PopupFrame {
-             frame: Frame {
+            frame: Frame {
                 width: 8,
                 height: 8,
                 pixels: vec![127; 8 * 8 * 4],
@@ -639,13 +692,27 @@ mod tests {
 
     #[test]
     fn dirty_union_boxes_and_clips_the_changed_region() {
-        let rect = |x, y, w, h| Rect { x, y, width: w, height: h };
+        let rect = |x, y, w, h| Rect {
+            x,
+            y,
+            width: w,
+            height: h,
+        };
         assert_eq!(dirty_union(&[], (100, 100)), None);
-        assert_eq!(dirty_union(&[rect(10, 10, 5, 5), rect(20, 20, 5, 5)], (100, 100)), Some((10, 10, 15, 15)));
+        assert_eq!(
+            dirty_union(&[rect(10, 10, 5, 5), rect(20, 20, 5, 5)], (100, 100)),
+            Some((10, 10, 15, 15))
+        );
         // Clipped to the frame bounds.
-        assert_eq!(dirty_union(&[rect(90, 90, 50, 50)], (100, 100)), Some((90, 90, 10, 10)));
+        assert_eq!(
+            dirty_union(&[rect(90, 90, 50, 50)], (100, 100)),
+            Some((90, 90, 10, 10))
+        );
         // Empty rects are ignored.
-        assert_eq!(dirty_union(&[rect(0, 0, 0, 0), rect(5, 5, 4, 4)], (100, 100)), Some((5, 5, 4, 4)));
+        assert_eq!(
+            dirty_union(&[rect(0, 0, 0, 0), rect(5, 5, 4, 4)], (100, 100)),
+            Some((5, 5, 4, 4))
+        );
     }
 
     #[test]
@@ -666,7 +733,7 @@ mod tests {
         .expect("request test device");
 
         // Two rows of CEF BGRA pixels: red/green, then blue/white.
-        let source = Arc::new(Mutex::new( Frame {
+        let source = Arc::new(Mutex::new(Frame {
             width: 2,
             height: 2,
             pixels: vec![
@@ -677,7 +744,7 @@ mod tests {
             dirty: Vec::new(),
         }));
         let popup = Arc::new(Mutex::new(PopupFrame {
-             frame: Frame {
+            frame: Frame {
                 width: 1,
                 height: 1,
                 pixels: vec![0, 0, 255, 255],

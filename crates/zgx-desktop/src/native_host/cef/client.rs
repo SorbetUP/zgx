@@ -568,10 +568,7 @@ wrap_render_handler! {
             let pixels = unsafe { std::slice::from_raw_parts(buffer, length) };
             if kind == PaintElementType::POPUP {
                 let mut popup = self.state.popup.lock().unwrap_or_else(|poison| poison.into_inner());
-                popup.frame.width = width;
-                popup.frame.height = height;
-                popup.frame.pixels.clear();
-                popup.frame.pixels.extend_from_slice(pixels);
+                popup.frame.blit(pixels, width, height, &paint.dirty_rects);
                 popup.frame.revision = popup.frame.revision.wrapping_add(1);
                 drop(popup);
                 (self.state.invalidate)();
@@ -594,8 +591,9 @@ wrap_render_handler! {
                 drop(frame);
                 return;
             }
-            frame.pixels.clear();
-            frame.pixels.extend_from_slice(pixels);
+            // Copy only the dirty rects CEF reported (full copy on resize),
+            // instead of memcpy-ing the whole frame on every paint.
+            frame.blit(pixels, width, height, &paint.dirty_rects);
             frame.revision = frame.revision.wrapping_add(1);
             drop(frame);
             (self.state.invalidate)();
